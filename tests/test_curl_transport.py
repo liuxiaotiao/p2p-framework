@@ -104,6 +104,21 @@ def test_range_unsupported_does_not_trigger_a_switch(srv, monkeypatch) -> None:
     assert s.transport == "auto", "不该切"
 
 
+def test_a_missing_file_does_not_trigger_a_switch(srv, monkeypatch, caplog) -> None:
+    """404 是服务器明确说「没有这个文件」—— 换 curl 也是同一个回答。
+
+    真机上 `meta` 取 Qwen3-30B-A3B 的 special_tokens_map.json（仓库里本来就没有）
+    时切到了 curl，还打出「两者 TLS 不同」，把文件缺失误报成网络问题。"""
+    s = _src(srv, "auto")
+    err = urllib.error.HTTPError("u", 404, "Not Found", {}, None)
+    monkeypatch.setattr(Source, "_get_urllib", lambda *a, **k: (_ for _ in ()).throw(err))
+    with caplog.at_level("WARNING", logger="p2pmoe.fetch"):
+        with pytest.raises(urllib.error.HTTPError):
+            s.read("special_tokens_map.json", 0, 10)
+    assert s.transport == "auto", "404 不该触发切换"
+    assert "TLS" not in caplog.text
+
+
 def test_explicit_urllib_never_switches(srv, monkeypatch) -> None:
     """显式指定了传输就该照办 —— 自动切换会让排查变成猜谜。"""
     s = _src(srv, "urllib")

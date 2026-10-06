@@ -245,6 +245,11 @@ class Source:
             # RangeNotSupported 是对端行为，换传输也不会变 —— 不该触发切换
             if isinstance(e, RangeNotSupported) or self.transport != "auto":
                 raise
+            # 404/410 是服务器**明确回答「没有这个文件」**（如 Qwen3-30B-A3B 仓库里
+            # 本来就没有 special_tokens_map.json），换 curl 拿到的是同一个回答。
+            # 以前这里也切了，还打一句「两者 TLS 不同」—— 把文件缺失误报成网络问题。
+            if isinstance(e, urllib.error.HTTPError) and e.code in (404, 410):
+                raise
             if not self._have_curl():
                 raise
             # **决定切的那一刻就粘住**，不是等 curl 成功之后。

@@ -402,7 +402,12 @@ cmd_fetch() {
     SRCARG=(--repo "$REPO" ${HF_ENDPOINT:+--endpoint "$HF_ENDPOINT"})
     ep=${HF_ENDPOINT:-https://huggingface.co}
   fi
-  echo "  合计约 141GB（全模型 160GB × 15 台 = 2400GB，省 94%）"
+  $PY - "$PLAN" <<'PYEOF' 2>/dev/null || true
+import json, sys
+m = json.load(open(sys.argv[1]))
+g = [n["weight_gb"] for n in m["nodes"]]
+print(f"  按清单合计约 {sum(g):.0f}GB，{len(g)} 台，每台 {min(g):.1f}–{max(g):.1f}GB")
+PYEOF
   echo "  源  $ep"
   echo "    ↑ **各节点**从这里拉，不是控制机。控制机的网络好不好在这里不算数。"
   if [ -z "$SRC_DIR$SRC_URL" ] && [ -z "${HF_ENDPOINT:-}" ]; then
@@ -883,6 +888,11 @@ from p2pmoe.runtime.weights import WeightIndex
 import re
 
 plan, node, wdir = sys.argv[1], sys.argv[2], sys.argv[3]
+if not (Path(wdir) / "config.json").exists():
+    n = len(list(Path(wdir).glob("*.safetensors"))) if Path(wdir).is_dir() else 0
+    print(f"NONE {wdir}" + ("（目录不存在）" if not Path(wdir).is_dir()
+                            else f"（没有 config.json，{n} 个 safetensors）"))
+    sys.exit(1)
 cfg = json.loads((Path(wdir) / "config.json").read_text(encoding="utf-8"))
 man = DeploymentManifest.from_json(Path(plan).read_text(encoding="utf-8"))
 want = keys_for_node(man, node, config=cfg)
@@ -913,7 +923,7 @@ PYEOF
   done < <(awk '{sub(/#.*/,"")} NF>=2 {split($2,a,":"); print $1, a[1]}' "$HOSTS")
   wait
 
-  local ok=0 bad=0
+  local ok=0 bad=0 none=0
   for e in "${ids[@]}"; do
     local id=${e%%:*} ip=${e#*:} out
     out=$(head -3 "$d/$id.out" 2>/dev/null)
@@ -923,13 +933,23 @@ PYEOF
                printf '  ✗ %-5s 缺 %s  本地 %s  %s %s\n' "$id" "$2" "$3" "$5" "$6"
                printf '        首个缺失: %s\n' "$4"
                bad=$((bad+1)) ;;
-      *)       printf '  ? %-5s %s\n' "$id" "$(echo "$out" | head -1)"; bad=$((bad+1)) ;;
+      NONE\ *) printf '  ✗ %-5s 本地没有权重：%s\n' "$id" "${out#NONE }"
+               none=$((none+1)); bad=$((bad+1)) ;;
+      # 其它异常：显示 Traceback 的**最后一行**（真正的错误），不是第一行
+      *)       printf '  ? %-5s %s\n' "$id" "$(grep -v '^\s*$' "$d/$id.out" | tail -1)"
+               bad=$((bad+1)) ;;
     esac
   done
   echo
   if [ "$bad" = 0 ]; then
     echo "  $ok/$ok 台的权重与清单一致 —— 可以 start 了。"
     return 0
+  fi
+  if [ "$none" -gt 0 ]; then
+    echo "  $none 台本地没有权重（$WEIGHTS）—— fetch 没跑、没跑完，或者 WEIGHTS 与 fetch 时不同。"
+    echo "  先跑 fetch，看它最后那行「fetch: N/15 成功」："
+    echo "      bash ./deploy_15.sh fetch"
+    return 1
   fi
   echo "  $bad 台对不上。看那一行的 have= 与 want=："
   echo "    · 两个区间**完全不同** → 装的是**别的节点**那一份。"

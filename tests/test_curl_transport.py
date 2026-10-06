@@ -383,3 +383,76 @@ def test_a_redirect_does_not_truncate_the_body(tmp_path) -> None:
         front.shutdown()
         front.server_close()
         real.stop()
+
+
+# --------------------------------------------------------------------------- #
+# 4. 单次请求超时：带回已收的那一段，从断点续
+# --------------------------------------------------------------------------- #
+class _Slow:
+    """支持 Range、但每秒只吐 ~200KB 的上游 —— 一次 1 秒超时下不完一段。"""
+
+    def __init__(self, data: bytes):
+        import http.server
+        import threading
+
+        outer = self
+        self.data, self.requests = data, 0
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                import re
+                import time
+
+                outer.requests += 1
+                m = re.match(r"bytes=(\d+)-(\d*)", self.headers.get("Range", ""))
+                lo = int(m.group(1)) if m else 0
+                hi = int(m.group(2)) + 1 if m and m.group(2) else len(outer.data)
+                body = outer.data[lo:hi]
+                self.send_response(206 if m else 200)
+                self.send_header("Content-Length", str(len(body)))
+                if m:
+                    self.send_header("Content-Range", f"bytes {lo}-{hi - 1}/{len(outer.data)}")
+                self.end_headers()
+                try:
+                    for i in range(0, len(body), 20_000):
+                        self.wfile.write(body[i:i + 20_000])
+                        self.wfile.flush()
+                        time.sleep(0.1)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.port = self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+
+def test_a_range_slower_than_the_timeout_still_completes() -> None:
+    """真机上 5 台前段全挂在 `curl: (28) Operation timed out after 60s`：
+    整层 128 个专家是连续的，合成好几 GB 一次请求，60 秒下不完，而超时后已收的
+    字节被丢掉、从同一个起点重来 —— 永远没有进展。"""
+    data = bytes(range(256)) * 3000                       # 768000 字节 ≈ 4 秒
+    up = _Slow(data)
+    try:
+        s = Source(base_url=f"http://127.0.0.1:{up.port}", transport="curl",
+                   timeout=1, retries=3)
+        assert s.read("m.safetensors", 1000, 700_000) == data[1000:700_000]
+        assert up.requests >= 3, "应该是多次请求接力完成的"
+    finally:
+        up.httpd.shutdown()
+
+
+def test_ranges_are_capped() -> None:
+    from p2pmoe.deploy.fetch import TensorSpec, _coalesce
+
+    mb = 1 << 20
+    specs = [TensorSpec(name=f"t{i}", shard="s", dtype="BF16", shape=(1,),
+                        start=i * 10 * mb, end=(i + 1) * 10 * mb) for i in range(100)]
+    rs = _coalesce(specs, gap=mb, max_bytes=256 * mb)
+    assert all(hi - lo <= 256 * mb for lo, hi in rs)
+    assert rs[0][0] == 0 and rs[-1][1] == 1000 * mb
+    assert all(a[1] == b[0] for a, b in zip(rs, rs[1:])), "区间要首尾相接、不漏不重"
+    big = [TensorSpec(name="emb", shard="s", dtype="BF16", shape=(1,), start=0, end=600 * mb)]
+    assert _coalesce(big, gap=mb, max_bytes=256 * mb) == [(0, 600 * mb)]

@@ -296,6 +296,15 @@ class Source:
                 except ValueError:
                     status = 0
             if r.returncode != 0:
+                # 28 = 到了 --max-time，18 = 连接中途断了。这两种情况 body 里是**已经
+                # 收到的那一段**，对端也认了 Range（206）—— 交回去让 read() 从断点续。
+                # 以前一律丢掉重来：一个 60 秒下不完的大区间（前段要整层 128 个专家，
+                # 连续的张量被合成好几 GB 的一次请求）就永远没有进展，重试 5 次后失败。
+                got = body.stat().st_size if body.exists() else 0
+                if r.returncode in (18, 28) and ranged and got > 0 and status == 206:
+                    log.debug("%s：curl %s，带回 %d 字节，交给续传",
+                              name, r.returncode, got)
+                    return body.read_bytes(), status
                 raise OSError(f"curl 退出码 {r.returncode}："
                               f"{r.stderr.decode(errors='replace').strip()[:200]}")
             # **两条传输必须抛同一种异常。** 调用方靠 HTTPError.code 区分
@@ -614,11 +623,22 @@ def plan_fetch(src: Source, keys: Iterable[str]) -> FetchPlan:
 
 
 # --------------------------------------------------------------------------- #
-def _coalesce(specs: Sequence[TensorSpec], gap: int) -> list[tuple[int, int]]:
-    """把相邻的字节区间并成一次请求 —— 隔一小段就多发一次请求不划算。"""
+MAX_RANGE = 256 << 20
+"""单次请求最多合并到多大。
+
+不设上限的话，前段（整层 128 个专家都要）的张量在分片里是连续的，会被合成
+好几 GB 的一次请求：慢链路上 60 秒超时内下不完，内存里也要放下整段。单个张量
+本身超过上限（embedding / lm_head 约 600MB）时它自成一段，靠续传爬完。"""
+
+
+def _coalesce(specs: Sequence[TensorSpec], gap: int,
+              max_bytes: int = MAX_RANGE) -> list[tuple[int, int]]:
+    """把相邻的字节区间并成一次请求 —— 隔一小段就多发一次请求不划算。
+    合并后的一段不超过 max_bytes（单个张量更大时除外）。"""
     out: list[tuple[int, int]] = []
     for t in specs:
-        if out and t.start - out[-1][1] <= gap:
+        if (out and t.start - out[-1][1] <= gap
+                and max(out[-1][1], t.end) - out[-1][0] <= max_bytes):
             out[-1] = (out[-1][0], max(out[-1][1], t.end))
         else:
             out.append((t.start, t.end))

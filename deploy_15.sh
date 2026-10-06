@@ -58,7 +58,9 @@ case "$WEIGHTS" in
   /*) ;;
   *) WEIGHTS=$WORKDIR/$WEIGHTS ;;
 esac
-if [ "$(dirname "$WEIGHTS")" = "/" ]; then
+# 只拦 `$WORKDIR/weights…` 在 $WORKDIR 为空时展开出来的那种形态（/weights、/weights-q3-30b）。
+# /data 这类根下的真实挂载点是合法的，不能一并拦掉。
+if [ "$(dirname "$WEIGHTS")" = "/" ] && case "$(basename "$WEIGHTS")" in weights*) true ;; *) false ;; esac; then
   echo "✗ WEIGHTS=$WEIGHTS 是根目录下的路径 —— 多半是终端里 \$WORKDIR 为空，"
   echo "  export WEIGHTS=\$WORKDIR/... 展开成了 /...。改成下面任一种："
   echo "      export WEIGHTS=${WEIGHTS#/}                       # 相对路径，按 WORKDIR=$WORKDIR 解释"
@@ -113,6 +115,9 @@ DUMP_FRONT=${DUMP_FRONT:-}
 # ---------------------------------------------------------------------------
 
 PY=${PY:-python3}
+# 输出接进 `| tee` 时 Python 会改成整块缓冲 —— fetch 每 30s 的进度表就憋在缓冲里，
+# 几小时里屏幕上什么都没有，看起来像卡死。一律不缓冲。
+export PYTHONUNBUFFERED=1
 
 # 权重目录在代码目录里面的话，同步与打包都必须绕开它。
 # 这不是优化 —— rsync --delete 会真的把 141GB 删掉，tar 会真的把它打进包里。

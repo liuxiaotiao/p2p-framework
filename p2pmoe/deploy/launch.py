@@ -196,16 +196,16 @@ def _progress_loop(hosts, out_of: dict[str, int], out_dir, *, ssh, user,
               f"{tot_got/1e9:.1f}/{tot_want/1e9:.0f}GB  "
               f"({tot_got/tot_want:.0%})  {rate/1e6:.0f}MB/s  "
               f"{done}/{len(rows)} 台完成"
-              + (f"  剩约 {eta/60:.0f}min" if eta else ""))
+              + (f"  剩约 {eta/60:.0f}min" if eta else ""), flush=True)
         for nid, got, want, delta in sorted(rows):
             if got < 0:
-                print(f"     {nid:<6} ?（问不到目录大小）")
+                print(f"     {nid:<6} ?（问不到目录大小）", flush=True)
                 continue
             frac = got / want if want else 0
             bar = "█" * round(24 * min(1.0, frac)) + "·" * (24 - round(24 * min(1.0, frac)))
             # 两次之间没长 = 卡住了。进程还在不代表在下东西。
             mark = ("  ⏸ 无增长" if delta == 0 and got < want * 0.98 else "")
-            print(f"     {nid:<6} {bar} {got/1e9:>5.1f}/{want/1e9:<5.1f}GB{mark}")
+            print(f"     {nid:<6} {bar} {got/1e9:>5.1f}/{want/1e9:<5.1f}GB{mark}", flush=True)
 
 
 def _warn_default_workdir(args) -> None:

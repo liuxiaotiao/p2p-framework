@@ -625,13 +625,8 @@ def _coalesce(specs: Sequence[TensorSpec], gap: int) -> list[tuple[int, int]]:
     return out
 
 
-def _write_safetensors(path: Path, specs: Sequence[TensorSpec],
-                       blobs: Mapping[str, bytes]) -> int:
-    """按 safetensors 的格式把拿到的张量拼成一个新文件。
-
-    dtype 与 shape 原样搬运 —— 我们从头到尾没有解释过一个字节，只是搬运。
-    这也是为什么不需要 torch：拼文件是纯字节操作。
-    """
+def _st_header(specs: Sequence[TensorSpec]) -> bytes:
+    """safetensors 文件头（JSON + 对齐填充），张量按 specs 的顺序紧挨着排。"""
     header: dict = {"__metadata__": {"format": "pt"}}
     off = 0
     for t in specs:
@@ -639,8 +634,17 @@ def _write_safetensors(path: Path, specs: Sequence[TensorSpec],
                           "data_offsets": [off, off + t.nbytes]}
         off += t.nbytes
     raw = json.dumps(header, separators=(",", ":")).encode("utf-8")
-    pad = (-len(raw)) % _ALIGN
-    raw += b" " * pad
+    return raw + b" " * ((-len(raw)) % _ALIGN)
+
+
+def _write_safetensors(path: Path, specs: Sequence[TensorSpec],
+                       blobs: Mapping[str, bytes]) -> int:
+    """按 safetensors 的格式把拿到的张量拼成一个新文件。
+
+    dtype 与 shape 原样搬运 —— 我们从头到尾没有解释过一个字节，只是搬运。
+    这也是为什么不需要 torch：拼文件是纯字节操作。
+    """
+    raw = _st_header(specs)
 
     with open(path, "wb") as fh:
         fh.write(len(raw).to_bytes(8, "little"))
@@ -684,26 +688,47 @@ def fetch(src: Source, keys: Iterable[str], out_dir: str | Path, *,
             json.dumps(idx, indent=2), encoding="utf-8")
         return plan
 
-    # ---- 逐张量 ---- #
-    blobs: dict[str, bytes] = {}
+    # ---- 逐张量：边下边写 ---- #
+    # 以前是把所有张量攒在内存里、最后一次写出 —— 两个后果：
+    #   · 目录大小在下载期间一直不变，按目录大小报的进度永远是 0，看起来像卡死；
+    #   · 单台要 21GB 时内存要装下 21GB + 当前分片的读缓冲，29GB 的机器会被 OOM 杀掉，
+    #     而且是在快下完的时候。
+    # 每个张量的 dtype / shape / 字节数在下载前就从分片头里知道了，所以文件头可以
+    # 先写好，之后按顺序把字节流进去。内存里最多只有一段合并后的区间。
+    final = out / "model.safetensors"
+    part = out / "model.safetensors.partial"
+    header = _st_header(plan.tensors)
     done = 0
-    for shard in plan.shards_needed:
-        specs = [t for t in plan.tensors if t.shard == shard]
-        ranges = _coalesce(specs, gap)
-        chunks = {}
-        for lo, hi in ranges:
-            chunks[(lo, hi)] = src.read(shard, lo, hi)
-        for t in specs:
-            for (lo, hi), buf in chunks.items():
-                if lo <= t.start and t.end <= hi:
-                    blobs[t.name] = buf[t.start - lo: t.end - lo]
-                    break
-        done += sum(hi - lo for lo, hi in ranges)
-        log.info("  %s：%d 个张量 / %d 次请求 / %.1fMB（累计 %.1fMB）",
-                 shard, len(specs), len(ranges),
-                 sum(t.nbytes for t in specs) / 1e6, done / 1e6)
-
-    size = _write_safetensors(out / "model.safetensors", plan.tensors, blobs)
+    with open(part, "wb") as fh:
+        fh.write(len(header).to_bytes(8, "little"))
+        fh.write(header)
+        for shard in plan.shards_needed:
+            specs = [t for t in plan.tensors if t.shard == shard]   # 已按 start 排好
+            ranges = _coalesce(specs, gap)
+            i = 0
+            for lo, hi in ranges:
+                buf = memoryview(src.read(shard, lo, hi))
+                if len(buf) != hi - lo:
+                    raise RuntimeError(
+                        f"{shard}[{lo}:{hi}] 拿到 {len(buf)} 字节，应该是 {hi - lo} —— "
+                        f"上游可能没有正确处理 Range 请求")
+                while i < len(specs) and specs[i].end <= hi:
+                    t = specs[i]
+                    fh.write(buf[t.start - lo: t.end - lo])
+                    i += 1
+                done += hi - lo
+                del buf
+            if i != len(specs):
+                raise RuntimeError(f"{shard}：{len(specs) - i} 个张量没落进任何区间")
+            fh.flush()
+            log.info("  %s：%d 个张量 / %d 次请求 / %.1fMB（累计 %.1fMB）",
+                     shard, len(specs), len(ranges),
+                     sum(t.nbytes for t in specs) / 1e6, done / 1e6)
+    want = 8 + len(header) + sum(t.nbytes for t in plan.tensors)
+    if part.stat().st_size != want:
+        raise RuntimeError(f"{part} 是 {part.stat().st_size} 字节，应该是 {want}")
+    os.replace(part, final)            # 写完才改名：半截文件不会被当成完整的
+    size = final.stat().st_size
     (out / "model.safetensors.index.json").write_text(
         json.dumps({"metadata": {"total_size": size},
                     "weight_map": {t.name: "model.safetensors"

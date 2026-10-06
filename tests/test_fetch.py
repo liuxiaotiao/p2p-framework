@@ -340,3 +340,68 @@ def test_preflight_and_load_resolve_to_the_same_place(tmp_path) -> None:
 def test_a_wrong_node_name_fails_the_preflight(tmp_path) -> None:
     (tmp_path / "n3").mkdir()
     assert not _bare_node("n9").check_model(str(tmp_path / "{node}"))["ok"]
+
+
+# --------------------------------------------------------------------------- #
+# 边下边写：目录大小随下载增长，内存里不攒整份权重
+# --------------------------------------------------------------------------- #
+class _Watching(Source):
+    """每读一段之前，检查上一段是不是已经落盘了。"""
+
+    def __init__(self, d: Path, out: Path, fail_after: int | None = None):
+        super().__init__(local=d)
+        self.out, self.fail_after, self.calls, self.sizes = out, fail_after, 0, []
+
+    def read(self, name, start=None, end=None):
+        part = self.out / "model.safetensors.partial"
+        if part.exists():                                  # 下载阶段（规划阶段只读分片头）
+            self.sizes.append(part.stat().st_size)
+            self.calls += 1
+            if self.fail_after is not None and self.calls > self.fail_after:
+                raise OSError("连接被重置（测试注入）")
+        return super().read(name, start, end)
+
+
+def test_bytes_hit_disk_while_downloading(upstream, tmp_path) -> None:
+    """真机上「fetch 在跑但目录一直不长」：以前所有张量攒在内存里，最后才写。
+    按目录大小报的进度因此恒为 0；21GB 的节点还会被 OOM 杀掉。"""
+    d, cfg = upstream
+    man = make_manifest(cfg)
+    out = tmp_path / "w"
+    src = _Watching(d, out)
+    fetch(src, keys_for_node(man, "n2", config=cfg), out, mode="slice", gap=0)
+    assert src.calls >= 3, "区间太少，测不出增长"
+    assert src.sizes == sorted(src.sizes) and src.sizes[-1] > src.sizes[0], \
+        f"读下一段之前上一段没落盘：{src.sizes}"
+    assert not (out / "model.safetensors.partial").exists()
+    want = {k: v for k, v in load_all(d).items() if k in keys_for_node(man, "n2", config=cfg)}
+    got = load_all(out)
+    assert set(got) == set(want)
+    assert all((got[k] == want[k]).all() for k in want)
+
+
+def test_a_failed_download_leaves_no_complete_looking_file(upstream, tmp_path) -> None:
+    """中途断了：只留 .partial，verify / 加载侧都不会把它当成完整的权重。"""
+    d, cfg = upstream
+    man = make_manifest(cfg)
+    out = tmp_path / "w"
+    with pytest.raises(OSError, match="测试注入"):
+        fetch(_Watching(d, out, fail_after=2), keys_for_node(man, "n2", config=cfg),
+              out, mode="slice", gap=0)
+    assert (out / "model.safetensors.partial").exists()
+    assert not (out / "model.safetensors").exists()
+    assert not (out / "model.safetensors.index.json").exists()
+
+
+def test_streamed_file_equals_the_old_in_memory_writer(upstream, tmp_path) -> None:
+    from p2pmoe.deploy.fetch import _write_safetensors
+
+    d, cfg = upstream
+    man = make_manifest(cfg)
+    keys = keys_for_node(man, "n1", config=cfg)
+    out = tmp_path / "w"
+    plan = fetch(Source(local=d), keys, out, mode="slice")
+    src = Source(local=d)
+    blobs = {t.name: src.read(t.shard, t.start, t.end) for t in plan.tensors}
+    _write_safetensors(tmp_path / "old.safetensors", plan.tensors, blobs)
+    assert (out / "model.safetensors").read_bytes() == (tmp_path / "old.safetensors").read_bytes()

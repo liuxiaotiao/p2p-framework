@@ -202,8 +202,23 @@ def train_segments(task: str, body: str, *, raw: bool = False) -> tuple[list, bo
 
 
 def _probe_tasks(d: Path, tasks) -> list[str]:
-    return tasks or sorted(p.name.removesuffix("_bodies.jsonl")
-                           for p in d.glob("*_bodies.jsonl"))
+    """probe 目录里有哪些 task。**一个都没有就报错**，不能让后面比 0 条然后说「一致」。
+
+    Path.glob 在目录不存在时安静地返回空 —— 路径写错、tgz 没解压，都会变成「核对通过」。
+    """
+    if not d.is_dir():
+        raise SystemExit(f"✗ probe 目录不存在：{d}\n"
+                         f"  多半是 Delta_30B/delta_30b.tgz 还没解压：tar xzf Delta_30B/delta_30b.tgz -C Delta_30B")
+    found = sorted(p.name[:-len("_bodies.jsonl")] for p in d.glob("*_bodies.jsonl"))
+    if not found:
+        raise SystemExit(f"✗ {d} 里没有 *_bodies.jsonl —— 不是 moe_prefill_probe 的输出目录？"
+                         f"\n  里面有：{sorted(x.name for x in d.iterdir())[:8]}")
+    if tasks:
+        missing = sorted(set(tasks) - set(found))
+        if missing:
+            raise SystemExit(f"✗ {d} 里没有 {missing}；有的是 {found}")
+        return list(tasks)
+    return found
 
 
 def _bodies(d: Path, task: str) -> list[dict]:
@@ -218,7 +233,7 @@ def _cmd_tokens(a) -> int:
     if a.thinking != "default":
         tio.template_kw["enable_thinking"] = a.thinking == "on"
     print(f"  tokenizer {a.model_dir}，enable_thinking={tio.template_kw.get('enable_thinking')}")
-    bad_total = 0
+    bad_total = n_total = 0
     for u in _probe_tasks(a.probe_dir, a.tasks):
         with np.load(a.probe_dir / f"{u}_prefill_persample.npz") as z:
             ref = {int(i): (int(n), int(b)) for i, n, b in
@@ -236,11 +251,14 @@ def _cmd_tokens(a) -> int:
             if (bp.n_body != want_b) and first_bad is None:
                 first_bad = (r["sample_idx"], len(bp.ids), want_n, bp.n_body, want_b)
         bad_total += n - ok_body
+        n_total += n
         note = "（no_robots 带 system 的那几条整条长度对不上是预期的）" if u == "no_robots" else ""
         print(f"  {u:<10} {n:>5} 条  整条 prompt 一致 {ok_full}/{n}  body 一致 {ok_body}/{n}{note}")
         if first_bad:
             i, g, w, gb, wb = first_bad
             print(f"      首个不一致：样本 {i} 整条 {g} vs {w}，body {gb} vs {wb}")
+    if n_total == 0:
+        raise SystemExit("✗ 一条样本都没比 —— 这不是通过")
     print("  ✓ body token 数与训练时完全一致" if bad_total == 0 else
           f"  ✗ {bad_total} 条 body 数不一致 —— 模板 / tokenizer / enable_thinking 与训练不同")
     return 0 if bad_total == 0 else 1

@@ -51,6 +51,20 @@ WORKDIR=${WORKDIR:-/home/ubuntu/P2P_MoE}       # 各节点上的代码目录
 # 而权重是各节点自己拉的、源端根本没有 —— 一次 sync 就能抹掉 141GB。
 # 所以下面 sync 会**自动把它排除**（bootstrap 打包时同理）。
 WEIGHTS=${WEIGHTS:-$WORKDIR/weights}
+# 相对路径按代码目录解释：WEIGHTS=weights-q3-30b 就是 $WORKDIR/weights-q3-30b。
+# 不这么做的话，在自己的终端里写 WEIGHTS=$WORKDIR/weights-q3-30b 是个坑 ——
+# 终端里没有 $WORKDIR（它只在本脚本里有默认值），展开成 /weights-q3-30b。
+case "$WEIGHTS" in
+  /*) ;;
+  *) WEIGHTS=$WORKDIR/$WEIGHTS ;;
+esac
+if [ "$(dirname "$WEIGHTS")" = "/" ]; then
+  echo "✗ WEIGHTS=$WEIGHTS 是根目录下的路径 —— 多半是终端里 \$WORKDIR 为空，"
+  echo "  export WEIGHTS=\$WORKDIR/... 展开成了 /...。改成下面任一种："
+  echo "      export WEIGHTS=${WEIGHTS#/}                       # 相对路径，按 WORKDIR=$WORKDIR 解释"
+  echo "      export WEIGHTS=$WORKDIR/${WEIGHTS#/}"
+  exit 1
+fi
 # 节点上跑 torch 的那个解释器。**和控制机的 PY 是两回事** —— 控制机不装 torch。
 # torch 在 conda 环境里的话，这里要填**绝对路径**，不能只写 python3：
 #     NODE_PY=/home/ubuntu/miniconda3/envs/moe/bin/python

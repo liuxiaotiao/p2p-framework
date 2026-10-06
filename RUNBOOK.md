@@ -87,7 +87,7 @@ export SSH_USER=ubuntu                # ssh 用户名，root 就不用设
 export SSH_OPTS="-i ~/.ssh/pool.pem"  # 私钥/端口，没有就不设
 
 export WORKDIR=/home/ubuntu/P2P_MoE            # 各节点上代码放哪儿
-export WEIGHTS=$WORKDIR/weights                # 权重放哪儿（15 台路径要一致）
+export WEIGHTS=weights                         # 权重放哪儿（相对路径按 WORKDIR 解释；15 台要一致）
 export NODE_PY=/home/ubuntu/anaconda3/envs/moe/bin/python   # 节点上带 torch 的解释器
 ```
 
@@ -363,13 +363,13 @@ python3 examples/probe_to_data.py --probe-dir <probe_30b_ref20/prefill_Qwen3-30B
 # 1. 规划：真实驻留集（每层 prefill / decode 各 90% 的并集）、L₀=8、前段装全
 python3 examples/task_deploy.py --data task3 --config qwen3-30b-a3b --phase prefill \
     --tasks gsm8k=1,mbpp=1,no_robots=1 \
-    --expert-sets qwen3-30b/expert_sets_90_union.json \
+    --expert-sets qwen3-30b/expert_sets_90/expert_sets_90_union.json \
     --l0 8 --front-full --exhaustive-short --reserve-gb 2.5 --fill-idle \
     --save-plan qwen3-30b/plan_es90_fill.json --save-profile qwen3-30b/profile_es90.json
 # 2. 只用 tokenizer 核对 prompt 构造（控制机上，不用集群）：body 数应全部一致
 python3 -m p2pmoe.deploy.lr_tool tokens --model-dir $WEIGHTS --probe-dir <probe 目录>
 # 3. 权重（单独的目录，别和 Qwen3-Next 混）→ 起 agent
-export REPO=Qwen/Qwen3-30B-A3B WEIGHTS=$WORKDIR/weights-q3-30b \
+export REPO=Qwen/Qwen3-30B-A3B WEIGHTS=weights-q3-30b \
        PLAN=qwen3-30b/plan_es90_fill.json PROFILE=qwen3-30b/profile_es90.json \
        TASKS=gsm8k=1,mbpp=1,no_robots=1
 bash ./deploy_15.sh sync && bash ./deploy_15.sh meta && bash ./deploy_15.sh fetch
@@ -532,7 +532,7 @@ done
 
 ## 8. 常见问题
 
-**`PermissionError: /data`** —— 系统目录要 root。`export WEIGHTS=$WORKDIR/weights`。
+**`PermissionError: /data`** —— 系统目录要 root。`export WEIGHTS=weights`（相对路径，按 WORKDIR 解释）。
 
 **`xxx/config.json 不存在`** —— 控制机也要这个目录，但只要里面的
 `config.json` 与 tokenizer（约 10MB），**不要权重**。跑 `./deploy_15.sh meta`。

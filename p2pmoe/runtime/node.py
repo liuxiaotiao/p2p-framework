@@ -16,19 +16,31 @@
 
 from __future__ import annotations
 
+import gc
+import importlib.util
 import queue
 import socket
 import threading
 import time
 import traceback
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from .identify import HistogramClassifier
+from .lr_classifier import make_classifier
 from .model import MoEStats, SegmentModel, ToyMoEConfig, embed_tokens, lm_head
-from .wire import Addr, LinkTable, PeerPool, recv_msg, send_msg
+from .wire import (
+    Addr,
+    LinkTable,
+    PeerPool,
+    RelayListener,
+    dial_via_relay,
+    recv_msg,
+    send_msg,
+)
 
 __all__ = ["NodeConfig", "NodeServer", "run_agent", "run_node"]
 
@@ -50,6 +62,22 @@ class ReqState:
     n_decode: int = 0
     n_sampled: int = 0
 
+    # ---- 逐请求的时序埋点（用来算总时延与算力使用率）----
+    compute_ms: float = 0.0
+    """本节点在这条请求上**实际算**了多久。
+
+    只用单调时钟量**时长**，不记绝对时刻 —— 15 台机器的墙钟不同步，跨机的
+    绝对时刻拼不到一条时间轴上。时长是本地量、本地可信的，这也是为什么
+    「网络时间」只能由 `总时延 − 各节点计算 − 排队` 反推，而不能直接测。
+    """
+    n_forward: int = 0
+    """前向次数（prefill 1 次 + 每个 decode 步 1 次）。"""
+    bytes_out: int = 0
+    """本节点往下游发出的 hidden state 字节数。"""
+    first_seen: float = 0.0
+    """本节点第一次碰这条请求的本地时刻（单调）—— 只用来算本地存续时长。"""
+    last_seen: float = 0.0
+
 
 @dataclass
 class NodeConfig:
@@ -67,7 +95,73 @@ class NodeConfig:
     coordinator: Addr
     model: dict
     classifier: dict | None = None
-    """只有 front 的 tail 需要 —— 识别在那里做（II.5）。"""
+    """只有 front 的 tail 需要 —— 识别在那里做（II.5）。
+
+    两种：直方图余弦（老格式，无 `kind`）与 LR（`kind="lr"`，见
+    runtime/lr_classifier.py）。静态模式下通常为 None；给了 LR 的话静态模式
+    也会算一遍，但只作**旁路**上报（不影响配对），用来量识别准确率。"""
+    report_layers: bool = False
+    """前段 tail 把本请求前 L₀ 层的**逐层**统计随识别结果一起上报。
+
+    用于 --dump-front-stats：落盘后可以离线拿同一个 LR 复核，确认节点上拼出的
+    特征与训练时一致。每条请求一次、几十 KB，不开就不发。"""
+
+    miss_policy: str = "drop"
+    """路由到的专家不在本地时怎么补救。三选一：
+
+    * `"drop"`（默认，文档 II.5）—— 跳过缺失的，剩下的**重归一**；
+    * `"drop_noscale"` —— 跳过缺失的，但**不重归一**：活下来的保持原权重，
+      于是 FFN 贡献按丢掉的门控质量成比例缩小，缺得越多越接近「只走残差」；
+    * `"local_topk"` —— 把路由概率限制到驻留集再取 top-k，永远用满 k 个。
+
+    默认保持 `drop` 是为了忠于文档。但实测（`examples/drop_expert_impact.py`）
+    在合成权重上 `drop_noscale` 明显更好 —— 重归一等于宣称「路由本来就只想要
+    剩下这几个」，而那不是事实。真权重上该测一遍再定。"""
+
+    profile: bool = False
+    """开启逐层激活画像累计（runtime/profile.py）。
+
+    只有想采画像的那一轮才开。开着的代价是每层一次向量加法 —— 相对前向可以忽略，
+    但**采画像必须在全装（无 drop-expert 近似）的前提下做**：只驻留子集时输出被
+    近似带偏，后面几层的路由就不是真实路由了。"""
+
+    stop_ids: list[int] = field(default_factory=list)
+    """EOS token id。**只是一个抄近路的优化，不是权威。**
+
+    停止是控制面的决定（协调器判 EOS / stop 串 / max_tokens）。但采样出 EOS 的
+    那一刻，tail(b) 就已经知道这一步不必再绕环了 —— 不告诉它的话，环会白转
+    一整圈（两跳网络 + 一次前后段前向），只为算出一个马上要被丢掉的 token。
+
+    所以两边都判：节点判了就不发 `loop`，协调器仍按自己收到的 token 收尾。
+    两条判定互不依赖，节点这份配错了也只是少省一圈，不会漏停。
+
+    节点因此**不需要 tokenizer** —— 它只拿到几个整数。""" 
+
+    # ---- 静态配对模式 ----------------------------------------------------- #
+    static_peer: str | None = None
+    """前段 tail 的固定下游：对面后段的 head 节点 id。
+
+    **给了它就进入静态模式**：前段 prefill 完直接发过去，不做识别、不上报
+    `classified`、不等协调器的 `bind`。省掉一个控制面 RTT，也省掉分类器、
+    置信三区、通道二检出、换绑这一整套。
+
+    代价是放弃了「到达时 task 未知」这个前提（文档 I.1.1）—— 调用方必须知道
+    自己是哪个 task。以及放弃了任意组合：配对写死在配置里，想改要重新下发
+    （但**不用重新加载权重**，只要前段装的是全集或并集）。
+    """
+    static_task: str | None = None
+    """本段服务的 task。静态模式下前后段都带，用于协调器按 task 选通道。"""
+
+    # ---- 真实模型后端 ------------------------------------------------------ #
+    backend: str = "numpy"
+    """"numpy"（toy 模型，验证协议用）或 "torch"（真实 MoE 权重）。"""
+    model_dir: str | None = None
+    """backend="torch" 时的 checkpoint 目录（safetensors 格式）。"""
+    device: str = "cpu"
+    with_embed: bool = False
+    """本节点是否需要词嵌入 —— 只有前段的 head 需要。"""
+    with_lm_head: bool = False
+    """本节点是否需要最终 norm + 输出头 —— 只有后段的 tail 需要。"""
 
     def to_dict(self) -> dict:
         return {
@@ -85,7 +179,47 @@ class NodeConfig:
         return cls(**d)
 
 
+def _ranges_to_mask(ranges, T: int) -> np.ndarray:
+    """[[start, end), ...]（token 下标）→ 长 T 的 bool 掩码。"""
+    m = np.zeros(T, dtype=bool)
+    for a, b in ranges:
+        if not (0 <= a <= b <= T):
+            raise ValueError(f"body 区间 [{a},{b}) 超出 prompt 长度 {T}")
+        m[a:b] = True
+    return m
+
+
 # --------------------------------------------------------------------------- #
+# 会回复的消息类型 —— 出错时必须把错误**也回到那条连接上**，否则调用方
+# 干等到超时，而超时那条信息里什么都没有。
+#
+# 单向消息（seg_in / hop / loop / bind …）不在此列：往那些连接上多发一条
+# 会把协议搞乱，它们的错误本来就该走上报通道。
+def _cuda_state() -> dict:
+    """这台的 CUDA 能不能用 —— 在**装载之前**就要回答得了。
+
+    起不来的话，`--device cuda:0` 的装载会挂在那儿（张量往一个不存在的设备上
+    搬），控制机看到的是一个 120 秒超时，而节点日志里只有一行
+    `CUDA unknown error` 的 UserWarning，淹在几十行正常输出里。
+
+    **探测本身放在执行层**（`runtime/weights.py`），这里只转发 —— node.py
+    不 import torch 是条硬边界（`test_heavy_deps_stay_in_the_execution_layer`）：
+    控制面与数据面的装配代码不该拖进几 GB 的 CUDA 依赖。
+    """
+    try:
+        from .weights import cuda_state
+    except Exception as e:                      # 连执行层都导不进来
+        return {"ok": False, "why": f"导不进执行层：{type(e).__name__}: {e}"[:200]}
+    try:
+        return cuda_state()
+    except Exception as e:
+        return {"ok": False, "why": f"{type(e).__name__}: {e}"[:200]}
+
+
+_REPLIES = frozenset({"echo", "capabilities", "check_model", "configure",
+                      "probe", "profile"})
+
+
 class NodeServer:
     """两阶段：先起服务，再等控制器下发 configure。
 
@@ -106,6 +240,7 @@ class NodeServer:
         mem_mb: float | None = None,
         access_ms: float = 0.0,
         access_jitter_ms: float = 0.0,
+        relay: Addr | None = None,
     ):
         self.me = node_id
         self.declared_mem_mb = mem_mb
@@ -126,37 +261,141 @@ class NodeServer:
         self.compute_ms = 0.0
         self.n_msgs = 0
 
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind((host, port))
-        self.sock.listen(128)
-        self.host, self.port = self.sock.getsockname()[:2]
+        # 中继模式：不监听任何端口，改成在中继上挂几条连接等人来接。
+        # `RelayListener` 的接口与 socket 对齐，所以 serve_forever 一行不用改 ——
+        # 节点不需要知道自己是在监听端口还是挂在中继上。
+        self.relay = tuple(relay) if relay else None
+        if self.relay:
+            self.pool.use_relay(self.relay)
+            self.sock = RelayListener(self.relay, self.me)
+            self.host, self.port = self.relay
+        else:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.sock.bind((host, port))
+            self.sock.listen(128)
+            self.host, self.port = self.sock.getsockname()[:2]
 
     # -- 第二阶段：装载 ---------------------------------------------------- #
+    def _release_model(self) -> None:
+        """装新的之前，先把上一份放掉。
+
+        **顺序是这里唯一要紧的事。** 原来的写法是先 `SelectiveLoader.load()` 把
+        新张量全部分配出来，最后才 `self.model = SegModel(...)` —— 也就是说整个
+        装载过程中旧模型一直挂在 `self` 上，显存峰值是**两份**。
+
+        一份 14.6GB 的前段配在 22GB 的卡上绰绰有余，两份就必然炸。实测正是如此：
+        第二次 configure 报 OOM，且「保留但未用」只有 1.58MiB —— 不是碎片，是旧
+        张量真的还被引用着。后果是同一批 agent 只能被 configure 一次，而 `measure`
+        每跑一遍都要重新下发清单，于是每次实验前都得重启 15 个进程。
+
+        `gc.collect()` 不能省：模型是模块套模块，父子互指成环，光靠引用计数放不掉。
+        环要等下一次 gc 才收，而下一次 gc 很可能发生在新张量已经分配之后 —— 那就
+        白让了。
+        """
+        if self.model is None:
+            return
+        device = str(getattr(self.cfg, "device", "") or "") if self.cfg else ""
+        self.model = None
+        gc.collect()
+        if device.startswith("cuda"):
+            # 缓存分配器手里的空闲块本进程能重用，但形状对不上时仍会碎。
+            # 还给驱动一次，代价是下一次分配要重新问驱动要，几十毫秒。
+            from .weights import release_cuda_cache
+
+            release_cuda_cache()
+
     def apply_config(self, cfg: NodeConfig) -> dict:
-        """收到清单：加载**属于自己那一段的那几层的那些专家**。"""
+        """收到清单：加载**属于自己那一段的那几层的那些专家**。
+
+        两个后端共用这一条路径，因为它们的契约相同
+        （`forward(req, x) -> (y, MoEStats)`、`drop_kv` 等）。
+        """
+        self._release_model()   # 先放旧的，再装新的 —— 见上面的注释
         self.cfg = cfg
-        self.mcfg = ToyMoEConfig(**cfg.model)
         t0 = time.perf_counter()
-        self.model = SegmentModel(self.mcfg, cfg.layer_experts)
+        extra: dict = {}
+        if cfg.backend == "torch":
+            self.mcfg, extra = self._load_torch(cfg)
+        else:
+            self.mcfg = ToyMoEConfig(**cfg.model)
+            self.model = SegmentModel(self.mcfg, cfg.layer_experts)
+        if cfg.profile:
+            self.model.enable_profiling()
         self.load_ms = (time.perf_counter() - t0) * 1000
-        self.clf = (
-            HistogramClassifier.from_wire(cfg.classifier) if cfg.classifier else None
-        )
+        self.clf = make_classifier(cfg.classifier)
         self.links = LinkTable.from_dict(cfg.links)
         self.pool = PeerPool(self.me, self.links, seed=abs(hash(self.me)) % (2**31),
                              egress_ms=self.access_ms,
                              egress_jitter_ms=self.access_jitter_ms)
+        self.pool.use_relay(self.relay)   # 重建连接池时别把中继设置丢了
         for n, a in cfg.peers.items():
             self.pool.register(n, a)
         self.pool.register("__coord__", cfg.coordinator)
         return {
             "node": self.me, "segment": cfg.segment, "role": cfg.role,
+            "backend": cfg.backend,
             "layers": sorted(cfg.layer_experts),
             "n_experts": sum(len(v) for v in cfg.layer_experts.values()),
             "resident_mb": round(self.model.resident_bytes / 1e6, 3),
             "full_mb": round(self.model.full_bytes / 1e6, 3),
             "load_ms": round(self.load_ms, 1),
+            "static_peer": cfg.static_peer,
+            "task": cfg.static_task,
+            **extra,
+        }
+
+    def _load_torch(self, cfg: NodeConfig):
+        """真实模型后端：按清单从 safetensors 只读需要的张量。
+
+        torch / safetensors 是**可选依赖**（requirements-node.txt）——
+        只有配成 backend="torch" 的节点才会走到这里，控制机永远不会。
+        """
+        from .weights import (
+            KeyPlan, SelectiveLoader, WeightIndex, qwen3_next_keys, qwen_moe_keys,
+        )
+
+        if not cfg.model_dir:
+            raise ValueError("backend='torch' 需要 model_dir")
+
+        # 按 checkpoint 自报的架构分派。**不要按「有没有某个字段」去猜** ——
+        # 猜错的代价是加载一个结构不对的模型，而它不会报错，只会算出垃圾。
+        arch = str(cfg.model.get("model_type", "")).lower()
+        archs = [str(a).lower() for a in cfg.model.get("architectures", [])]
+        is_next = arch == "qwen3_next" or any("qwen3next" in a for a in archs)
+
+        idx = WeightIndex(self.resolve_dir(cfg.model_dir))
+        plan = KeyPlan(layer_experts=cfg.layer_experts,
+                       with_embed=cfg.with_embed, with_lm_head=cfg.with_lm_head)
+        if is_next:
+            from .qwen3_next import NextModelConfig, TorchNextSegmentModel
+
+            mcfg = NextModelConfig.from_hf(cfg.model)
+            keys = qwen3_next_keys(
+                plan, layer_types=list(mcfg.layer_types),
+                shared_expert=mcfg.shared_intermediate > 0,
+                tie_word_embeddings=mcfg.tie_word_embeddings)
+            SegModel = TorchNextSegmentModel
+        else:
+            from .torch_model import TorchModelConfig, TorchSegmentModel
+
+            mcfg = TorchModelConfig.from_hf(cfg.model)
+            keys = qwen_moe_keys(plan, tie_word_embeddings=mcfg.tie_word_embeddings)
+            SegModel = TorchSegmentModel
+        tensors, rep = SelectiveLoader(idx).load(
+            keys, device=cfg.device, dtype=mcfg.torch_dtype
+        )
+        if rep.missing:
+            raise KeyError(f"checkpoint 缺 {len(rep.missing)} 个 key，首个: {rep.missing[0]}")
+        self.model = SegModel(mcfg, cfg.layer_experts, tensors, device=cfg.device,
+                              miss_policy=cfg.miss_policy)
+        return mcfg, {
+            "loaded_gb": round(rep.bytes_loaded / 1e9, 3),
+            "ckpt_gb": round(rep.bytes_total / 1e9, 3),
+            "load_fraction": round(rep.fraction, 4),
+            "shards": f"{rep.shards_opened}/{rep.shards_total}",
+            "model_dir": self.resolve_dir(cfg.model_dir),
+            "arch": "qwen3_next" if is_next else "qwen3_moe",
         }
 
     # -- 服务循环 ---------------------------------------------------------- #
@@ -188,8 +427,22 @@ class NodeServer:
                 try:
                     self._dispatch(header, arr, conn)
                 except Exception:
+                    tb = traceback.format_exc()
+                    # 上报给协调器 —— 但**这还不够**。
                     self._report({"type": "error", "node": self.me,
-                                  "trace": traceback.format_exc()[-800:]})
+                                  "trace": tb[-800:]})
+                    # 请求/应答型的消息，调用方正阻塞在 recv 上等回复。
+                    # 只上报不回复的话，它会一直等到超时 —— 而超时那条信息里
+                    # 什么都没有，真正的 traceback 又走了另一条通道
+                    # （下发清单那会儿上报通道可能还没建好，于是彻底丢了）。
+                    # 一个 120 秒的静默超时换来的是零信息，代价太大。
+                    if conn is not None and header.get("type") in _REPLIES:
+                        try:
+                            send_msg(conn, {"type": "error", "node": self.me,
+                                            "for": header.get("type"),
+                                            "trace": tb[-1500:]})
+                        except (OSError, ConnectionError):
+                            pass
         except (ConnectionError, OSError):
             pass
         finally:
@@ -219,10 +472,17 @@ class NodeServer:
                 send_msg(conn, {"type": "capabilities_ack", **self.capabilities()})
             return
         if t == "probe":
-            res = self.probe_peer(tuple(h["addr"]), int(h.get("k", 8)))
+            res = self.probe_peer(tuple(h["addr"]), int(h.get("k", 8)),
+                                  peer=h.get("peer"))
             if conn is not None:
                 send_msg(conn, {"type": "probe_ack", "peer": h["peer"],
                                 "src": self.me, **res})
+            return
+        if t == "check_model":
+            # 预检必须在 configure **之前**能答 —— 它问的就是「你能不能加载」
+            if conn is not None:
+                send_msg(conn, {"type": "check_model_ack",
+                                **self.check_model(str(h.get("dir", "")))})
             return
         if t == "configure":
             info = self.apply_config(NodeConfig.from_dict(h["config"]))
@@ -251,9 +511,31 @@ class NodeServer:
             self._report({"type": "kv_dropped", "req": h["req"], "node": self.me,
                           "dropped": dropped})
         elif t == "release":
+            # 释放前把这条请求的时序埋点报回去 —— 之后状态就没了。
+            # 报的是**时长**不是时刻：跨机的绝对时刻拼不到一条轴上（无时钟同步）。
+            st_ = self._reqs.get(h["req"])
+            if st_ is not None:
+                self._report({
+                    "type": "req_trace", "req": h["req"], "node": self.me,
+                    "segment": self.cfg.segment, "role": self.cfg.role,
+                    "layers": sorted(self.cfg.layer_experts),
+                    "n_experts": sum(len(v) for v in self.cfg.layer_experts.values()),
+                    "compute_ms": round(st_.compute_ms, 3),
+                    "n_forward": st_.n_forward,
+                    "bytes_out": st_.bytes_out,
+                    "local_span_ms": round((st_.last_seen - st_.first_seen) * 1000, 3)
+                    if st_.first_seen else 0.0,
+                })
             self.model.drop_kv(h["req"])
             with self._lock:
                 self._reqs.pop(h["req"], None)
+        elif t == "get_profile":
+            if conn is not None:
+                send_msg(conn, {"type": "profile_ack", "node": self.me,
+                                "segment": self.cfg.segment, "role": self.cfg.role,
+                                "task": self.cfg.static_task,
+                                **(self.model.profiler.to_wire()
+                                   if self.model.profiler else {"layers": {}})})
         elif t == "stats":
             self._report({"type": "node_stats", "node": self.me, **self.stats()})
 
@@ -262,25 +544,43 @@ class NodeServer:
         with self._lock:
             return self._reqs.setdefault(req, ReqState())
 
-    def _forward(self, x: np.ndarray, req: str) -> tuple[np.ndarray, MoEStats]:
+    def _forward(self, x: np.ndarray, req: str,
+                 cmask: list | None = None) -> tuple[np.ndarray, MoEStats]:
+        st_ = self._state(req)
         t0 = time.perf_counter()
-        h, st = self.model.forward(req, x)
-        self.compute_ms += (time.perf_counter() - t0) * 1000
+        if not st_.first_seen:
+            st_.first_seen = t0
+        if cmask is None:
+            h, st = self.model.forward(req, x)
+        else:
+            h, st = self.model.forward(req, x, count_mask=_ranges_to_mask(cmask, len(x)))
+        dt = (time.perf_counter() - t0) * 1000
+        self.compute_ms += dt
+        st_.compute_ms += dt
+        st_.n_forward += 1
+        st_.last_seen = time.perf_counter()
+        st_.bytes_out += int(getattr(h, "nbytes", 0)
+                             or (h.numel() * 4 if hasattr(h, "numel") else 0))
         return h, st
 
     def _on_prefill(self, h: dict) -> None:
         """协调器 → head(f)：一条新请求到达（盲绑已经在协调器侧完成）。"""
         req = h["req"]
-        x = embed_tokens(self.mcfg, h["ids"])
-        y, st = self._forward(x, req)
-        self._advance(req, "prefill", y, st, self.cfg.seg_head)
+        x = (self.model.embed_tokens(h["ids"]) if self.cfg.backend == "torch"
+             else embed_tokens(self.mcfg, h["ids"]))
+        # body 区间（task 选择器只数用户内容本身的 token）：只在前段 prefill 用，
+        # 随 hop 一路带到 tail(f)，每台只对这些位置计逐层统计
+        cm = h.get("cmask")
+        y, st = self._forward(x, req, cm)
+        self._advance(req, "prefill", y, st, self.cfg.seg_head, cmask=cm)
 
     def _on_hop(self, h: dict, arr: np.ndarray) -> None:
         """段内下一跳收到 hidden state（+ 捎带的直方图）。"""
         req = h["req"]
-        y, st = self._forward(arr, req)
+        cm = h.get("cmask")
+        y, st = self._forward(arr, req, cm)
         st = st.merge(MoEStats.from_wire(h["stats"]))
-        self._advance(req, h["phase"], y, st, h.get("loop_to"))
+        self._advance(req, h["phase"], y, st, h.get("loop_to"), cmask=cm)
 
     def _on_seg_in(self, h: dict, arr: np.ndarray) -> None:
         """对面那一段的入口收到 hidden state（跨接口，正向）。"""
@@ -296,16 +596,19 @@ class NodeServer:
         self._advance(req, h["phase"], y, st, loop_to)
 
     def _advance(
-        self, req: str, phase: str, y: np.ndarray, st: MoEStats, loop_to: str | None
+        self, req: str, phase: str, y: np.ndarray, st: MoEStats, loop_to: str | None,
+        *, cmask: list | None = None,
     ) -> None:
         """算完本节点的层之后往下走：段内还有下一跳就转发，否则按角色出段。"""
         if self.cfg.next_hop:
-            self.pool.send(
-                self.cfg.next_hop,
-                {"type": "hop", "req": req, "phase": phase,
-                 "stats": st.to_wire(), "loop_to": loop_to},
-                y,
-            )
+            # 逐层统计只在**前段 prefill** 捎带 —— 识别只在那一刻做。
+            # decode 每步、后段都不带，报文与以前逐字节相同。
+            lay = self.cfg.role == "front" and phase == "prefill"
+            hdr = {"type": "hop", "req": req, "phase": phase,
+                   "stats": st.to_wire(layers=lay), "loop_to": loop_to}
+            if lay and cmask is not None:
+                hdr["cmask"] = cmask
+            self.pool.send(self.cfg.next_hop, hdr, y)
             return
 
         if self.cfg.role == "front":
@@ -316,18 +619,53 @@ class NodeServer:
     # -- 前段出口：识别 + 绑定 --------------------------------------------- #
     def _front_tail(self, req: str, phase: str, y: np.ndarray, st: MoEStats) -> None:
         s = self._state(req)
+
+        # ---- 静态模式：配对在部署时就定死了，不识别、不问协调器 ----
+        if self.cfg.static_peer:
+            s.bound_to = s.bound_to or self.cfg.static_peer
+            s.cached_l0 = y if phase == "prefill" else s.cached_l0
+            self.pool.send(
+                s.bound_to,
+                {"type": "seg_in", "req": req, "phase": phase,
+                 "loop_to": self.cfg.seg_head, "task": self.cfg.static_task},
+                y,
+            )
+            if phase == "prefill":
+                msg = {
+                    "type": "static_forward", "req": req, "node": self.me,
+                    "task": self.cfg.static_task, "peer": s.bound_to,
+                    "front_stats": st.to_wire(layers=False),
+                }
+                # 旁路识别：hidden state 已经发出去了，这里算不耽误数据面
+                if self.clf is not None:
+                    msg["shadow"] = self._verdict_wire(self.clf.predict_stats(st))
+                if self.cfg.report_layers:
+                    msg["layers"] = st.to_wire()["lay"] if st.layers else {}
+                self._report(msg)
+            return
+
         if phase == "prefill":
             # 缓存 layer L₀ 输出 —— 换绑时靠它避免重放前段（命题 III.7.1/III.7.2）
             s.cached_l0 = y
-            v = self.clf.predict(st.hist) if self.clf else None
-            self._report({
+            v = self.clf.predict_stats(st) if self.clf else None
+            msg = {
                 "type": "classified", "req": req, "node": self.me,
                 "task": v.task if v else None,
                 "conf": round(v.confidence, 4) if v else 0.0,
                 "zone": v.zone if v else "none",
                 "scores": {k: round(x, 4) for k, x in (v.scores if v else {}).items()},
-                "front_stats": st.to_wire(),
-            })
+                "front_stats": st.to_wire(layers=False),
+                "clf": getattr(self.clf, "kind", None),
+            }
+            if v is not None and v.raw is not None:
+                msg["raw"] = {k: round(x, 4) for k, x in v.raw.items()}
+            if v is not None and v.error:
+                msg["clf_error"] = v.error
+            if v is not None and v.note:
+                msg["clf_note"] = v.note
+            if self.cfg.report_layers:
+                msg["layers"] = st.to_wire()["lay"] if st.layers else {}
+            self._report(msg)
             s.pending = y  # 等 bind
             return
 
@@ -340,6 +678,18 @@ class NodeServer:
                 y,
             )
 
+    @staticmethod
+    def _verdict_wire(v) -> dict:
+        d = {"task": v.task, "conf": round(v.confidence, 4), "zone": v.zone,
+             "scores": {k: round(x, 4) for k, x in v.scores.items()}}
+        if v.raw is not None:
+            d["raw"] = {k: round(x, 4) for k, x in v.raw.items()}
+        if v.error:
+            d["error"] = v.error
+        if v.note:
+            d["note"] = v.note
+        return d
+
     def _on_bind(self, h: dict) -> None:
         """协调器 → tail(f)：本请求绑到哪条后段。也用于换绑。"""
         req = h["req"]
@@ -348,8 +698,21 @@ class NodeServer:
         s.task = h.get("task")
         payload = s.pending if s.pending is not None else s.cached_l0
         if payload is None:
-            self._report({"type": "error", "req": req, "node": self.me,
-                          "trace": "bind 时没有可发的 L₀ 输出"})
+            # 这台从来没跑过这条请求的前段 —— 说明 bind 发错了地方。
+            # 报错要带足够的东西让人当场判断：谁、什么角色、手里有哪些请求。
+            # 只说「没有可发的输出」的话，读的人还得去猜是哪条请求、哪一段。
+            known = sorted(self._reqs)[:6]
+            self._report({
+                "type": "error", "req": req, "node": self.me,
+                "trace": (
+                    f"bind({req}) 时没有可发的 L₀ 输出 —— 本机没跑过这条请求的前段。"
+                    f" 本机角色={self.cfg.role if self.cfg else '?'}"
+                    f" 段={self.cfg.segment if self.cfg else '?'}"
+                    f" is_tail={self.cfg.is_tail if self.cfg else '?'};"
+                    f" 手里的请求={known or '无'}。"
+                    f" bind 应该发给该段**真正的尾节点** —— 段记录的 tail 与各节点"
+                    f"自己的 is_tail 对不上时就会发到这里。"),
+            })
             return
         s.pending = None
         # 换绑走的也是这条路：把**缓存的** L₀ 输出重发给新后段，前段一层都不重算
@@ -365,7 +728,8 @@ class NodeServer:
         req = h["req"]
         s = self._state(req)
         s.n_decode += 1
-        x = embed_tokens(self.mcfg, [h["token"]])
+        x = (self.model.embed_tokens([h["token"]]) if self.cfg.backend == "torch"
+             else embed_tokens(self.mcfg, [h["token"]]))
         y, st = self._forward(x, req)
         self._advance(req, "decode", y, st, self.cfg.seg_head)
 
@@ -376,16 +740,24 @@ class NodeServer:
         # 温度采样而非 argmax：权重绑定 + argmax 会让生成塌成一个不动点，
         # decode 阶段就永远在同一个 token 上打转，验证不到路由的动态。
         st_ = self._state(req)
-        logits = lm_head(self.mcfg, y[-1]) / max(self.mcfg.sample_temp, 1e-6)
-        pr = np.exp(logits - logits.max())
-        pr /= pr.sum()
-        rng = np.random.default_rng(abs(hash((req, st_.n_sampled))) % (2**31))
-        token = int(rng.choice(len(pr), p=pr))
+        if self.cfg.backend == "torch":
+            # 采样交给模型自己做 —— node.py 不 import torch，否则 toy 模型路径
+            # 也会被迫装 torch（见 test_requirements 的依赖边界）
+            token = self.model.sample(y, temperature=0.0)
+        else:
+            logits = lm_head(self.mcfg, y[-1]) / max(self.mcfg.sample_temp, 1e-6)
+            pr = np.exp(logits - logits.max())
+            pr /= pr.sum()
+            rng = np.random.default_rng(abs(hash((req, st_.n_sampled))) % (2**31))
+            token = int(rng.choice(len(pr), p=pr))
         st_.n_sampled += 1
+        stop = token in self.cfg.stop_ids
         self._report({
             "type": "token", "req": req, "node": self.me, "segment": self.cfg.segment,
-            "phase": phase, "token": token, "back_stats": st.to_wire(),
+            "phase": phase, "token": token, "back_stats": st.to_wire(), "stop": stop,
         })
+        if stop:
+            return          # 抄近路：不再绕环。收尾由协调器做（见 NodeConfig.stop_ids）
         if not loop_to:
             self._report({"type": "error", "req": req, "node": self.me,
                           "trace": "后段出口不知道回环目标"})
@@ -396,7 +768,9 @@ class NodeServer:
     # -- 未配置态：能力与探测 ---------------------------------------------- #
     def capabilities(self) -> dict:
         """上报本机能力。规划器的 Node 表就是由这些回包拼出来的。"""
+        cuda = _cuda_state()
         return {
+            "cuda": cuda,
             "node": self.me,
             "host": self.host,
             "port": self.port,
@@ -405,9 +779,56 @@ class NodeServer:
             "access_ms": self.access_ms,
             "ms_per_layer": _bench_ms_per_layer(),
             "configured": self.model is not None,
+            "relay": list(self.relay) if self.relay else None,
         }
 
-    def probe_peer(self, addr: tuple[str, int], k: int) -> dict:
+    def resolve_dir(self, model_dir: str | None) -> str | None:
+        """把 `{node}` 代成本机的节点名。
+
+        为什么由节点代而不是控制机代：**只在一处代，就只有一处会代错。**
+        预检问的是「你能不能加载」，加载做的是「按这个路径加载」—— 两者必须
+        是同一个路径，而唯一保证这一点的办法是让同一段代码算它。
+
+        真机上各机权重放在同一个路径，压根不用占位；占位是给「多个 agent 挤在
+        一台机器上」的演练用的。
+        """
+        if not model_dir:
+            return model_dir
+        return model_dir.replace("{node}", self.me)
+
+    def check_model(self, model_dir: str) -> dict:
+        """本机能不能加载这个 checkpoint —— 在下发清单**之前**回答。
+
+        权重分发还没做（TODO.md P0），`model_dir` 是各节点上的本地路径。
+        控制机读得到不代表这台读得到，而不预检的话故障会推迟到下发那一刻才爆，
+        那时前面几分钟的探测已经白跑。所以这里只做便宜的检查：目录在不在、
+        config.json 在不在、权重索引在不在、torch/safetensors 装没装。
+        """
+        if not model_dir:
+            return {"ok": False, "why": "没给目录"}
+        model_dir = self.resolve_dir(model_dir)
+        d = Path(model_dir)
+        if not d.is_dir():
+            return {"ok": False, "why": f"{d} 不存在或不是目录"}
+        if not (d / "config.json").exists():
+            return {"ok": False, "why": f"{d}/config.json 不存在"}
+        idx = d / "model.safetensors.index.json"
+        shards = sorted(d.glob("*.safetensors"))
+        if not idx.exists() and not shards:
+            return {"ok": False, "why": f"{d} 里没有 safetensors 权重"
+                                        f"（.bin 格式不支持：pickle 做不到只读部分张量）"}
+        for mod in ("torch", "safetensors"):
+            if importlib.util.find_spec(mod) is None:
+                return {"ok": False, "why": f"没装 {mod}"
+                                            f"（pip install -r requirements-node.txt）"}
+        return {
+            "ok": True,
+            "node": self.me,
+            "shards": len(shards),
+            "bytes": sum(f.stat().st_size for f in shards),
+        }
+
+    def probe_peer(self, addr: tuple[str, int], k: int, peer: str | None = None) -> dict:
         """**由本节点发起**去量到 addr 的延迟。
 
         为什么必须是节点自己去量：逐对代价 h(v,v′) 里最大的一项是两端的接入段
@@ -425,8 +846,18 @@ class NodeServer:
         rtts: list[float] = []
         s = None
         try:
-            s = socket.create_connection(addr, timeout=5.0)
-            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            if self.relay:
+                # 中继模式下量到的是**经中继的**往返，不是两台之间的真实延迟。
+                # 规划器据此做的放置仍然自洽（它优化的就是实际付出的延迟），
+                # 但别拿这些数字去推断链路质量。
+                if not peer:
+                    return {"ok": False, "error": "中继模式下探测要给对端节点 id",
+                            "p50": 0.0, "p95": 0.0, "k": k}
+                s = dial_via_relay(self.relay, self.me, peer, timeout=15.0)
+                s.settimeout(15.0)
+            else:
+                s = socket.create_connection(addr, timeout=5.0)
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             for i in range(k):
                 t0 = time.perf_counter()
                 self.pool.egress_delay()   # 本节点发出去也要过自己的接入段

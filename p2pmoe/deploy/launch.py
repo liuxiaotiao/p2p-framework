@@ -23,8 +23,11 @@ hosts 文件每行一台，`#` 注释：
 from __future__ import annotations
 
 import argparse
+import json
 import shlex
 import subprocess
+import threading
+import time
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -72,10 +75,37 @@ def read_hosts(path: Path) -> list[Host]:
 
 
 # --------------------------------------------------------------------------- #
-def _ssh(h: Host, cmd: str, *, ssh: str, user: str | None) -> tuple[bool, str]:
+def _brief(msg: str, width: int = 200) -> str:
+    """把多行输出压成一行，**保留头部**。
+
+    以前是 `msg[-160:]` —— 留尾巴。可失败原因几乎总在开头：
+    「读不到 https://… 的 config.json：SSL EOF」被切成「ingface.co/…/main」，
+    读的人看到的是半截 URL，看不出这是个网络错误。
+    """
+    lines = [x.strip() for x in msg.strip().splitlines() if x.strip()]
+    if not lines:
+        return "（没有输出）"
+    head = lines[0]
+    if len(lines) > 1:
+        head += f"  … +{len(lines) - 1} 行（末行：{lines[-1][:60]}）"
+    return head if len(head) <= width else head[:width - 1] + "…"
+
+
+def _ssh(h: Host, cmd: str, *, ssh: str, user: str | None,
+         timeout: float = 60.0) -> tuple[bool, str]:
+    """在 h 上跑一条命令。
+
+    `timeout` 默认 60 秒 —— 那是给 start/stop/status 这类**控制命令**的。
+    下载不能用这个数：单台最多要拉 22GB，60 秒必然超时，而超时抛出的
+    `TimeoutExpired` 消息里是一整串 argv，读起来完全不像「超时了」。
+    """
     target = f"{user}@{h.host}" if user else h.host
-    r = subprocess.run(shlex.split(ssh) + [target, cmd],
-                       capture_output=True, text=True, timeout=60)
+    try:
+        r = subprocess.run(shlex.split(ssh) + [target, cmd],
+                           capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, (f"ssh 超过 {timeout:.0f}s 没返回。"
+                       f"下载类命令要给足时间：--timeout <秒>")
     return r.returncode == 0, (r.stdout or r.stderr).strip()
 
 
@@ -112,9 +142,128 @@ def _start_cmd(h: Host, workdir: str, python: str, logdir: str) -> str:
     )
 
 
-def _stop_cmd(h: Host) -> str:
-    # 精确匹配 --id，避免误杀同机上别的 agent
-    return f"pkill -f {shlex.quote(f'p2pmoe.deploy.agent --id {h.node_id} ')} || true"
+def _expected_bytes(plan_path, per_node_dir: bool) -> dict[str, int]:
+    """清单里每台该拉多少字节。进度条的分母。"""
+    try:
+        m = json.loads(Path(plan_path).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return {n["node"]: int(float(n.get("weight_gb", 0)) * 1e9) for n in m.get("nodes", [])}
+
+
+def _du(h: Host, path: str, *, ssh: str, user: str | None) -> int:
+    """远端目录当前多大。`du -sb` 很便宜，30 秒问一次不心疼。"""
+    ok, out = _ssh(h, f"du -sb {shlex.quote(path)} 2>/dev/null | cut -f1",
+                   ssh=ssh, user=user, timeout=20)
+    if not ok:
+        return -1
+    tok = out.strip().split()
+    return int(tok[0]) if tok and tok[0].isdigit() else -1
+
+
+def _progress_loop(hosts, out_of: dict[str, int], out_dir, *, ssh, user,
+                   every: float, stop: "threading.Event", per_node_dir: bool,
+                   local: bool) -> None:
+    """每 `every` 秒打一次进度表。
+
+    为什么要有：`fetch` 是**几小时**的操作，而每个节点的输出被 `capture_output`
+    扣着，要等它整个跑完才吐出来。中间什么都没有的话，人分不清「在下」「卡住了」
+    和「早就死了」—— 而这三件事的处置完全不同。
+
+    问的是目录大小，不是进程状态：进程活着但一个字节没动，才是最需要看见的那种卡。
+    """
+    t0 = time.monotonic()
+    last: dict[str, int] = {}
+    while not stop.wait(every):
+        rows = []
+        for h in hosts:
+            d = f"{out_dir}/{h.node_id}" if per_node_dir else out_dir
+            got = -1 if local else _du(h, d, ssh=ssh, user=user)
+            want = out_of.get(h.node_id, 0)
+            # 第一次采样没有「上一次」可比 —— delta 记 None，而不是 0。
+            # 记 0 的话首屏会把每台都标成「无增长」，而那正是最刺眼的告警。
+            delta = None if h.node_id not in last else got - last[h.node_id]
+            rows.append((h.node_id, got, want, delta))
+            if got >= 0:
+                last[h.node_id] = got
+        done = sum(1 for _, g, w, _ in rows if w and g >= w * 0.98)
+        tot_got = sum(max(0, g) for _, g, _, _ in rows)
+        tot_want = sum(w for _, _, w, _ in rows) or 1
+        el = time.monotonic() - t0
+        rate = tot_got / el if el > 0 else 0
+        eta = (tot_want - tot_got) / rate if rate > 1e3 else 0
+        print(f"\n  ── 进度 +{el/60:.0f}min  "
+              f"{tot_got/1e9:.1f}/{tot_want/1e9:.0f}GB  "
+              f"({tot_got/tot_want:.0%})  {rate/1e6:.0f}MB/s  "
+              f"{done}/{len(rows)} 台完成"
+              + (f"  剩约 {eta/60:.0f}min" if eta else ""))
+        for nid, got, want, delta in sorted(rows):
+            if got < 0:
+                print(f"     {nid:<6} ?（问不到目录大小）")
+                continue
+            frac = got / want if want else 0
+            bar = "█" * round(24 * min(1.0, frac)) + "·" * (24 - round(24 * min(1.0, frac)))
+            # 两次之间没长 = 卡住了。进程还在不代表在下东西。
+            mark = ("  ⏸ 无增长" if delta == 0 and got < want * 0.98 else "")
+            print(f"     {nid:<6} {bar} {got/1e9:>5.1f}/{want/1e9:<5.1f}GB{mark}")
+
+
+def _warn_default_workdir(args) -> None:
+    """`--workdir` 默认是 `"."`，而远端的 `cd .` 落在 **ssh 登录目录**（通常是
+    $HOME），不是代码目录。症状是每台都报 `No module named 'p2pmoe'` ——
+    看起来像没装，其实是跑在了错的目录里。
+
+    本机模式（`--local`）没这个问题：`.` 就是当前进程的工作目录。
+    """
+    if args.local or args.workdir not in (".", "./"):
+        return
+    print("  ⚠ 没给 --workdir，远端会 `cd .` —— 那是 ssh 登录目录（通常 $HOME），")
+    print("    不是代码目录。如果各节点的代码不在那儿，会报 No module named 'p2pmoe'。")
+    print("    加上 --workdir /path/to/p2p-framework（deploy_15.sh 用 $WORKDIR）")
+
+
+def _stop_cmd(h: Host, *, by_port: bool = False) -> str:
+    """停掉这台上的 agent。
+
+    默认按 `--id` 精确匹配命令行 —— 同机上可能还跑着别人的东西，宁可漏杀不误杀。
+
+    但**漏杀的代价是下一轮起不来**：端口还被占着，`start` 报
+    `Address already in use`，而 `pkill -f` 只认命令行模式 —— 上一轮如果是手工
+    起的、或者参数顺序不同，模式就对不上。`by_port` 补的是这个洞：直接找谁在听
+    这个端口。它更狠，所以要显式要求，而且会先把杀掉的进程打出来。
+    """
+    pat = shlex.quote(f"p2pmoe.deploy.agent --id {h.node_id}")
+    # **不能直接用 `pkill -f`。**
+    #
+    # ssh 远端执行的是 `bash -c '<整条命令>'`，而这条命令里就写着那个模式 ——
+    # 于是 `pkill -f` 第一个匹配到的是**执行它的这个 shell 自己**，把自己杀掉，
+    # 后面的清理一句都跑不到。症状是 stop 悄无声息地什么也没做，
+    # 下一轮 start 照样 Address already in use。
+    #
+    # 所以先 pgrep 拿 pid，再**按 comm 只留 python 进程**：agent 是 python，
+    # 包裹它的 shell 是 bash，这样一刀切干净，不用去猜 $$ / $PPID 有几层。
+    base = (f"for p in $(pgrep -f {pat} 2>/dev/null); do "
+            f'case "$(ps -o comm= -p $p 2>/dev/null)" in '
+            f"python*|Python*) kill $p 2>/dev/null;; esac; done; ")
+    if not by_port:
+        return base + "true"
+    # 三条查法轮着来 —— 没有哪一条到处都有：
+    #   ss     容器镜像里常常没装（本仓库的开发容器就没有）
+    #   fuser  psmisc 包，最小化镜像里可能没有
+    #   lsof   有些发行版默认不装
+    # `ss -p` 还有个限制：只对自己的进程（或 root）给得出 pid。
+    return base + (
+        f"P=$(ss -lntpH 'sport = :{h.port}' 2>/dev/null "
+        f"| grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u); "
+        f'[ -z "$P" ] && P=$(fuser {h.port}/tcp 2>/dev/null); '
+        f'[ -z "$P" ] && P=$(lsof -ti tcp:{h.port} -sTCP:LISTEN 2>/dev/null); '
+        f'if [ -n "$P" ]; then '
+        f'echo "占用 {h.port} 的："; '
+        # 先看清楚杀的是什么再杀 —— 这台上可能跑着别人的东西
+        f"ps -o pid=,user=,cmd= -p $P 2>/dev/null | cut -c1-110; "
+        f"kill $P 2>/dev/null; sleep 1; kill -9 $P 2>/dev/null; echo 已清理; "
+        f"else echo '{h.port} 空闲'; fi"
+    )
 
 
 def probe_status(h: Host) -> tuple[Host, str]:
@@ -223,11 +372,110 @@ WantedBy=multi-user.target
 
 
 # --------------------------------------------------------------------------- #
+def _fetch_all(hosts, args) -> int:
+    """让每台节点**自己**去拉它那一份权重。
+
+    为什么是各节点自己拉而不是控制机拉了再分发：控制机的上行是单点，15 台机器
+    从它这里拿等于把并行的下载串行化了。各节点直连上游（或镜像），带宽是加起来的。
+
+    清单**不**推过去 —— 各节点只需要知道自己那一份，而 `--node` 加上清单里的
+    条目就够了。所以清单文件得在各节点上能读到（跟代码一起 rsync 过去即可）。
+    """
+    if not args.plan:
+        print("fetch 需要 --plan（部署清单）")
+        return 2
+    if not (args.repo or args.endpoint or args.base_url or args.src):
+        print("fetch 需要一个权重源：--repo / --endpoint / --base-url / --src")
+        return 2
+    out = args.out or "/data/p2pmoe-weights"
+    _warn_default_workdir(args)
+
+    def cmd_for(h) -> str:
+        parts = [args.python, "-m", "p2pmoe.deploy.fetch",
+                 "--plan", str(args.plan), "--node", h.node_id,
+                 "--out", f"{out}/{h.node_id}" if args.per_node_dir else out,
+                 "--mode", args.mode]
+        # 权重源三选一，与 fetch 的口径一致
+        if args.src:
+            parts += ["--src", args.src]
+        elif args.base_url:
+            parts += ["--base-url", args.base_url]
+        else:
+            if args.repo:
+                parts += ["--repo", args.repo, "--revision", args.revision]
+            if args.endpoint:
+                parts += ["--endpoint", args.endpoint]
+        if args.transport and args.transport != "auto":
+            parts += ["--transport", args.transport]
+        return " ".join(shlex.quote(x) for x in parts)
+
+    if args.dry_run:
+        # 打**真正会执行的那条**，含 `cd`。少打 cd 的代价：workdir 配错时
+        # dry-run 看起来完全正常，直到真跑才报 No module named 'p2pmoe'。
+        for h in hosts:
+            shown = (cmd_for(h) if args.local
+                     else f"cd {shlex.quote(args.workdir)} && {cmd_for(h)}")
+            print(f"  {h.node_id:<8} {shown}")
+        return 0
+
+    def run_one(h):
+        try:
+            if args.local:
+                import subprocess
+                r = subprocess.run(cmd_for(h), shell=True, cwd=args.workdir,
+                                   capture_output=True, text=True)
+                return h, r.returncode == 0, (r.stdout or r.stderr).strip()[-200:]
+            full = f"cd {shlex.quote(args.workdir)} && {cmd_for(h)}"
+            return (h, *_ssh(h, full, ssh=args.ssh, user=args.user,
+                             timeout=args.timeout))
+        except Exception as e:
+            return h, False, f"{type(e).__name__}: {e}"[:200]
+
+    # 各节点并行拉 —— 这正是不经控制机中转的意义
+    stop = threading.Event()
+    mon: threading.Thread | None = None
+    if args.progress_every > 0 and not args.local:
+        exp = _expected_bytes(args.plan, args.per_node_dir)
+        if exp:
+            print(f"  每 {args.progress_every:.0f}s 报一次进度"
+                  f"（问的是目录大小，不是进程状态）")
+            mon = threading.Thread(
+                target=_progress_loop, args=(hosts, exp, out),
+                kwargs=dict(ssh=args.ssh, user=args.user,
+                            every=args.progress_every, stop=stop,
+                            per_node_dir=args.per_node_dir, local=args.local),
+                daemon=True)
+            mon.start()
+    try:
+        with ThreadPoolExecutor(max_workers=args.parallel) as ex:
+            rows = list(ex.map(run_one, hosts))
+    finally:
+        stop.set()
+        if mon:
+            mon.join(timeout=3)
+        print()
+    n_ok = 0
+    for h, ok, msg in rows:
+        print(f"  {h.node_id:<8} {'✓' if ok else '✗'} {_brief(msg)}")
+        n_ok += ok
+    print(f"\nfetch: {n_ok}/{len(hosts)} 成功")
+    if n_ok == len(hosts):
+        where = f"{out}/<节点id>" if args.per_node_dir else out
+        print(f"\n各节点的权重在 {where}（每台只有自己那一份张量）")
+        if not args.per_node_dir:
+            print(f"下一步：控制器加 --model-dir {out} —— 对 15 台是同一个值，"
+                  f"因为每台机器上那个目录里装的正好是它自己要的")
+        print("提醒：这份权重是**按当时的驻留集**拉的。改了画像、覆盖率或分层之后"
+              "要重拉，否则节点加载时会报「缺 N 个 key」")
+    return 0 if n_ok == len(hosts) else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="p2pmoe-launch",
                                  description="批量管理节点 agent")
     ap.add_argument("action",
-                    choices=["start", "stop", "status", "probe", "agents", "systemd"])
+                    choices=["start", "stop", "status", "probe", "agents", "systemd",
+                             "fetch"])
     ap.add_argument("--hosts", type=Path, help="hosts 文件")
     ap.add_argument("--workdir", default=".", help="各节点上代码所在目录")
     ap.add_argument("--python", default="python3")
@@ -237,7 +485,42 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--local", action="store_true",
                     help="不走 ssh，在本机执行（用于同机演练与自测）")
     ap.add_argument("--parallel", type=int, default=16)
+    ap.add_argument("--by-port", action="store_true",
+                    help="stop 时连**占着端口的进程**一起清。`pkill -f` 只认命令行"
+                         "模式，上一轮手工起的或参数顺序不同就漏掉了 —— 而漏掉的"
+                         "代价是下一轮 Address already in use。会先把杀掉的进程打出来")
+    ap.add_argument("--progress-every", type=float, default=30.0, metavar="秒",
+                    help="fetch 期间多久报一次进度（0=关）。问的是各节点输出目录"
+                         "的大小 —— 几小时的操作没有中间输出的话，"
+                         "分不清「在下」「卡住了」和「早就死了」")
+    ap.add_argument("--timeout", type=float, default=4 * 3600, metavar="秒",
+                    help="fetch 的单节点超时。默认 4 小时 —— 单台最多拉 22GB，"
+                         "控制命令那套 60 秒的口径在这里必然超时")
     ap.add_argument("--k", type=int, default=8, help="probe 的采样次数")
+    # fetch 子命令用
+    ap.add_argument("--plan", type=Path, help="部署清单 JSON（fetch 用）")
+    ap.add_argument("--repo", default=None, help="HF 仓库，如 Qwen/Qwen3-30B-A3B")
+    ap.add_argument("--revision", default="main")
+    ap.add_argument("--endpoint", default=None, help="HF 镜像地址")
+    ap.add_argument("--base-url", default=None,
+                    help="任意 base URL —— 局域网权重源（serve_weights）用这个")
+    ap.add_argument("--src", default=None,
+                    help="各节点都能读到的全量 checkpoint 目录（NFS/共享盘）")
+    ap.add_argument("--transport", choices=("auto", "urllib", "curl"),
+                    default="auto",
+                    help="透传给各节点的 fetch。curl 能下而 Python 下不动时用")
+    ap.add_argument("--out", default=None,
+                    help="各节点上放权重的目录。**各机同一个路径** —— "
+                         "节点 id 决定拉什么，不决定放哪，这样 --model-dir 对 "
+                         "15 台是同一个值")
+    ap.add_argument("--per-node-dir", action="store_true",
+                    help="改成 <out>/<节点id>。只在同机演练（多个 agent 在一台机器上）"
+                         "时需要，真机上别开")
+    ap.add_argument("--mode", choices=("slice", "shard"), default="slice")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="只打印各节点上该跑的命令，不执行。"
+                         "**没配 ssh 就用它**：把命令拷到各机自己跑，效果一样 —— "
+                         "ssh 只是这个脚本的便利，框架本身不需要它")
     # systemd 子命令用
     ap.add_argument("--id", default="v1")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
@@ -258,6 +541,9 @@ def main(argv: list[str] | None = None) -> int:
         print(",".join(f"{h.node_id}={h.host}:{h.port}" for h in hosts))
         return 0
 
+    if args.action == "fetch":
+        return _fetch_all(hosts, args)
+
     if args.action == "probe":
         return _probe_matrix(hosts, k=args.k, parallel=args.parallel)
 
@@ -274,6 +560,17 @@ def main(argv: list[str] | None = None) -> int:
                   "分散环境下这是常态")
         return 0 if up else 1
 
+    if args.dry_run:
+        # ssh 是 launch 的便利，不是框架的依赖。打印出来自己跑，结果一模一样。
+        for h in hosts:
+            cmd = (_start_cmd(h, args.workdir, args.python, args.logdir)
+                   if args.action == "start" else _stop_cmd(h, by_port=args.by_port))
+            print(f"# {h.node_id} @ {h.host}\n{cmd}\n")
+        return 0
+
+    if args.action == "start":
+        _warn_default_workdir(args)
+
     def run_one(h: Host):
         try:
             if args.local:
@@ -281,7 +578,8 @@ def main(argv: list[str] | None = None) -> int:
                            if args.action == "start" else _local_stop(h))
             else:
                 cmd = (_start_cmd(h, args.workdir, args.python, args.logdir)
-                       if args.action == "start" else _stop_cmd(h))
+                       if args.action == "start"
+                       else _stop_cmd(h, by_port=args.by_port))
                 ok, msg = _ssh(h, cmd, ssh=args.ssh, user=args.user)
             return h, ok, msg[:120]
         except Exception as e:
@@ -291,9 +589,66 @@ def main(argv: list[str] | None = None) -> int:
         rows = list(ex.map(run_one, hosts))
     n_ok = 0
     for h, ok, msg in rows:
-        print(f"  {h.node_id:<8} {h.host:<16} {'✓' if ok else '✗'} {msg}")
+        print(f"  {h.node_id:<8} {h.host:<16} {'✓' if ok else '✗'} {_brief(msg)}")
         n_ok += ok
     print(f"\n{args.action}: {n_ok}/{len(hosts)} 成功")
+
+    if args.action == "start" and n_ok:
+        # PID **不是**存活证明 —— `setsid nohup ... &` 立刻返回 PID，进程随后
+        # 因为缺依赖、端口占用、代码不在 workdir 而死掉，start 却报了 ✓。
+        # 这里补一次真正的存活检查：等几秒，然后按 hosts 逐台探端口。
+        import socket as _sock
+        import time as _time
+
+        print("\n验活（PID 只说明 fork 成功了，不说明进程还在）…")
+        _time.sleep(5)
+        dead = []
+        for h in hosts:
+            try:
+                with _sock.create_connection((h.host, h.port), timeout=3):
+                    pass
+            except OSError:
+                dead.append(h)
+        if not dead:
+            print(f"  ✓ {len(hosts)}/{len(hosts)} 台在听 {hosts[0].port}")
+        else:
+            print(f"  ✗ {len(dead)}/{len(hosts)} 台起来就死了："
+                  f"{', '.join(h.node_id for h in dead)}")
+            print("  —— 下面是它们各自日志的最后几行（死因通常就在这里）：")
+            logf = f"{args.logdir}/agent-{{}}.log"
+            for h in dead[:5]:
+                print(f"\n  ── {h.node_id} @ {h.host} : {logf.format(h.node_id)}")
+                if args.local:
+                    try:
+                        tail = Path(logf.format(h.node_id)).read_text(
+                            encoding="utf-8", errors="replace").splitlines()[-12:]
+                    except OSError as e:
+                        tail = [f"（读不到日志：{e}）"]
+                else:
+                    # ssh 失败 与 日志不存在 是两回事 —— 前者是网络，后者是
+                    # 代码没到。tail 对缺文件返回非零，混在一起会把「没同步」
+                    # 误报成「连不上」，修法正好相反。
+                    lp = shlex.quote(logf.format(h.node_id))
+                    ok2, out = _ssh(
+                        h, f"if [ -s {lp} ]; then tail -n 12 {lp}; "
+                           f"else echo __NOLOG__; fi",
+                        ssh=args.ssh, user=args.user)
+                    if not ok2:
+                        tail = [f"（ssh 连不上：{out.splitlines()[0] if out else ''}）"]
+                    elif out.strip() == "__NOLOG__":
+                        tail = [f"（日志不存在 —— 进程连启动都没到，"
+                                f"`cd {args.workdir}` 就失败了，代码不在那儿）"]
+                    else:
+                        tail = out.splitlines()
+                for ln in tail:
+                    print(f"     {ln[:160]}")
+            if len(dead) > 5:
+                print(f"\n  （还有 {len(dead)-5} 台，同样看 {logf.format('<id>')}）")
+            print("\n  最常见的三个原因：")
+            print("    1. 节点上没装依赖 —— `pip3 install -r requirements-node.txt`")
+            print(f"    2. 代码不在 {args.workdir} —— 先 ./deploy_15.sh sync")
+            print(f"    3. 端口 {hosts[0].port} 被占 —— `ss -lntp | grep {hosts[0].port}`")
+            return 1
 
     if args.action == "start":
         print("\n下一步（等几秒让 agent 起完）：")

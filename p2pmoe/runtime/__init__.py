@@ -7,6 +7,7 @@
 from .model import ToyMoEConfig, MoEStats, PartialExpertMoEBlock, SegmentModel
 from .corpus import make_corpus, profile_from_corpus, sample_prompt
 from .identify import HistogramClassifier, Verdict
+from .lr_classifier import FeatureSpec, LRClassifier
 from .wire import LinkTable, PeerPool
 from .node import NodeConfig, NodeServer, run_node
 from .coordinator import Coordinator, LocalCluster, RequestRecord
@@ -23,7 +24,7 @@ except ImportError:  # pragma: no cover
 __all__ = [
     "ToyMoEConfig", "MoEStats", "PartialExpertMoEBlock", "SegmentModel",
     "make_corpus", "profile_from_corpus", "sample_prompt",
-    "HistogramClassifier", "Verdict",
+    "HistogramClassifier", "Verdict", "LRClassifier", "FeatureSpec",
     "LinkTable", "PeerPool",
     "NodeConfig", "NodeServer", "run_node",
     "Coordinator", "LocalCluster", "RequestRecord",

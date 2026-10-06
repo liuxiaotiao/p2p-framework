@@ -35,6 +35,7 @@ from .common_band import (
     sweep_bandwidth,
 )
 from .experts import ExpertPlacement
+from .fill import FillResult, fill_idle
 from .loop_trim import TrimResult, loop_profile, trim_by_loop
 from .manifest import DeploymentManifest, build_manifest
 from .memory import L0Candidate, choose_l0, hops_min, make_back_spec, make_front_spec
@@ -293,6 +294,10 @@ class PlanResult:
     没有专家身份就写不出「这一层装哪些专家」。"""
     log: list[str] = field(default_factory=list)
     n_probes: int = 0
+    fill: FillResult | None = None
+    """开了 cfg.fill_idle 时的补位记录。fronts_final / standby / backs 已是补位后的。"""
+    audit_core: AuditReport | None = None
+    """补位前、只含核心段的终审。开补位时 audit 是全网格的，这里留着核心那份做对照。"""
 
     @property
     def n_back_total(self) -> int:
@@ -415,6 +420,7 @@ def plan(
             s = deploy_path(
                 spec, sorted(free), node_map, net, build_obj,
                 beam_width=cfg.beam_width, prune_topk=cfg.prune_topk,
+                exhaustive_short=cfg.exhaustive_short,
             )
             if s is None:
                 log.append(
@@ -662,6 +668,7 @@ def plan(
         s = deploy_path(
             front_spec, sorted(pool), node_map, net, front_obj,
             beam_width=cfg.beam_width_front, prune_topk=cfg.prune_topk,
+            exhaustive_short=cfg.exhaustive_short,
         )
         if s is None:
             break
@@ -721,6 +728,27 @@ def plan(
         + ("通过" if audit.passed else "未通过：" + "；".join(audit.reasons))
     )
 
+    # ---------------- 补位（可选）：把空着的节点全部用上 --------------------
+    fill: FillResult | None = None
+    audit_core: AuditReport | None = None
+    if cfg.fill_idle:
+        fill = fill_idle(
+            fronts=fronts_final, standby=standby, backs=backs, tasks=tasks,
+            model=model, union_experts=union_experts, l0=l0,
+            node_map=node_map, net=net, cfg=cfg,
+        )
+        log.extend(fill.log)
+        audit_core = audit
+        fronts_final, standby, backs = fill.fronts, fill.standby, fill.backs
+        n_back_total = sum(len(v) for v in backs.values())
+        audit = _audit(fronts_final, backs, net, cfg, [t.name for t in tasks])
+        log.append(
+            f"[补位·终审] 全网格 {len(fronts_final)}×{n_back_total} = {len(audit.pairs)} 组，"
+            f"最坏相对极差 {audit.worst_rel_spread * 100:.1f}%"
+            f"（核心网格 {audit_core.worst_rel_spread * 100:.1f}%，η={cfg.eta * 100:.0f}%）"
+            + ("" if audit.passed else " —— 补位段不在公共带内，这是开 --fill-idle 的已知代价")
+        )
+
     # ---------------- 部署清单 + 组合矩阵 ----------------------------------
     manifest: DeploymentManifest | None = None
     back_plc = {t.name: t.placement for t in tasks if t.placement is not None}
@@ -739,6 +767,10 @@ def plan(
             cfg=cfg,
             band=(band_res.w_lo, band_res.w_hi),
             w_cap=w_cap,
+            **({} if fill is None else dict(
+                origin=fill.origin, relaxed=fill.relaxed,
+                spread_nodes={r for r, _ in fill.spread}, idle=fill.still_idle,
+            )),
         )
         n_pairs = len(manifest.pairings)
         log.append(
@@ -769,6 +801,8 @@ def plan(
         manifest=manifest,
         log=log,
         n_probes=net.n_probes,
+        fill=fill,
+        audit_core=audit_core,
     )
 
 
@@ -804,6 +838,7 @@ def _rebuild_entry(
             got = deploy_path(
                 back_specs[u], sorted(pool), node_map, net, obj,
                 beam_width=cfg.beam_width, prune_topk=cfg.prune_topk,
+                exhaustive_short=cfg.exhaustive_short,
             )
             if got is None:
                 return False

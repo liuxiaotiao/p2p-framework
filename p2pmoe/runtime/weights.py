@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
-__all__ = ["KeyPlan", "qwen_moe_keys", "WeightIndex", "SelectiveLoader", "LoadReport"]
+__all__ = ["qwen3_next_keys", "KeyPlan", "qwen_moe_keys", "WeightIndex", "SelectiveLoader", "LoadReport"]
 
 
 # --------------------------------------------------------------------------- #
@@ -35,6 +35,47 @@ class KeyPlan:
     """是否需要词嵌入（前段的 head 需要）。"""
     with_lm_head: bool = False
     """是否需要输出头与最终 norm（后段的 tail 需要）。"""
+
+
+def cuda_state() -> dict:
+    """CUDA 现在能不能用，以及不能用时**是哪一种**不能用。
+
+    `torch.cuda.is_available()` 为真也可能在真正分配时才炸（驱动刚被卸载、
+    GPU 被别人独占、ECC 复位中）—— 所以光问不够，要真摸一下。
+
+    「CUDA unknown error」最常见的成因是驱动反复加载卸载：没开持久化模式时，
+    GPU 一空闲就掉驱动，下一个进程再初始化就撞上竞态。
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return {"ok": False, "why": "torch.cuda.is_available() 为假"}
+    n = torch.cuda.device_count()
+    if n == 0:
+        return {"ok": False, "why": "可见 GPU 数为 0"}
+    try:
+        torch.zeros(8, device="cuda:0")     # 光问不够，真分配一次
+    except Exception as e:
+        return {"ok": False, "why": f"分配失败 {type(e).__name__}: {e}"[:200]}
+    return {"ok": True, "n": n, "name": torch.cuda.get_device_name(0)}
+
+
+def release_cuda_cache() -> None:
+    """把缓存分配器手里的空闲块还给驱动。
+
+    调用方（`NodeServer._release_model`）刚刚丢掉了上一份模型的引用。那些显存
+    已经回到 PyTorch 的缓存池里，本进程能重用 —— 但只在**块的形状对得上**时。
+    重新配置往往换了层数和专家数，块的大小全变，于是池子里躺着一堆用不上的
+    空闲块，而新的分配还要向驱动要。`empty_cache()` 把它们退回去。
+
+    住在这里而不是 `node.py` 里，理由和 `cuda_state()` 一样：
+    `test_heavy_deps_stay_in_the_execution_layer` 盯着 —— 控制面那一层
+    （node.py 也在其中）一个 torch 都不许 import。
+    """
+    import torch
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def qwen_moe_keys(plan: KeyPlan, *, tie_word_embeddings: bool = False) -> set[str]:
@@ -219,3 +260,67 @@ class SelectiveLoader:
             missing=sorted(want - set(tensors)),
         )
         return tensors, report
+
+
+# --------------------------------------------------------------------------- #
+def qwen3_next_keys(plan: KeyPlan, *, layer_types: Sequence[str],
+                    shared_expert: bool = True,
+                    tie_word_embeddings: bool = False) -> set[str]:
+    """Qwen3-Next 的 key 命名 —— **逐层不同**，这是它与 Qwen3-MoE 最大的差别。
+
+    每 4 层里 3 层是 Gated DeltaNet、1 层是标准 attention（`full_attention_interval`），
+    两种层的 key 集合完全不重叠::
+
+        linear_attention  model.layers.{i}.linear_attn.{A_log, dt_bias, conv1d.weight,
+                                                        in_proj_qkvz, in_proj_ba,
+                                                        norm, out_proj}.weight
+        full_attention    model.layers.{i}.self_attn.{q,k,v,o}_proj.weight
+                          model.layers.{i}.self_attn.{q,k}_norm.weight
+
+    两种层都有 MoE，且都带一个**共享专家**（`mlp.shared_expert.*` 与
+    `mlp.shared_expert_gate.weight`）。共享专家对每个 token 都激活，
+    **不参与驻留集裁剪** —— 承载该层的节点必须装它。
+
+    `layer_types` 用 1-based 的层号索引（`layer_types[l-1]`），与规划器口径一致。
+    """
+    keys: set[str] = set()
+    for layer, experts in plan.layer_experts.items():
+        i = int(layer) - 1                       # 1-based → 0-based
+        p = f"model.layers.{i}"
+        kind = layer_types[i]
+        keys |= {f"{p}.input_layernorm.weight", f"{p}.post_attention_layernorm.weight",
+                 f"{p}.mlp.gate.weight"}
+        if kind == "linear_attention":
+            keys |= {
+                f"{p}.linear_attn.A_log", f"{p}.linear_attn.dt_bias",
+                f"{p}.linear_attn.conv1d.weight",
+                f"{p}.linear_attn.in_proj_qkvz.weight",
+                f"{p}.linear_attn.in_proj_ba.weight",
+                f"{p}.linear_attn.norm.weight",
+                f"{p}.linear_attn.out_proj.weight",
+            }
+        else:
+            keys |= {
+                f"{p}.self_attn.q_proj.weight", f"{p}.self_attn.k_proj.weight",
+                f"{p}.self_attn.v_proj.weight", f"{p}.self_attn.o_proj.weight",
+                f"{p}.self_attn.q_norm.weight", f"{p}.self_attn.k_norm.weight",
+            }
+        if shared_expert:
+            keys |= {
+                f"{p}.mlp.shared_expert.gate_proj.weight",
+                f"{p}.mlp.shared_expert.up_proj.weight",
+                f"{p}.mlp.shared_expert.down_proj.weight",
+                f"{p}.mlp.shared_expert_gate.weight",
+            }
+        for e in experts:
+            keys |= {
+                f"{p}.mlp.experts.{int(e)}.gate_proj.weight",
+                f"{p}.mlp.experts.{int(e)}.up_proj.weight",
+                f"{p}.mlp.experts.{int(e)}.down_proj.weight",
+            }
+    if plan.with_embed:
+        keys.add("model.embed_tokens.weight")
+    if plan.with_lm_head:
+        keys.add("model.norm.weight")
+        keys.add("model.embed_tokens.weight" if tie_word_embeddings else "lm_head.weight")
+    return keys

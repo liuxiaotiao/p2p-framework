@@ -115,6 +115,13 @@ class DeploymentManifest:
     band: tuple[float, float]
     standby_fronts: list[str]
     violations: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    """不阻止上线、但要让人知道的事。目前只有一类：补位（--fill-idle）建出来的
+    段不在公共带内，涉及它们的组合的带内 / w_cap / 抖动检查记在这里而不是
+    violations —— 那是开 --fill-idle 时明知故犯的取舍，不是清单坏了。"""
+    idle: list[str] = field(default_factory=list)
+    """规划完仍然没有任何角色的节点。不开补位时这里为空（主流程不记），
+    开了补位还剩下的，是连一层都装不下的。"""
 
     @property
     def ok(self) -> bool:
@@ -143,26 +150,7 @@ class DeploymentManifest:
             "model": self.model,
             "l0": self.l0,
             "band": {"w_lo": self.band[0], "w_hi": self.band[1]},
-            "nodes": [
-                {
-                    "node": p.node,
-                    "role": p.role,
-                    "segment": p.segment,
-                    "position": p.position,
-                    "is_head": p.is_head,
-                    "is_tail": p.is_tail,
-                    "layer_range": list(p.layer_range),
-                    "weight_gb": round(p.weight_gb, 4),
-                    "kv_gb": round(p.kv_gb, 4),
-                    "total_gb": round(p.total_gb, 4),
-                    "layers": [
-                        {"layer": l.layer, "experts": list(l.experts),
-                         "weight_gb": round(l.weight_gb, 4)}
-                        for l in p.layers
-                    ],
-                }
-                for p in self.nodes
-            ],
+            "nodes": [_node_dict(p) for p in self.nodes],
             "segments": self.segments,
             "pairings": [
                 {
@@ -176,13 +164,98 @@ class DeploymentManifest:
             ],
             "standby_fronts": self.standby_fronts,
             "violations": self.violations,
+            # 只有补位才会产生这两项；空着就不写 —— 不开补位时存出来的清单与
+            # 以前逐字节一致（test_wiring.py 的往返测试守着这一点）
+            **({"warnings": self.warnings} if self.warnings else {}),
+            **({"idle": self.idle} if self.idle else {}),
         }
 
     def to_json(self, **kw) -> str:
         return json.dumps(self.to_dict(), ensure_ascii=False, indent=2, **kw)
 
+    # -- 反序列化 ---------------------------------------------------------- #
+    @classmethod
+    def from_dict(cls, d: Mapping) -> "DeploymentManifest":
+        """从存下来的清单还原 —— 让部署可以**不重新规划**就重放。
+
+        规划的输入里有一项是不可复现的：逐对延迟实测。同一个池子换个时间跑，
+        探测值会变，段的构成与 id 编号都可能跟着变。于是「我要 F0 连 BX1」
+        这种指定在下一次规划里可能指到别的东西上。
+
+        存清单 → 改连接 → 载清单，这条路把放置固定住，人工指定的连接才有稳定
+        的所指。代价是这份清单反映的是**当时**的网络与节点集合；机器换了或
+        链路劣化了要重跑规划。
+        """
+        nodes = [
+            NodePlan(
+                node=p["node"], role=p["role"], segment=p["segment"],
+                position=int(p["position"]),
+                is_head=bool(p["is_head"]), is_tail=bool(p["is_tail"]),
+                layers=tuple(
+                    LayerLoad(layer=int(l["layer"]), experts=tuple(l["experts"]),
+                              weight_gb=float(l["weight_gb"]),
+                              kv_gb=float(l.get("kv_gb", 0.0)))
+                    for l in p["layers"]
+                ),
+            )
+            for p in d["nodes"]
+        ]
+        pairings = [
+            Pairing(front=q["front"], back=q["back"], task=q["task"],
+                    forward=tuple(q["forward"]), loop=tuple(q["loop"]),
+                    w_p50=float(q["w_p50"]), w_p95=float(q.get("w_p95", 0.0)),
+                    w_jitter=float(q.get("w_jitter", 0.0)),
+                    d_loop_p50=float(q["d_loop_p50"]),
+                    d_loop_jitter=float(q.get("d_loop_jitter", 0.0)),
+                    t50=float(q["t50"]))
+            for q in d.get("pairings", [])
+        ]
+        band = d.get("band", {})
+        return cls(
+            model=d["model"], l0=int(d["l0"]), nodes=nodes,
+            segments=dict(d["segments"]), pairings=pairings,
+            band=(float(band.get("w_lo", 0.0)), float(band.get("w_hi", 0.0))),
+            standby_fronts=list(d.get("standby_fronts", [])),
+            violations=list(d.get("violations", [])),
+            warnings=list(d.get("warnings", [])),
+            idle=list(d.get("idle", [])),
+        )
+
+    @classmethod
+    def from_json(cls, text: str) -> "DeploymentManifest":
+        return cls.from_dict(json.loads(text))
+
 
 # --------------------------------------------------------------------------- #
+_ND = 6
+
+
+def _node_dict(p: "NodePlan") -> dict:
+    """逐节点的 JSON。
+
+    **逐节点的三个合计值由已经四舍五入过的逐层值加出来**，不是把精确合计再舍入。
+    两种算法在最后一位上会差 1e-6，于是「导出 → 载入 → 再导出」得不到同一份
+    文件，`--load-plan` 的可重放性就成了一句空话。以读者能复算的口径为准。
+    """
+    layers = [
+        {"layer": l.layer, "experts": list(l.experts),
+         "weight_gb": round(l.weight_gb, _ND),
+         # KV 也要落盘：逐节点的 total_gb 是由逐层数据算出来的，少了它
+         # from_dict 还原出来的清单对不上原来的账
+         "kv_gb": round(l.kv_gb, _ND)}
+        for l in p.layers
+    ]
+    w = round(sum(x["weight_gb"] for x in layers), _ND)
+    kv = round(sum(x["kv_gb"] for x in layers), _ND)
+    return {
+        "node": p.node, "role": p.role, "segment": p.segment,
+        "position": p.position, "is_head": p.is_head, "is_tail": p.is_tail,
+        "layer_range": list(p.layer_range),
+        "weight_gb": w, "kv_gb": kv, "total_gb": round(w + kv, _ND),
+        "layers": layers,
+    }
+
+
 def _layer_loads(
     seg: Segment,
     idx: int,
@@ -219,12 +292,24 @@ def build_manifest(
     cfg: PlannerConfig,
     band: tuple[float, float],
     w_cap: float,
+    origin: Mapping[Segment, str] | None = None,
+    relaxed: set[Segment] | frozenset[Segment] = frozenset(),
+    spread_nodes: set[str] | frozenset[str] = frozenset(),
+    idle: Sequence[str] = (),
 ) -> DeploymentManifest:
-    """把规划结果翻译成逐节点的加载指令 + 完整组合矩阵，并逐项校验。"""
+    """把规划结果翻译成逐节点的加载指令 + 完整组合矩阵，并逐项校验。
+
+    origin / relaxed / spread_nodes 只有开了补位（fill.fill_idle）才会传；
+    不传时输出与原来逐字一致。
+    """
+    origin = origin or {}
     node_plans: list[NodePlan] = []
     segments: dict[str, dict] = {}
+    relaxed_sids: set[str] = set()
 
     def add_segment(seg: Segment, sid: str, role: str, placement: ExpertPlacement) -> None:
+        if seg in relaxed:
+            relaxed_sids.add(sid)
         segments[sid] = {
             "role": role,
             "task": seg.task,
@@ -237,6 +322,11 @@ def build_manifest(
             "hop_ms": round(seg.hop_ms, 2),
             "delay_ms": round(seg.delay_ms, 2),
         }
+        if seg in origin:
+            segments[sid]["origin"] = origin[seg]
+        spread = [v for v in seg.nodes if v in spread_nodes]
+        if spread:
+            segments[sid]["spread_nodes"] = spread
         for i, v in enumerate(seg.nodes):
             node_plans.append(
                 NodePlan(
@@ -296,10 +386,12 @@ def build_manifest(
         pairings=pairings,
         band=band,
         standby_fronts=[v for s in standby for v in s.nodes],
+        idle=sorted(idle),
     )
     man.violations = _validate(
         man, model, node_map, front_placement, back_placements, cfg, w_cap,
         n_fronts=len(fronts), back_counts={u: len(v) for u, v in backs.items()},
+        relaxed_sids=relaxed_sids, warnings=man.warnings,
     )
     return man
 
@@ -316,8 +408,15 @@ def _validate(
     *,
     n_fronts: int,
     back_counts: Mapping[str, int],
+    relaxed_sids: set[str] | frozenset[str] = frozenset(),
+    warnings: list[str] | None = None,
 ) -> list[str]:
-    """七项一致性校验。任何一条不过，清单就不能上线。"""
+    """七项一致性校验。任何一条不过，清单就不能上线。
+
+    例外只有一处：第 7 项（公共带 / w_cap / 抖动闸）对**补位段**参与的组合降为
+    警告，写进 warnings。补位段本来就是在带外建的 —— 开 --fill-idle 就是接受
+    这个取舍；把它记成违规会让清单永远上不了线，等于没开。其余六项一律照旧。
+    """
     bad: list[str] = []
 
     # 1. 排他：一节点至多服务一条段（I.2.2）
@@ -379,16 +478,18 @@ def _validate(
     # 7. 逐对过闸：正向落在公共带内且 ≤ w_cap；两个接口的抖动都 ≤ J_cap（I.2.3）
     lo, hi = man.band
     for p in man.pairings:
+        relaxed = p.front in relaxed_sids or p.back in relaxed_sids
+        sink = (warnings if warnings is not None else []) if relaxed else bad
         if not (lo - 1e-6 <= p.w_p50 <= hi + 1e-6):
-            bad.append(
+            sink.append(
                 f"[公共带] {p.front}×{p.back} 的正向 w={p.w_p50:.1f}ms 落在带 "
                 f"[{lo:.1f},{hi:.1f}] 之外 —— 任意组合的前提被破坏"
             )
         if p.w_p50 > w_cap + 1e-6:
-            bad.append(f"[w_cap] {p.front}×{p.back} 正向 {p.w_p50:.1f} > {w_cap:.1f}")
+            sink.append(f"[w_cap] {p.front}×{p.back} 正向 {p.w_p50:.1f} > {w_cap:.1f}")
         if p.w_jitter > cfg.j_cap_ms + 1e-6:
-            bad.append(f"[抖动闸] {p.front}×{p.back} 正向抖动 {p.w_jitter:.1f} > {cfg.j_cap_ms}")
+            sink.append(f"[抖动闸] {p.front}×{p.back} 正向抖动 {p.w_jitter:.1f} > {cfg.j_cap_ms}")
         if p.d_loop_jitter > cfg.j_cap_ms + 1e-6:
-            bad.append(f"[抖动闸] {p.front}×{p.back} 回环抖动 {p.d_loop_jitter:.1f} > {cfg.j_cap_ms}")
+            sink.append(f"[抖动闸] {p.front}×{p.back} 回环抖动 {p.d_loop_jitter:.1f} > {cfg.j_cap_ms}")
 
     return bad

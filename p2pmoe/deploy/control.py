@@ -21,17 +21,28 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import logging
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 
-from ..planner.experts import build_placement, union_placement
+from ..planner.experts import (
+    ExpertPlacement,
+    build_placement,
+    full_placement,
+    union_placement,
+)
+from ..planner.hf_config import granularity_verdict, model_spec_from_hf
+from ..planner.manifest import DeploymentManifest
 from ..planner.network import MeasurementCache
 from ..planner.pipeline import PlanningError, plan
+from ..planner.static_pairing import assign_static_pairs
 from ..planner.types import ModelSpec, Node, PlannerConfig, TaskProfile
 from ..runtime.corpus import (
     make_corpus,
@@ -42,7 +53,9 @@ from ..runtime.corpus import (
 )
 from ..runtime.coordinator import Coordinator
 from ..runtime.identify import HistogramClassifier
+from ..runtime.lr_classifier import LRClassifier
 from ..runtime.model import ToyMoEConfig
+from ..runtime.text import TextIO
 from ..runtime.node import NodeConfig
 from ..runtime.wire import Addr, LinkTable, PeerPool, rpc
 from .probe import RemoteNetworkOracle
@@ -69,6 +82,93 @@ def parse_agents(s: str) -> dict[str, Addr]:
     return out
 
 
+def parse_tasks(s: str) -> list[tuple[str, float]]:
+    """--tasks 'general' 或 'code=0.6,chat=0.4' → [(名字, 到达率占比)]。
+
+    省略权重就按均分。权重只影响后段的**配额分配**（II.7.1 最大余额法）——
+    流量大的 task 分到更多条后段。
+    """
+    items = [x.strip() for x in s.split(",") if x.strip()]
+    out: list[tuple[str, float]] = []
+    for it in items:
+        name, _, w = it.partition("=")
+        out.append((name.strip(), float(w) if w else 0.0))
+    if all(w == 0.0 for _, w in out):
+        out = [(u, 1.0 / len(out)) for u, _ in out]
+    tot = sum(w for _, w in out)
+    return [(u, w / tot) for u, w in out]
+
+
+RELAY: Addr | None = None
+"""进程级的中继地址。控制面所有 rpc 都从这里取 —— 与其给十几个函数各加一个
+参数，不如认一个事实：一次部署要么全走中继，要么全不走，没有一半一半。"""
+
+
+def _probe_agent(node: str, addr: Addr, timeout: float = 8.0) -> str:
+    """这台 agent 现在是什么状态。返回 "alive" / "wedged" / "gone"。
+
+    **只做 TCP connect 是不够的。** 监听 socket 还在、内核就会把连接收进
+    backlog —— 进程卡死在一个永不返回的系统调用里（挂掉的 NFS、坏掉的块设备）
+    照样能连上。那样得到的「进程活着」是个假信号，会把人往「再等等」引，
+    而实际上等到天荒地老也不会好。
+
+    agent 是**每连接一个线程**（`NodeServer.serve_forever`），所以它在装载
+    模型的同时仍然应答得了 `capabilities`。于是：
+
+        连得上 + 答得出  → 真的只是在装，等就是了
+        连得上 + 不答    → **卡死**，等没有意义
+        连不上          → 进程没了
+    """
+    import socket as _s
+
+    try:
+        with _s.create_connection(addr, timeout=min(3.0, timeout)):
+            pass
+    except OSError:
+        return "gone"
+    try:
+        rpc(addr, {"type": "capabilities"}, timeout=timeout, relay=RELAY, to=node)
+        return "alive"
+    except Exception:
+        return "wedged"
+
+
+class NodeError(RuntimeError):
+    """节点在处理请求时抛了异常，并把 traceback 回了过来。
+
+    比超时好得多：超时那条信息里什么都没有，而这个带着节点上的真实堆栈。
+    """
+
+
+def _rpc(node: str, addr: Addr, header: dict, *, timeout: float = 30.0) -> dict:
+    r = rpc(addr, header, timeout=timeout, relay=RELAY, to=node)
+    if isinstance(r, dict) and r.get("type") == "error":
+        raise NodeError(
+            f"{node} 处理 {r.get('for', header.get('type'))} 时出错：\n"
+            + str(r.get("trace", "")).rstrip())
+    return r
+
+
+def check_model_dirs(addrs: dict[str, Addr], model_dir: str) -> list[str]:
+    """预检：每台节点自己看得见 checkpoint 吗？
+
+    **这是真机上最常见的翻车点。** 权重分发还没做（TODO.md P0），
+    `--model-dir` 是各节点上的**本地路径** —— 控制机能读到不代表节点能。
+    不预检的话，故障会推迟到下发清单那一刻才爆，而那时前面的探测（几分钟）
+    已经白跑了。
+    """
+    bad: list[str] = []
+    for name, addr in addrs.items():
+        try:
+            r = _rpc(name, addr, {"type": "check_model", "dir": model_dir}, timeout=30.0)
+        except Exception as e:
+            bad.append(f"{name}: 问不到（{e}）")
+            continue
+        if not r.get("ok"):
+            bad.append(f"{name}: {r.get('why', '未知')}")
+    return bad
+
+
 def toy_model_spec(cfg: ToyMoEConfig) -> ModelSpec:
     """toy 模型的真实字节数 → 规划器的内存模型（单位统一取 MB）。"""
     mb = 1e6
@@ -80,18 +180,490 @@ def toy_model_spec(cfg: ToyMoEConfig) -> ModelSpec:
 
 
 # --------------------------------------------------------------------------- #
-def collect_capabilities(addrs: dict[str, Addr], *, mem_cap_mb: float | None) -> list[Node]:
+def resolve_wiring(path: Path, manifest, fronts_ids: Sequence[str]) -> dict[str, tuple[str, str]]:
+    """读**人工指定**的前后段连接。
+
+    格式（JSON）::
+
+        {"pairs": [{"front": "F0",  "back": "BX0", "task": "X"},
+                   {"front": "n07", "back": "n11"}]}
+
+    `front` / `back` 既接受段 id（F0、BX0 —— 规划器给的），也接受**节点 id**
+    （n07 —— 你自己给机器起的名字）。后者更实用：段 id 是每次规划现编的，
+    换一次探测就可能重排；节点 id 是你写在 hosts.txt 里的，跨规划稳定。
+
+    `task` 省略时取后段自己的 task —— 后段本来就是按 task 建的，写不写都一样，
+    写了就多一道校验。
+    """
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    pairs = raw.get("pairs", raw if isinstance(raw, list) else None)
+    if not pairs:
+        raise SystemExit(f"{path} 里没有 pairs")
+
+    # 段 id → 段信息；节点 id → 它所属的段（一节点至多一条段，I.2.2）
+    by_node: dict[str, str] = {}
+    for sid, info in manifest.segments.items():
+        for v in info["nodes"]:
+            by_node[v] = sid
+
+    def to_sid(name: str, want: str) -> str:
+        sid = name if name in manifest.segments else by_node.get(name)
+        if sid is None:
+            raise SystemExit(
+                f"--wiring 里的 {name!r} 既不是段 id 也不是本次规划用到的节点。\n"
+                f"  可用前段: {sorted(fronts_ids)}\n"
+                f"  可用后段: {sorted(k for k in manifest.segments if k.startswith('B'))}\n"
+                f"  提示：先用 --save-wiring 导出自动配对，改完再用 --wiring 喂回来"
+            )
+        role = manifest.segments[sid]["role"]
+        if want == "front" and role != "front":
+            raise SystemExit(f"--wiring: {name!r} 解析成 {sid}，但它是 {role}，不是前段")
+        if want == "back" and not role.startswith("back:"):
+            raise SystemExit(f"--wiring: {name!r} 解析成 {sid}，但它是 {role}，不是后段")
+        return sid
+
+    out: dict[str, tuple[str, str]] = {}
+    used_back: dict[str, str] = {}
+    for i, item in enumerate(pairs):
+        f = to_sid(str(item["front"]), "front")
+        b = to_sid(str(item["back"]), "back")
+        task = manifest.segments[b]["role"].split(":", 1)[1]
+        if item.get("task") and item["task"] != task:
+            raise SystemExit(
+                f"--wiring 第 {i} 条写的 task={item['task']}，但后段 {b} 是按 "
+                f"{task} 建的。后段的 task 由它装了哪些专家决定，改不了 —— "
+                f"要么改这一行，要么重规划")
+        if f in out:
+            raise SystemExit(f"--wiring: 前段 {f} 被指了两次（{out[f][0]} 和 {b}）。"
+                             f"一条前段同时只能服务一条请求（I.2.4），不能一对多")
+        if b in used_back:
+            raise SystemExit(f"--wiring: 后段 {b} 被指了两次（{used_back[b]} 和 {f}）")
+        out[f], used_back[b] = (b, task), f
+    return out
+
+
+def wiring_to_json(wired: dict[str, tuple[str, str]], manifest) -> str:
+    """导出成 --wiring 能吃回去的格式，顺便把节点 id 也写上便于人读。"""
+    seg = manifest.segments
+    return json.dumps({"pairs": [
+        {"front": f, "back": b, "task": t,
+         "front_nodes": list(seg[f]["nodes"]), "back_nodes": list(seg[b]["nodes"])}
+        for f, (b, t) in sorted(wired.items())
+    ]}, ensure_ascii=False, indent=2)
+
+
+# --------------------------------------------------------------------------- #
+@dataclass
+class ModelSetup:
+    """「跑哪个模型、每层装哪些专家」—— toy 与真模型两条路的统一出口。"""
+
+    label: str
+    spec: ModelSpec
+    n_layers: int
+    n_experts: int
+    backend: str
+    """"numpy"（toy）| "torch"（真 checkpoint）"""
+    node_model: dict
+    """下发给节点的模型描述：toy 是 ToyMoEConfig 的字段，torch 是 HF config。"""
+    front_plc: ExpertPlacement
+    back_plcs: dict[str, ExpertPlacement]
+    tasks: list[TaskProfile]
+    mcfg: ToyMoEConfig | None = None
+    corpus: object | None = None
+    approximate: bool = True
+    """后段是否只驻留子集。False = 全装，输出与单机参考实现逐位一致。"""
+    profiles: dict | None = None
+    """逐 task 的 `ActivationProfile`（真模型 + --profile 时才有）。
+    动态模式的分类器要从它构造 —— 见 main() 里 clf 的分支。"""
+
+
+def load_cases(path: Path, tasks: Sequence[str]) -> list[tuple[str | None, "str | dict"]]:
+    """读测试集文件 → [(真实 task 或 None, prompt), ...]。
+
+    `.jsonl` 走 `_load_cases_jsonl`（与 task 选择器的 predict 输入同一种写法，
+    能区分模板段与 body 段）；其余按下面的纯文本格式读。
+
+    格式：一行一条。想标注真实 task 就写 `mbpp<TAB>prompt` —— 标注只用来
+    核对在线识别对不对，**不影响派发**（派发靠前段自己识别，那才是被测的东西）。
+
+    制表符前的字段只有**在 tasks 里认识**时才当成标注。否则整行都是 prompt ——
+    正文里出现制表符不该被误读成标注，而这在代码类 prompt 里很常见。
+    """
+    if path.suffix.lower() == ".jsonl":
+        return _load_cases_jsonl(path)
+    known = set(tasks)
+    cases: list[tuple[str | None, "str | dict"]] = []
+    for ln in path.read_text(encoding="utf-8").splitlines():
+        # 先只去行尾换行 —— rstrip() 会把 `mbpp<TAB>` 末尾的制表符也吃掉，
+        # 于是「有标注、prompt 为空」这一行会被误判成「没标注」。
+        ln = ln.rstrip("\r\n")
+        if not ln.strip() or ln.lstrip().startswith("#"):
+            continue
+        head, tab, rest = ln.partition("\t")
+        if tab and head.strip() in known:
+            cases.append((head.strip(), rest.rstrip()))
+        else:
+            cases.append((None, ln.rstrip()))
+    return cases
+
+
+def _load_cases_jsonl(path: Path) -> list[tuple[str | None, "str | dict"]]:
+    """一行一个 JSON，写法与 task_selector.py predict 的输入相同，外加可选的 task 标注::
+
+        {"task": "gsm8k", "text": "Janet's ducks lay 16 eggs per day..."}
+        {"task": "gsm8k", "segments": [["Solve the following math problem. ...Problem: ", true],
+                                       ["Janet's ducks ...", false]]}
+        {"task": "no_robots", "text": "Write a poem.", "system": "Be brief."}
+
+    * `text`：整条 user 消息都是 body；
+    * `segments`：`true` = 模板（不计入选择器特征），`false` = body。选择器训练时
+      gsm8k/math/mbpp/humaneval 都带任务指令模板 —— 想复现训练条件就这么写；
+    * `system`：作为模板段放在最前面，不计入 body（训练时 No Robots 就是这样处理的）。
+
+    `task` 可以是没部署的类（如 no_robots）：用来看选择器把它判去了哪里。
+    """
+    out: list[tuple[str | None, "str | dict"]] = []
+    for i, ln in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not ln.strip() or ln.lstrip().startswith("#"):
+            continue
+        try:
+            r = json.loads(ln)
+        except json.JSONDecodeError as e:
+            raise SystemExit(f"{path} 第 {i} 行不是 JSON：{e}") from e
+        label = r.get("task", r.get("label"))
+        if "segments" in r:
+            segs = [(str(t), bool(tpl)) for t, tpl in r["segments"]]
+        elif "text" in r:
+            segs = None
+        else:
+            raise SystemExit(f"{path} 第 {i} 行要有 text 或 segments：{ln[:80]}")
+        if segs is None and not r.get("system") and "id" not in r:
+            out.append((label, str(r["text"])))
+        else:
+            d = {"segments": segs if segs is not None else [(str(r["text"]), False)],
+                 "system": r.get("system")}
+            if "id" in r:
+                d["id"] = str(r["id"])      # lr_tool cases 生成的 "task:样本号"
+            out.append((label, d))
+    return out
+
+
+def _case_text(payload: "str | dict") -> str:
+    if isinstance(payload, dict):
+        return "".join(t for t, _ in payload["segments"])
+    return payload
+
+
+def _submit_case(coord, req: str, payload: "str | dict", *, true_task: str | None,
+                 channel_task: str | None, static: bool):
+    """测试集里的一条 → coord.submit。静态模式要指定走哪个 task 的通道。"""
+    kw = dict(true_task=true_task, task=channel_task if static else None)
+    if isinstance(payload, dict):
+        rec = coord.submit(req, segments=payload["segments"],
+                           system=payload.get("system"), **kw)
+        rec.case_id = payload.get("id")
+        return rec
+    return coord.submit(req, text=payload, **kw)
+
+
+def _load_profile_file(path: Path, tasks: Sequence[str], n_layers: int,
+                       n_experts: int, *, coverage: float = 0.95,
+                       top_k: int = 1) -> tuple[dict, dict]:
+    """读激活画像 → (逐 task 驻留集, 逐 task 原始分布)。
+
+    两种格式都认（与 `runtime/profile.py` 同一套）：
+
+    * **质量格式**（推荐）`{"tasks": {u: {"layers": {l: [mass…]}}}}` —— 存的是
+      归一化的逐层激活质量。换覆盖率不用重新采样，而且**动态模式的分类器只能
+      从它构造**（分类器要的是分布，不是 id 列表）。
+    * **id 格式** `{u: [[ids] × n_layers]}` —— 外部流程直接给驻留集。
+      能用来部署，但**没有分布就没有分类器**，只能配 `--static`。
+
+    返回的第二项在 id 格式下是 None —— 调用方据此判断能不能走动态模式。
+    """
+    from ..runtime.profile import (
+        load_profile, placement_from_profile, to_activation_profile,
+    )
+
+    raw = load_profile(path)
+    is_ids = raw.get("format") == "ids"
+    have = raw.get("tasks", raw)
+    missing = [u for u in tasks if u not in have]
+    if missing:
+        raise SystemExit(f"--profile 里没有 task {missing}；有的是 {sorted(have)}")
+
+    plcs: dict[str, ExpertPlacement] = {}
+    profs: dict = {}
+    for u in tasks:
+        sets = placement_from_profile(raw, u, coverage=coverage,
+                                      n_experts=n_experts, min_experts=top_k,
+                                      layers=list(range(1, n_layers + 1)))
+        full = tuple(range(n_experts))
+        plcs[u] = ExpertPlacement(
+            name=u, n_layers=n_layers,
+            sets=tuple(frozenset(sets.get(l, full)) for l in range(1, n_layers + 1)),
+            achieved_coverage=tuple(coverage if l in sets else 1.0
+                                    for l in range(1, n_layers + 1)),
+            coverage_target=coverage,
+        )
+        if not is_ids:
+            profs[u] = to_activation_profile(raw, u, n_layers=n_layers,
+                                             n_experts=n_experts)
+    return plcs, (profs or None)
+
+
+def _where_is_it_stuck(rec, coord, addrs, pool) -> None:
+    """请求超时了 —— 去问路径上的每台节点它自己怎么看。
+
+    协调器这一侧的事件日志只能说到「派发出去了」为止；派发之后的沉默有好几种
+    完全不同的原因，而它们在日志里长得一模一样：
+
+        · 段首根本没收到 seg_in（消息没送到，或它在忙别的）
+        · 收到了但还没装载完模型（第一条请求常撞上，装几十 GB 要时间）
+        · 装载失败了（错误上报走的是另一条路，可能还没到）
+        · 算到一半卡在某一跳（段内逐跳，任何一跳挂了都表现为整体沉默）
+
+    分辨它们只要一件事：**问节点自己**。
+
+    先问 `capabilities` 而不是 `stats` —— **`stats` 在配置之前答不了**
+    （返回 `{"type": "error", ...}`），而「压根没配置成功」恰恰是最常见的
+    那一种。`capabilities` 从起进程那一刻就能答，还顺带告诉你 configured。
+    """
+    from p2pmoe.runtime.wire import rpc
+
+    log.error("  —— 路径上各节点的自述：")
+    segs = [x for x in (rec.front, rec.back) if x]
+    if not segs:
+        log.error("     （还没绑上任何段 —— 那是排队问题，不是节点问题）")
+        return
+    nodes: list[tuple[str, str]] = []
+    for sid in segs:
+        info = coord.man.segments.get(sid)
+        if info:
+            nodes += [(sid, n) for n in info["nodes"]]
+
+    def ask(nid, addr, what):
+        return rpc(addr, {"type": what}, timeout=8.0, relay=RELAY,
+                   me="__coord__", to=nid)
+
+    for sid, nid in nodes:
+        a = addrs.get(nid)
+        if a is None:
+            log.error("     %-6s %-6s ✗ 不在 --agents 里 —— 它永远不会响应",
+                      sid, nid)
+            continue
+        try:
+            cap = ask(nid, a, "capabilities")
+        except Exception as e:
+            log.error("     %-6s %-6s ✗ 问不到（进程没了？端口不通？）：%s",
+                      sid, nid, f"{type(e).__name__}: {e}"[:60])
+            continue
+        if not cap.get("configured"):
+            log.error("     %-6s %-6s ✗ **进程活着但还没配置** —— "
+                      "下发没到，或装载失败了", sid, nid)
+            continue
+        try:
+            st = ask(nid, a, "stats")
+        except Exception as e:
+            log.error("     %-6s %-6s 已配置，但问 stats 失败：%s",
+                      sid, nid, f"{type(e).__name__}"[:40])
+            continue
+        log.error("     %-6s %-6s 层 %s  驻留 %.1fGB  装载 %.0fms  "
+                  "算过 %.0fms  收发 %d 条",
+                  sid, nid, _span(st.get("layers")),
+                  st.get("resident_mb", 0) / 1024, st.get("load_ms", 0),
+                  st.get("compute_ms", 0), st.get("msgs", 0))
+    log.error("  —— 怎么读：**算过 0ms** 的那台就是没开始干活的那台。")
+    log.error("     它是段首 → seg_in 没送到；不是段首 → 上一跳卡住了。")
+    log.error("     全都算过却没出 token → 看下面「节点上报的错误」。")
+
+
+def _shadow_acc(rs: list[dict]) -> float | None:
+    xs = [r["shadow"]["task"] == r["true_task"] for r in rs
+          if r.get("shadow") and r.get("true_task")]
+    return round(sum(xs) / len(xs), 4) if xs else None
+
+
+def _dump_front_stats(path: Path, recs: list, l0: int, n_experts: int,
+                      deployed: Sequence[str] = ()) -> None:
+    """每条请求一行：真实 task、在线识别结果、前 L₀ 层的逐层统计（稀疏）。
+
+    层号是**规划器口径（1-based）**，与 csv 的 0-based 差 1 —— 文件头的
+    `layer_base` 字段写明了，离线复核（lr_tool check）会自己换算。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    n = 0
+    with path.open("w", encoding="utf-8") as f:
+        for rec in recs:
+            if not rec.front_layers:
+                continue
+            on = rec.shadow or ({"task": rec.task, "conf": rec.conf}
+                                if rec.clf_kind == "lr" else None)
+            f.write(json.dumps({
+                "req": rec.req, "true_task": rec.true_task,
+                **({"case_id": rec.case_id} if rec.case_id else {}),
+                "lr_task": on["task"] if on else None,
+                "lr_conf": on["conf"] if on else None,
+                "l0": l0, "n_experts": n_experts, "layer_base": 1,
+                "deployed": list(deployed),
+                "n_prompt": len(rec.ids), "prompt": rec.prompt,
+                **({"body": rec.body, "n_body": sum(b - a for a, b in rec.body)}
+                   if rec.body is not None else {}),
+                "layers": rec.front_layers,
+            }, ensure_ascii=False) + "\n")
+            n += 1
+    if n:
+        log.info("逐层统计已落盘 %s（%d 条）—— 离线复核："
+                 "python3 -m p2pmoe.deploy.lr_tool check --model <模型> --dump %s",
+                 path, n, path)
+    else:
+        log.warning("--dump-front-stats：没有一条请求带回逐层统计 —— "
+                    "节点代码是不是旧的？先 ./deploy_15.sh sync 再 stop force && start")
+
+
+def _span(layers) -> str:
+    if not layers:
+        return "—"
+    return f"{layers[0]}–{layers[-1]}" if len(layers) > 1 else str(layers[0])
+
+
+def build_model_setup(args, tasks_lam: Sequence[tuple[str, float]]) -> ModelSetup:
+    """步骤 0：决定跑哪个模型、每层装哪些专家。"""
+    names = [u for u, _ in tasks_lam]
+
+    # ---------------- toy 模型（默认）---------------------------------- #
+    if not args.model_dir:
+        # **横幅要显眼。** toy 模型不需要任何下载的权重，所以「没下成功」和
+        # 「跑的是 toy」这两件事在日志里长得一模一样 —— 都是顺利跑出 token。
+        # 而 toy 的时延（毫秒级）与真模型（百毫秒级）差一个量级，
+        # 拿它当测量结果会得出完全错误的结论。
+        log.warning("=" * 68)
+        log.warning("⚠ 没给 --model-dir —— 跑的是 **toy 模型**"
+                    "（8 层 × 32 专家的 numpy 玩具）")
+        log.warning("  它不加载任何真实权重，时延数字与 80B 的真实部署无关。")
+        log.warning("  要跑真模型：--model-dir <各节点上的权重目录> --profile <画像>")
+        log.warning("  （走 ./deploy_15.sh measure 会自动带上这些）")
+        log.warning("=" * 68)
+        mcfg = ToyMoEConfig()
+        spec = toy_model_spec(mcfg)
+        corpus = make_corpus(mcfg, names, seed=args.seed, shared_clusters=0)
+        plcs = {u: build_placement(p, args.coverage)
+                for u, p in profile_from_corpus(mcfg, corpus).items()}
+        uni = union_placement(list(plcs.values()))
+        log.info("      驻留集层均 %s，并集 %.1f/%d",
+                 {u: round(sum(p.sizes()) / mcfg.n_layers, 1) for u, p in plcs.items()},
+                 sum(uni.sizes()) / mcfg.n_layers, mcfg.n_experts)
+        front = (full_placement(mcfg.n_layers, mcfg.n_experts) if args.static else uni)
+        if args.static:
+            log.info("      --static：前段改装**全部** %d 个专家/层（并集是 %.1f）",
+                     mcfg.n_experts, sum(uni.sizes()) / mcfg.n_layers)
+        return ModelSetup(
+            label="toy", spec=spec, n_layers=mcfg.n_layers, n_experts=mcfg.n_experts,
+            backend="numpy", node_model=dict(mcfg.__dict__), front_plc=front,
+            back_plcs=plcs, mcfg=mcfg, corpus=corpus,
+            tasks=[TaskProfile(name=u, lam=l,
+                               experts_per_layer=plcs[u].as_experts_per_layer(),
+                               placement=plcs[u]) for u, l in tasks_lam],
+        )
+
+    # ---------------- 真实 checkpoint ------------------------------------ #
+    d = Path(args.model_dir)
+    cfg_f = d / "config.json"
+    if not cfg_f.exists():
+        # 控制机与节点共用 --model-dir 这一个路径，但**要的东西不一样**：
+        # 节点要权重（几十 GB），控制机只要 config.json 与 tokenizer（约 10MB）——
+        # 它一个张量都不碰，只用 config 算模型规格、用 tokenizer 编解码文本。
+        # 所以控制机上这个目录经常是空的：权重是各节点自己拉的，没经过这里。
+        raise SystemExit(
+            f"{cfg_f} 不存在。\n"
+            f"  控制机也需要这个目录 —— 但只要里面的 config.json 与 tokenizer"
+            f"（约 10MB），**不要权重**。\n"
+            f"  取一份：\n"
+            f"      ./deploy_15.sh meta\n"
+            f"  或者：\n"
+            f"      python3 -m p2pmoe.deploy.fetch --meta-only \\\n"
+            f"          --repo <HF仓库> --out {d}")
+    hf = json.loads(cfg_f.read_text(encoding="utf-8"))
+    spec, info = model_spec_from_hf(hf, name=d.name, ctx_max=args.ctx,
+                                    dtype_bytes=args.dtype_bytes)
+    log.info("      %s", info.summary())
+    ok, why = granularity_verdict(info)
+    log.info("      %s %s", "✓" if ok else "✗", why)
+
+    # 动态模式要两样东西，都来自激活画像：前段的并集、在线分类器的参考直方图。
+    # 有 --profile 就都有；没有就只能走 --static（配对定死、请求自报 task）。
+    if not args.static and not args.profile and not getattr(args, "lr_model", None):
+        raise SystemExit(
+            "真实模型走动态模式需要 --profile —— 前段并集与在线分类器都从画像来。"
+            "没有画像就用 --static（配对定死、请求自报 task）"
+        )
+    front = full_placement(info.n_layers, info.n_experts)
+
+    raw_profiles = None
+    if args.profile:
+        back_plcs, raw_profiles = _load_profile_file(
+            Path(args.profile), names, info.n_layers, info.n_experts,
+            coverage=args.coverage, top_k=info.top_k)
+        approximate = True
+        log.info("      后段驻留集来自 %s，层均 %s", args.profile,
+                 {u: round(sum(p.sizes()) / info.n_layers, 1)
+                  for u, p in back_plcs.items()})
+    elif args.resident_frac >= 1.0:
+        back_plcs = {u: full_placement(info.n_layers, info.n_experts, name=u)
+                     for u in names}
+        approximate = False
+        log.info("      后段也装**全部**专家 —— 没有 drop-expert 近似，"
+                 "输出与单机参考实现逐位一致。首次跑真权重应该用这个口径")
+    else:
+        # 没有画像却要只装子集 —— 能跑，但输出会烂，必须说清楚
+        n = max(info.top_k, round(args.resident_frac * info.n_experts))
+        back_plcs = {u: ExpertPlacement(
+            name=u, n_layers=info.n_layers,
+            sets=tuple(frozenset(range(n)) for _ in range(info.n_layers)),
+            achieved_coverage=tuple(0.0 for _ in range(info.n_layers))) for u in names}
+        approximate = True
+        log.warning(
+            "      ⚠ --resident-frac %.2f 但没给 --profile —— 驻留集只能按 id 顺序"
+            "硬取前 %d 个，**不是**按激活质量选的。miss 率会极高、drop-expert 兜不住，"
+            "输出基本是废的。这条路只用来压内存看放置，不要拿它评估质量。",
+            args.resident_frac, n)
+
+    if not args.static and raw_profiles is not None:
+        # 前段是 task 无关的，装**并集** ∪_u S_{u,l}（I.1.1）——
+        # 静态模式装全集是因为没有画像；有了画像就该用并集，省下的内存直接
+        # 换成更大的 L₀ 或更多通道
+        front = union_placement(list(back_plcs.values()), name="front-union")
+        log.info("      前段改装并集：层均 %.0f/%d（全集是 %d）",
+                 sum(front.sizes()) / info.n_layers, info.n_experts, info.n_experts)
+
+    return ModelSetup(
+        label=d.name, spec=spec, n_layers=info.n_layers, n_experts=info.n_experts,
+        backend="torch", node_model=hf, front_plc=front, back_plcs=back_plcs,
+        approximate=approximate, profiles=raw_profiles,
+        tasks=[TaskProfile(name=u, lam=l,
+                           experts_per_layer=back_plcs[u].as_experts_per_layer(),
+                           placement=back_plcs[u]) for u, l in tasks_lam],
+    )
+
+
+# --------------------------------------------------------------------------- #
+def collect_capabilities(addrs: dict[str, Addr], *, mem_cap_mb: float | None,
+                         real_units: bool = False,
+    out_caps: dict | None = None,
+) -> list[Node]:
     """步骤 1：问每个 agent「你有多少内存、算力多快」。
 
     算力用 agent 自己跑的 matmul 基准，归一化成相对值。比填铭牌值好，因为它
     包含了当时的实际负载与降频 —— 规划器要的就是「现在真能跑多快」。
     """
+    refused: list[tuple[str, Exception]] = []
     caps: dict[str, dict] = {}
     for name, addr in addrs.items():
         try:
-            r = rpc(addr, {"type": "capabilities"}, timeout=15.0)
+            r = _rpc(name, addr, {"type": "capabilities"}, timeout=15.0)
         except Exception as e:
             log.error("agent %s@%s:%d 无法连接：%s —— 已从池中剔除", name, *addr, e)
+            refused.append((name, e))
             continue
         if r.get("configured"):
             log.warning("agent %s 已被配置过，将被重新下发", name)
@@ -99,33 +671,114 @@ def collect_capabilities(addrs: dict[str, Addr], *, mem_cap_mb: float | None) ->
         log.info("  %-8s 内存 %8.0fMB  基准 %.3fms", name, r["mem_mb"], r["ms_per_layer"])
 
     if not caps:
+        # 「一台都连不上」和「掉了几台」是完全不同的事，不该共用同一句话。
+        # 而 errno 又把它分成两种，处置也不同：
+        #   ECONNREFUSED  主机在、端口上没人监听 → **agent 没跑**
+        #   超时 / 不可达  包都没到 → 网络、防火墙、地址写错
+        n_ref = sum(1 for _, e in refused
+                    if isinstance(e, OSError) and e.errno == errno.ECONNREFUSED)
+        log.error("")
+        log.error("=" * 68)
+        log.error("%d 台一个都没连上 —— 这不是「掉了几台」，是根本没起来。",
+                  len(refused))
+        if n_ref == len(refused):
+            log.error("")
+            log.error("全部是 Connection refused：**主机是通的，只是端口上没人监听**。")
+            log.error("换句话说 agent 进程不在跑。最常见的原因是上一轮 stop 之后没再 start。")
+            log.error("")
+            log.error("    bash ./deploy_15.sh start      # 起 agent，它会自己验活")
+            log.error("    bash ./deploy_15.sh check      # 确认 15/15 在线")
+            log.error("")
+            log.error("start 报成功却还是连不上的话，看日志：")
+            log.error("    bash ./deploy_15.sh logs       # 或 doctor 逐台体检")
+        elif n_ref == 0:
+            log.error("")
+            log.error("没有一台回 Connection refused —— 包根本没到。")
+            log.error("查地址与防火墙，而不是 agent：")
+            log.error("    bash ./deploy_15.sh check      # 逐台探连通性")
+            log.error("    （hosts.txt 里的 IP 对不对？9101 放行了吗？）")
+        else:
+            log.error("")
+            log.error("%d 台拒绝连接（agent 没跑）、%d 台不可达（网络）—— 两种都有。",
+                      n_ref, len(refused) - n_ref)
+            log.error("    bash ./deploy_15.sh doctor     # 逐台分开看")
+        log.error("=" * 68)
         raise SystemExit("没有任何 agent 可用")
+
+    # 原始应答带出去 —— 里面有 cuda 状态这类**只有节点自己知道**的东西，
+    # 而调用方要在配置之前用它做判断。
+    if out_caps is not None:
+        out_caps.update(caps)
 
     fastest = min(c["ms_per_layer"] for c in caps.values())
     nodes: list[Node] = []
     for name, c in caps.items():
-        mem = c["mem_mb"] if mem_cap_mb is None else min(c["mem_mb"], mem_cap_mb)
+        mb = c["mem_mb"] if mem_cap_mb is None else min(c["mem_mb"], mem_cap_mb)
+        # 单位：toy 模型整个都以 MB 记账（toy_model_spec 里 base/expert 都是 MB），
+        # 所以那条路把 agent 报的 MB **直接当 GB 用** —— 量纲自洽，数值好读。
+        # 真模型的内存公式是 GB，必须真的换算，否则会把 47GB 当成 47000GB。
+        mem = mb / 1024.0 if real_units else mb
         rel = c["ms_per_layer"] / fastest
+        step = 1.0 if real_units else 8.0
         nodes.append(Node(
             id=name,
-            tier=f"{round(mem / 8) * 8:.0f}MB",   # 按内存粗分档（II.7.1 的分档估算要用）
+            tier=f"{round(mem / step) * step:.0f}{'GB' if real_units else 'MB'}",
             mem_gb=mem,
             ms_per_layer=round(0.35 * rel, 4),
-            reserve_gb=max(1.0, mem * 0.05),
+            # 真机上留一档给激活/碎片/系统；toy 那边 5% 就够
+            reserve_gb=(max(1.0, mem * 0.05) if real_units else mem * 0.05),
             avail=0.95,
         ))
     return nodes
 
 
 def distribute(
-    manifest, addrs: dict[str, Addr], mcfg: ToyMoEConfig, clf: HistogramClassifier,
+    manifest, addrs: dict[str, Addr], setup: "ModelSetup",
+    clf: "HistogramClassifier | LRClassifier | None",
     coord_addr: Addr, l0: int,
+    static_wiring: dict[str, tuple[str, str]] | None = None,
+    stop_ids: list[int] | None = None,
+    model_dir: str | None = None,
+    device: str = "cpu",
+    profile: bool = False,
+    miss_policy: str = "drop",
+    node_caps: "list | None" = None,
+    caps_raw: dict | None = None,
+    report_layers: bool = False,
 ) -> list[dict]:
     """步骤 4：把清单拆开，每个节点只收自己那份。
 
     节点拿到的是「层区间 + 每层的专家 id 列表」——它不知道组合矩阵、不知道配额、
     不知道公共带。那些是离线规划的产物，在线用不到。
     """
+    # 要用 GPU 的话，先确认每台真的有可用的 GPU。
+    # 不查的话，CUDA 起不来的那台会挂在装载里，控制机等满超时才发现 ——
+    # 而节点日志里只有一行淹没在正常输出里的 UserWarning。
+    if device and device.startswith("cuda") and caps_raw:
+        bad = [(n, c["cuda"].get("why", "?"))
+               for n, c in caps_raw.items()
+               if isinstance(c.get("cuda"), dict) and not c["cuda"].get("ok")]
+        if bad:
+            log.error("")
+            log.error("=" * 68)
+            log.error("要 --device %s，但这些节点的 CUDA 用不了：", device)
+            for n, why in bad:
+                log.error("    %-6s %s", n, why)
+            log.error("")
+            log.error("硬上的结果是装载挂住，控制机等满超时 —— 而节点日志里只有")
+            log.error("一行 `CUDA unknown error` 的 UserWarning，淹在正常输出里。")
+            log.error("")
+            log.error("  · `CUDA unknown error` 常见于**驱动反复加载卸载** ——")
+            log.error("    没开持久化模式时，GPU 空闲就掉驱动。开一下：")
+            log.error("        sudo nvidia-smi -pm 1        # 或 sudo nvidia-persistenced")
+            log.error("    先在那台上确认：nvidia-smi 能不能正常出表")
+            log.error("  · 也可能是别的进程独占了 GPU：nvidia-smi 看有没有别人在跑")
+            log.error("  · **想先拿到一份端到端结果**，就走 CPU：")
+            log.error("        DEVICE=cpu bash ./deploy_15.sh measure")
+            log.error("    慢很多，但链路、识别、派发、时序全都验得到。")
+            log.error("=" * 68)
+            raise SystemExit("CUDA 不可用")
+
     by_seg: dict[str, list] = {}
     for p in manifest.nodes:
         by_seg.setdefault(p.segment, []).append(p)
@@ -133,11 +786,56 @@ def distribute(
         by_seg[sid].sort(key=lambda x: x.position)
 
     peers = {n: list(a) for n, a in addrs.items()}
+    wiring = dict(static_wiring or {})
+    # 装载之前先算一遍内存账。
+    #
+    # 不算的话，装不下的那台会在 configure 里被 OOM killer 干掉，而调用方
+    # 看到的是一个裸 TimeoutError —— 那时已经花了几分钟，而且完全看不出
+    # 是内存问题。这里几毫秒就能回答。
+    #
+    # **同一台物理机上挤了多个节点 id 时，它们的驻留量是相加的** ——
+    # 按上报的内存分组能抓到一部分（同机的 mem_mb 会非常接近），但真正
+    # 可靠的判据是 ./deploy_15.sh identity。
+    if node_caps:
+        mem = {n.id: float(n.mem_gb) for n in node_caps}
+        tight: list[str] = []
+        for p_ in manifest.nodes:
+            have = mem.get(p_.node)
+            if not have:
+                continue
+            need = float(getattr(p_, "total_gb", 0) or 0)
+            if need and need > have * 0.92:
+                tight.append(f"{p_.node}: 要装 {need:.1f}GB，可用 {have:.1f}GB")
+        if tight:
+            log.error("")
+            log.error("=" * 68)
+            log.error("这些节点装不下自己那一份：")
+            for t in tight:
+                log.error("    %s", t)
+            log.error("")
+            log.error("硬装的结果是 OOM killer 把 agent 干掉，而调用方只会看到")
+            log.error("一个 configure 超时 —— 花几分钟，还看不出是内存问题。")
+            log.error("")
+            log.error("  · 降覆盖率让后段驻留集更小：--coverage 0.5")
+            log.error("  · 或者确认是不是**几个节点 id 挤在同一台物理机上** ——")
+            log.error("    那样它们的驻留量相加：bash ./deploy_15.sh identity")
+            log.error("=" * 68)
+            raise SystemExit("内存装不下")
+
     acks: list[dict] = []
     for p in manifest.nodes:
         chain = by_seg[p.segment]
         i = p.position
         role = "front" if p.role.startswith("front") else p.role
+        # 静态模式：前段 tail 在配置期就拿到自己那一个后段 head 的名字。
+        # 之后它既不识别也不问协调器 —— 链路是随配置一起下发的。
+        peer = task = None
+        if wiring:
+            if role == "front" and p.is_tail and p.segment in wiring:
+                peer = manifest.segments[wiring[p.segment][0]]["head"]
+                task = wiring[p.segment][1]
+            elif role.startswith("back:"):
+                task = role.split(":", 1)[1]
         cfg = NodeConfig(
             node_id=p.node,
             role=role,
@@ -151,15 +849,110 @@ def distribute(
             # 真机上不注入延迟 —— 网络自己会给
             links=LinkTable().to_dict(),
             coordinator=list(coord_addr),
-            model=dict(mcfg.__dict__),
-            classifier=clf.to_wire() if (role == "front" and p.is_tail) else None,
+            model=dict(setup.node_model),
+            backend=setup.backend,
+            # 原样下发（可能含 {node} 占位）—— 由节点自己代入，见 node.resolve_dir
+            model_dir=model_dir,
+            device=device,
+            with_embed=(role == "front" and p.is_head),
+            with_lm_head=(role.startswith("back:") and p.is_tail),
+            # 直方图识别器只在动态模式下发；LR 静态模式也下发，做旁路识别
+            classifier=(clf.to_wire()
+                        if (clf is not None and role == "front" and p.is_tail
+                            and (not wiring or getattr(clf, "kind", "hist") == "lr"))
+                        else None),
+            report_layers=report_layers and role == "front" and p.is_tail,
+            static_peer=peer,
+            static_task=task,
+            # 只有后段的 tail 会采样，也只有它需要知道 EOS —— 一个整数列表，
+            # 节点仍然不需要 tokenizer（runtime/text.py 开头）
+            stop_ids=list(stop_ids or []) if (role.startswith("back:") and p.is_tail)
+            else [],
+            # 只有后段采画像：前段是 task 无关的，它装全集/并集，不按 task 裁
+            profile=profile and role.startswith("back:"),
+            miss_policy=miss_policy,
         )
-        ack = rpc(addrs[p.node], {"type": "configure", "config": cfg.to_dict()}, timeout=120.0)
+        # 超时按这台要装的量放大：120 秒对 1GB 绰绰有余，对 22GB 冷盘可能不够，
+        # 而「不够」的表现是一个裸 TimeoutError，读不出是慢还是死。
+        gb = float(getattr(p, "total_gb", 0) or getattr(p, "weight_gb", 0) or 1.0)
+        budget = max(120.0, 60.0 + gb * 30.0)     # 22GB → 720s
+        try:
+            ack = _rpc(p.node, addrs[p.node],
+                       {"type": "configure", "config": cfg.to_dict()},
+                       timeout=budget)
+        except NodeError as e:
+            # 节点把真实堆栈回过来了 —— 直接摊开，不用再猜。
+            log.error("")
+            log.error("=" * 68)
+            log.error("配置 %s 失败 —— **节点上抛了异常**（不是超时）：", p.node)
+            for line in str(e).splitlines():
+                log.error("  %s", line)
+            log.error("")
+            log.error("  它要装 层 %s，%.1fGB",
+                      f"{p.layer_range[0]}–{p.layer_range[1]}" if p.layer_range else "?",
+                      float(getattr(p, "total_gb", 0) or 0))
+            log.error("  完整日志：bash ./deploy_15.sh logs %s", p.node)
+            log.error("=" * 68)
+            raise SystemExit(f"配置 {p.node} 失败")
+        except (TimeoutError, OSError) as e:
+            # 裸异常只说「timed out」，不说是谁、在装什么、还活着没有 ——
+            # 而那三件事决定了下一步往哪查。
+            state = _probe_agent(p.node, addrs[p.node])
+            log.error("")
+            log.error("=" * 68)
+            log.error("配置 %s 超时（等了 %.0fs）：%s", p.node, budget, e)
+            log.error("  它要装 层 %s，%.1fGB",
+                      f"{p.layer_range[0]}–{p.layer_range[1]}" if p.layer_range else "?",
+                      gb)
+            log.error("  上一台成功的是 %s —— 说明链路本身是通的。",
+                      acks[-1]["node"] if acks else "（这是第一台）")
+            if state == "alive":
+                log.error("")
+                log.error("  进程**应答得了**别的请求 —— 它只是还没装完。")
+                log.error("  盘慢或页缓存冷的话 %.1fGB 可能真要更久：", gb)
+                log.error("      在 %s 上看：tail -f /tmp/p2pmoe/agent-%s.log",
+                          addrs[p.node][0], p.node)
+                log.error("      给足时间重跑：FETCH_TIMEOUT 之外还有 configure 预算，"
+                          "把这台的份额调小或换更快的盘")
+            elif state == "wedged":
+                log.error("")
+                log.error("  **端口连得上，但进程不应答** —— 它卡死了，不是在慢慢装。")
+                log.error("  （agent 是每连接一个线程，装载中也该答得出 capabilities；")
+                log.error("   答不出说明卡在一个不返回的系统调用里。）")
+                log.error("")
+                log.error("  %.1fGB 本该几秒装完，卡在这里最常见的是**存储**：", gb)
+                log.error("      在 %s 上：", addrs[p.node][0])
+                log.error("          mount | grep -E 'nfs|cifs|fuse'   # 权重在网络盘上？")
+                log.error("          ls %s                             # 会不会直接卡住", "$WEIGHTS")
+                log.error("          cat /proc/$(pgrep -f 'agent --id %s')/stack 2>/dev/null",
+                          p.node)
+                log.error("          dmesg -T | tail -20               # I/O 错误 / nfs timeout")
+                log.error("      D 状态（不可中断睡眠）的进程 kill -9 也杀不掉：")
+                log.error("          ps -o pid,stat,wchan:24,cmd -p $(pgrep -f 'agent --id %s')",
+                          p.node)
+            else:
+                log.error("")
+                log.error("  **连不上了 —— 进程没了。**")
+                log.error("  装 %.1fGB 的时候被杀掉，最可能是 OOM：", gb)
+                log.error("      在 %s 上看：dmesg -T | tail -20 | grep -i oom",
+                          addrs[p.node][0])
+                log.error("      也看：tail -30 /tmp/p2pmoe/agent-%s.log", p.node)
+                log.error("  这台内存装不下自己那一份的话，只有两条路：")
+                log.error("    · 降 COVERAGE，让后段的驻留集更小")
+                log.error("    · 换一台内存更大的，或把这个 id 挪到别的机器")
+                log.error("  注意：**几个节点 id 挤在同一台物理机上**时，")
+                log.error("  它们的驻留量是相加的 —— bash ./deploy_15.sh identity 查这个。")
+            log.error("=" * 68)
+            raise SystemExit(f"配置 {p.node} 失败")
         acks.append(ack)
+        rng = ack["layers"]
+        span = f"{rng[0]}–{rng[-1]}" if len(rng) > 1 else str(rng[0])
         log.info(
-            "  %-8s %-12s 层 %s  %d 个专家  驻留 %.2fMB（全装要 %.2fMB）  加载 %.0fms",
-            ack["node"], ack["role"] + "/" + ack["segment"], ack["layers"],
+            "  %-8s %-12s 层 %-7s %4d 个专家  驻留 %7.1fMB（全装 %7.1fMB）  加载 %.0fms%s",
+            ack["node"], ack["role"] + "/" + ack["segment"], span,
             ack["n_experts"], ack["resident_mb"], ack["full_mb"], ack["load_ms"],
+            (f"  从 checkpoint 读了 {ack['load_fraction']:.1%}"
+             f"（{ack['shards']} 个分片）" if "load_fraction" in ack else ""),
         )
     return acks
 
@@ -186,7 +979,100 @@ def main(argv: list[str] | None = None) -> int:
                     help="人为压低每台节点的可用内存，便于在大机器上演示分档效果")
     ap.add_argument("--asymmetric-probe", action="store_true",
                     help="逐向分别探测（默认对称，见 probe.py 的口径说明）")
-    ap.add_argument("--save-plan", type=Path, default=None)
+    ap.add_argument("--save-plan", type=Path, default=None,
+                    help="把这次的部署清单存下来 —— 配合 --load-plan 可以重放")
+    ap.add_argument("--load-plan", type=Path, default=None,
+                    help="载入存下来的清单，**跳过探测与规划**。放置因此完全固定，"
+                         "人工指定的 --wiring 才有稳定的所指")
+    ap.add_argument("--model-dir", default=None,
+                    help="真实 HF checkpoint 目录（**每台节点上的本地路径**，"
+                         "控制机也要能读到 config.json / tokenizer.json）。"
+                         "给了就跑真模型 + 文本进出；不给是 toy 模型 + token id")
+    ap.add_argument("--ctx", type=int, default=2048, help="KV 预算的上下文上限")
+    ap.add_argument("--dtype-bytes", type=int, default=2, help="权重字节数（bf16=2）")
+    ap.add_argument("--device", default="cpu", help="节点上的 torch 设备，如 cuda:0")
+    ap.add_argument("--tasks", default=None,
+                    help="task 名与权重，如 'general' 或 'code=0.6,chat=0.4'。"
+                         "后段全装专家时各 task 其实无差别，用单个 task 就行")
+    ap.add_argument("--profile", default=None,
+                    help="离线激活画像 JSON：{task: [[专家id...] × 层数]}。"
+                         "只驻留子集**必须**有它，否则驻留集是瞎选的")
+    ap.add_argument("--resident-frac", type=float, default=1.0,
+                    help="后段每层驻留比例。1.0（默认）= 全装、无近似、"
+                         "输出与单机逐位一致；要压内存请配 --profile 一起用")
+    ap.add_argument("--wiring", default=None,
+                    help="人工指定前后段连接的 JSON。省略则自动配对（贪心最小化组合延迟）")
+    ap.add_argument("--save-wiring", type=Path, default=None,
+                    help="把这次用的连接导出来 —— 改完可以用 --wiring 喂回去")
+    ap.add_argument("--miss-policy", default="drop",
+                    choices=("drop", "drop_noscale", "local_topk"),
+                    help="路由到的专家不在本地时怎么补救。drop=文档 II.5 的重归一；"
+                         "drop_noscale=不重归一（实测更好）；"
+                         "local_topk=在驻留集里重新取 top-k")
+    ap.add_argument("--relay", default=None, metavar="HOST:PORT",
+                    help="节点之间没有直连时的中继（deploy/relay.py）。"
+                         "各节点的 agent 也要加同一个 --relay")
+    ap.add_argument("--skip-model-check", action="store_true",
+                    help="跳过「每台节点能不能读到 checkpoint」的预检")
+    ap.add_argument("--prompt", action="append", default=None,
+                    help="文本 prompt，可重复。需要 --model-dir")
+    ap.add_argument("--req-timeout", type=float, default=300.0, metavar="秒",
+                    help="单条请求等多久算超时。默认 300s —— 第一条要等模型装载"
+                         "（真模型几十 GB，几分钟很正常）。调试时调小些能更快看到"
+                         "卡在哪台")
+    ap.add_argument("--warmup", type=int, default=0, metavar="N",
+                    help="先跑 N 条**不计入结果**的请求。torch 首次前向要选 kernel、"
+                         "分配显存池、把权重从 mmap 拉进页缓存 —— 这些都只发生一次。"
+                         "不预热的话第一条请求会明显偏慢，把 p50 也拖歪。"
+                         "量时延就该给 --warmup 2 起步")
+    ap.add_argument("--prompts-file", type=Path, default=None,
+                    help="一行一条 prompt 的文件。想标注真实 task 就写成 "
+                         "`mbpp\t写一个反转链表的函数` —— 制表符前是 task 名，"
+                         "用来核对在线识别对不对。`#` 开头与空行跳过。"
+                         "**--requests 比条数多时会循环**，少时只跑前几条")
+    ap.add_argument("--save-results", type=Path, default=None,
+                    help="把逐请求结果写成 JSON：时序拆解、各节点算力占比、"
+                         "识别对错、生成的文本。测完就有一份可复算的底稿，"
+                         "不用回头翻滚屏日志")
+    ap.add_argument("--chat", action="store_true", help="套对话模板（指令模型必须）")
+    ap.add_argument("--thinking", choices=("auto", "on", "off", "default"), default="auto",
+                    help="对话模板的 enable_thinking。auto：接了只数 body 的 task 选择器时"
+                         "关掉（它就是在非思考模式下训练的），否则沿用模板默认")
+    ap.add_argument("--fill-idle", action="store_true",
+                    help="规划完再补位：提拔备胎、用空闲节点加通道、剩下的分摊到显存最紧的段。"
+                         "补位段不过公共带（planner/fill.py）")
+    ap.add_argument("--static", action="store_true",
+                    help="静态简化模式：前段装全部专家，前后段配对离线定死。"
+                         "在线不识别、不派发、不换绑，请求自报 task。"
+                         "见 examples/static_qwen.py 的取舍说明")
+    g = ap.add_argument_group(
+        "LR 识别器（前段出口，替代直方图余弦）",
+        "外面训练好的逻辑回归，输入是本请求前 L₀ 层的**逐层**专家激活统计。"
+        "动态模式下用它识别；静态模式下只旁路上报，量准确率。"
+        "部署前先核对：python3 -m p2pmoe.deploy.lr_tool inspect --model M --l0 N")
+    g.add_argument("--lr-model", default=None, metavar="PATH",
+                   help="pkl/joblib（sklearn LogisticRegression 或 Scaler+LR 的 Pipeline）、"
+                        "npz 或 json。只在控制机上读，节点不需要 sklearn")
+    g.add_argument("--lr-classes", default=None, metavar="MAP",
+                   help="模型类别 → task 名：0=mbpp,1=gsm8k,2=math，或按 classes_ 顺序 "
+                        "mbpp,gsm8k,math。类别本来就是 task 名时不用给")
+    g.add_argument("--lr-features", default=None, metavar="JSON|FILE",
+                   help='特征怎么拼，必须与训练一致。默认 {"layers": null(=前段全部层), '
+                        '"layer_base": 0, "stats": ["count"], "normalize": "none", '
+                        '"log1p": false, "vector_norm": "none", "layout": "layer_major"}。'
+                        "stats 可选 count/weight/mean_weight/freq/weight_freq")
+    g.add_argument("--lr-feature-fn", default=None, metavar="FILE.py:FUNC",
+                   help="描述不了的特征工程直接给函数：f(count[L,E], weight[L,E], "
+                        "tokens[L], layers) -> 1 维向量。源码随清单下发到前段 tail")
+    g.add_argument("--tau-hi", type=float, default=None,
+                   help="置信 ≥ 它：提交。默认：选择器文件 0.9（SELECTOR_USAGE 的 --min-prob），"
+                        "其它 LR 0.55")
+    g.add_argument("--tau-lo", type=float, default=0.40,
+                   help="置信 < 它：绑最大先验池并全程监控")
+    g.add_argument("--dump-front-stats", type=Path, default=None, metavar="JSONL",
+                   help="把每条请求前 L₀ 层的逐层统计落盘（一行一条）。"
+                        "之后可离线复核：python3 -m p2pmoe.deploy.lr_tool "
+                        "check --model M --dump 这个文件")
     ap.add_argument("--once", action="store_true",
                     help="跑完这批请求就退出（不常驻）。节点 agent 不受影响")
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -196,32 +1082,41 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
+    global RELAY
+    if args.relay:
+        rh, _, rp = args.relay.rpartition(":")
+        RELAY = (rh or "127.0.0.1", int(rp))
+        log.info("中继模式：%s:%d —— 节点之间不直连，每跳绕一圈，逐 token 延迟大致翻倍",
+                 *RELAY)
     addrs = parse_agents(args.agents)
 
-    # ---------------- 0. 离线画像（回放语料） ---------------------------- #
-    mcfg = ToyMoEConfig()
-    spec = toy_model_spec(mcfg)
-    log.info("[0/5] 回放语料 → 激活画像 → 驻留专家集")
-    corpus = make_corpus(mcfg, [t for t, _ in TASKS], seed=args.seed, shared_clusters=0)
-    profiles = profile_from_corpus(mcfg, corpus)
-    plcs = {u: build_placement(p, args.coverage) for u, p in profiles.items()}
-    uni = union_placement(list(plcs.values()))
-    log.info("      驻留集层均 %s，并集 %.1f/%d",
-             {u: round(sum(p.sizes()) / mcfg.n_layers, 1) for u, p in plcs.items()},
-             sum(uni.sizes()) / mcfg.n_layers, mcfg.n_experts)
+    # ---------------- 0. 模型与放置 -------------------------------------- #
+    tasks_lam = parse_tasks(args.tasks) if args.tasks else TASKS
+    log.info("[0/5] 模型与驻留专家集（task %s）",
+             {u: round(l, 2) for u, l in tasks_lam})
+    setup = build_model_setup(args, tasks_lam)
+    mcfg, spec, front_plc = setup.mcfg, setup.spec, setup.front_plc
+    plcs, corpus = setup.back_plcs, setup.corpus
+    profiles_raw = setup.profiles
 
     # ---------------- 1. 采集能力 ---------------------------------------- #
     log.info("[1/5] 采集节点能力（%d 台）", len(addrs))
-    nodes = collect_capabilities(addrs, mem_cap_mb=args.mem_cap_mb)
+    raw_caps: dict = {}
+    nodes = collect_capabilities(addrs, mem_cap_mb=args.mem_cap_mb,
+                                 real_units=setup.backend == "torch", out_caps=raw_caps)
+    if setup.backend == "torch":
+        log.info("      可用内存/台 %s（已扣预留）",
+                 sorted({f"{n.usable_gb:.1f}GB" for n in nodes}))
     live = {n.id for n in nodes}
 
     # toy 模型只有几十 MB。真实节点报几十 GB 的话，一台就装得下整条通道，
     # 规划会退化成「全放一台、零跳」—— 部署路径照样验证得了，但看不到分段、
     # 跳数、公共带这些真正的机制。明确提示，而不是悄悄替用户做决定。
-    front_mb = (spec.base_gb_per_layer + spec.expert_gb * sum(uni.sizes()) / mcfg.n_layers)
-    chan_mb = front_mb * mcfg.n_layers   # 粗估：整模型驻留量的量级
+    front_mb = (spec.base_gb_per_layer
+                + spec.expert_gb * sum(front_plc.sizes()) / setup.n_layers)
+    chan_mb = front_mb * setup.n_layers   # 粗估：整模型驻留量的量级
     smallest = min(n.usable_gb for n in nodes)
-    if args.mem_cap_mb is None and smallest > 20 * chan_mb:
+    if setup.backend == "numpy" and args.mem_cap_mb is None and smallest > 20 * chan_mb:
         log.warning(
             "      节点最小可用内存 %.0fMB，而整个 toy 模型才 ~%.0fMB —— "
             "一台就装得下，规划会退化成「全放一台、零跳」。",
@@ -233,70 +1128,281 @@ def main(argv: list[str] | None = None) -> int:
         )
     addrs = {k: v for k, v in addrs.items() if k in live}
 
-    # ---------------- 2. 真实探测 ---------------------------------------- #
-    log.info("[2/5] 逐对探测（由节点自己发起，k=%d）", args.k_probe)
-    t0 = time.perf_counter()
-    oracle = RemoteNetworkOracle(addrs, k_default=args.k_probe,
-                                 symmetric=not args.asymmetric_probe)
-    n_pairs = oracle.warm_all(sorted(live), k=args.k_probe)
-    log.info("      %d 对，用时 %.1fs，%d 次 RPC", n_pairs,
-             time.perf_counter() - t0, oracle.n_rpc)
-    reach = oracle.reachability(sorted(live))
-    dead = [n for n, c in reach.items() if c < len(live) - 1]
-    if dead:
-        log.warning("      可达性不完整: %s —— 分散环境常态（NAT/防火墙），"
-                    "规划会自然绕开不可达链路",
-                    {n: f"{reach[n]}/{len(live)-1}" for n in dead})
-    for f in oracle.failures[:5]:
-        log.debug("      %s", f)
+    if args.model_dir and not args.skip_model_check:
+        log.info("      预检：%d 台节点能不能读到 %s", len(addrs), args.model_dir)
+        bad = check_model_dirs(addrs, args.model_dir)
+        if bad:
+            log.error("以下节点读不到 checkpoint：")
+            for b in bad:
+                log.error("    %s", b)
+            log.error("权重分发还没做（TODO.md P0）—— --model-dir 是**各节点上的"
+                      "本地路径**。先把 checkpoint 同步到每台机器（rsync / "
+                      "huggingface-cli download / 共享 NFS 挂载），或加 "
+                      "--skip-model-check 跳过预检自担风险")
+            return 4
+        log.info("      全部就绪")
 
-    # ---------------- 3. 规划 -------------------------------------------- #
-    log.info("[3/5] 离线规划")
+    # ---------------- 2. 探测 + 3. 规划 ---------------------------------- #
     cfg = PlannerConfig(eta=args.eta, beta=1.3, j_cap_ms=args.j_cap, theta=0.8,
                         kappa_over=0.3, n_standby=0, k_probe=args.k_probe,
-                        k_gate=args.k_probe, k_audit=args.k_probe, seed=args.seed)
-    net = MeasurementCache(oracle, k=cfg.k_probe, j_cap_ms=cfg.j_cap_ms, k_gate=cfg.k_gate)
-    tasks = [TaskProfile(name=u, lam=l, experts_per_layer=plcs[u].as_experts_per_layer(),
-                         placement=plcs[u]) for u, l in TASKS]
-    p_curve = {l: 0.70 + 0.05 * l for l in range(2, mcfg.n_layers)}
-    try:
-        res = plan(nodes, spec, tasks, uni, net, cfg, p_curve, p_min=0.80)
-    except PlanningError as e:
-        for line in e.log:
-            log.info("      %s", line)
-        log.error("规划失败: %s", str(e).split("。")[0])
-        return 2
+                        k_gate=args.k_probe, k_audit=args.k_probe, seed=args.seed,
+                        fill_idle=args.fill_idle)
+    net = None
+    res = None
 
-    man = res.manifest
-    log.info("      L₀=%d，配额 %s，前段 %d 条，组合矩阵 %d 组，清单校验 %s",
-             res.l0, {u: len(v) for u, v in res.backs.items()},
-             len(res.fronts_final), len(man.pairings),
-             "通过" if man.ok else f"未通过 {man.violations[:1]}")
-    if not man.ok:
-        return 3
-    if args.save_plan:
-        args.save_plan.write_text(man.to_json(), encoding="utf-8")
-        log.info("      清单已存 %s", args.save_plan)
+    if args.load_plan:
+        # 载入清单 = 把放置固定住。规划的输入里有一项不可复现：逐对延迟实测。
+        # 同一个池子换个时间跑，探测值会变，段的构成与 id 编号都可能跟着变 ——
+        # 于是「F0 连 BX1」这种人工指定在下一次规划里可能指到别的东西上。
+        # 存清单 → 改连接 → 载清单，这条路让指定有稳定的所指。
+        man = DeploymentManifest.from_json(args.load_plan.read_text(encoding="utf-8"))
+        log.info("[2/5] 跳过探测（--load-plan）")
+        log.info("[3/5] 载入清单 %s：L₀=%d，%d 个节点，%d 条段",
+                 args.load_plan, man.l0, len(man.nodes), len(man.segments))
+        missing = {p.node for p in man.nodes} - set(addrs)
+        if missing:
+            log.error("清单里的节点 %s 不在 --agents 里。清单绑定的是**当时**那批"
+                      "机器名；机器换了就得重跑规划（去掉 --load-plan）",
+                      sorted(missing))
+            return 3
+        n_ck = sum(len(p.layers) for p in man.nodes
+                   if p.segment == next(iter(man.segments)))
+        if n_ck and man.l0 >= setup.n_layers:
+            log.error("清单的 L₀=%d 与当前模型的 %d 层对不上 —— 清单不是这个模型的",
+                      man.l0, setup.n_layers)
+            return 3
+        l0 = man.l0
+    else:
+        log.info("[2/5] 逐对探测（由节点自己发起，k=%d）", args.k_probe)
+        t0 = time.perf_counter()
+        oracle = RemoteNetworkOracle(addrs, k_default=args.k_probe,
+                                     symmetric=not args.asymmetric_probe,
+                                     relay=RELAY)
+        n_pairs = oracle.warm_all(sorted(live), k=args.k_probe)
+        log.info("      %d 对，用时 %.1fs，%d 次 RPC", n_pairs,
+                 time.perf_counter() - t0, oracle.n_rpc)
+        reach = oracle.reachability(sorted(live))
+        dead = [n for n, c in reach.items() if c < len(live) - 1]
+        if dead:
+            log.warning("      可达性不完整: %s —— 分散环境常态（NAT/防火墙），"
+                        "规划会自然绕开不可达链路",
+                        {n: f"{reach[n]}/{len(live)-1}" for n in dead})
+        for f in oracle.failures[:5]:
+            log.debug("      %s", f)
+
+        log.info("[3/5] 离线规划")
+        net = MeasurementCache(oracle, k=cfg.k_probe, j_cap_ms=cfg.j_cap_ms,
+                               k_gate=cfg.k_gate)
+        p_curve = {l: min(0.97, 0.70 + 0.05 * l) for l in range(1, setup.n_layers)}
+        try:
+            res = plan(nodes, spec, setup.tasks, front_plc, net, cfg, p_curve,
+                       p_min=0.80)
+        except PlanningError as e:
+            for line in e.log:
+                log.info("      %s", line)
+            log.error("规划失败: %s", str(e).split("。")[0])
+            return 2
+
+        man = res.manifest
+        l0 = res.l0
+        log.info("      L₀=%d，配额 %s，前段 %d 条，组合矩阵 %d 组，清单校验 %s",
+                 res.l0, {u: len(v) for u, v in res.backs.items()},
+                 len(res.fronts_final), len(man.pairings),
+                 "通过" if man.ok else f"未通过 {man.violations[:1]}")
+        if not man.ok:
+            return 3
+        if args.save_plan:
+            args.save_plan.write_text(man.to_json(), encoding="utf-8")
+            log.info("      清单已存 %s（--load-plan 可以原样重放）", args.save_plan)
+
+    # ---------------- 3b. 静态模式：把链路定死 --------------------------- #
+    wired: dict[str, tuple[str, str]] = {}
+    if args.static:
+        front_ids = sorted(k for k, v in man.segments.items() if v["role"] == "front")
+        if args.wiring:
+            wired = resolve_wiring(Path(args.wiring), man, front_ids)
+            log.info("      静态链路：按 %s 指定的 %d 条", args.wiring, len(wired))
+        elif res is not None:
+            wiring = assign_static_pairs(res.fronts_final, res.backs, net,
+                                         k=cfg.k_audit,
+                                         front_ids=[f"F{i}" for i in
+                                                    range(len(res.fronts_final))])
+            if not wiring.pairs:
+                log.error("静态配对没配出任何通道 —— 前段或后段为空")
+                return 3
+            wired = wiring.as_map()
+            log.info("      静态链路（自动配对）：%s", wiring.summary())
+            if wiring.unpaired_backs:
+                log.warning("        ⚠ 没配上前段的后段: %s —— 这些后段收不到请求",
+                            wiring.unpaired_backs)
+        else:
+            # --load-plan 但没给 --wiring：用清单里存着的组合矩阵重放一次贪心。
+            # 拿的是当时测的 t50，不是现在的 —— 网络变了这个选择就未必还最优。
+            log.info("      静态链路：按清单里存的组合矩阵贪心配对（延迟是**当时**测的）")
+            used_f: set[str] = set()
+            used_b: set[str] = set()
+            for pr in sorted(man.pairings, key=lambda x: x.t50):
+                if pr.front in used_f or pr.back in used_b:
+                    continue
+                wired[pr.front] = (pr.back, pr.task)
+                used_f.add(pr.front)
+                used_b.add(pr.back)
+            if not wired:
+                log.error("清单里没有组合矩阵，无法自动配对 —— 请给 --wiring")
+                return 3
+
+        # 无论哪条路，都把这几对的延迟重报一遍
+        t50 = {(q.front, q.back): q for q in man.pairings}
+        for i, (f, (b, u)) in enumerate(sorted(wired.items())):
+            sf, sb = man.segments[f], man.segments[b]
+            if net is not None:
+                w = net.get(sf["tail"], sb["head"], cfg.k_audit).p50
+                dl = net.get(sb["tail"], sf["head"], cfg.k_audit).p50
+                tot, mark = sf["delay_ms"] + w + sb["delay_ms"] + dl, ""
+            elif (f, b) in t50:
+                q = t50[(f, b)]
+                w, dl, tot, mark = q.w_p50, q.d_loop_p50, q.t50, "（清单值）"
+            else:
+                w = dl = tot = float("nan")
+                mark = "（清单里没测过这一对 —— 它不在当时的组合矩阵里）"
+            log.info("        ch%d  %-8s %s%s → %s%s  正向 %.0fms  回环 %.0fms  组合 %.0fms%s",
+                     i, u, f, tuple(sf["nodes"]), b, tuple(sb["nodes"]), w, dl, tot, mark)
+        if args.save_wiring:
+            args.save_wiring.write_text(wiring_to_json(wired, man), encoding="utf-8")
+            log.info("      连接已存 %s（改完可用 --wiring 喂回来）", args.save_wiring)
 
     # ---------------- 4. 下发清单 ---------------------------------------- #
-    host = args.advertise
-    if host is None:
-        host = "127.0.0.1" if all(a[0] in ("127.0.0.1", "localhost") for a in addrs.values()) \
-            else _guess_local_ip(next(iter(addrs.values())))
-        log.info("      未指定 --advertise，推断控制器地址为 %s", host)
+    host, guessed = coordinator_host(args.advertise, addrs)
+    if guessed:
+        log.info("      未给 --advertise，推断控制器地址为 %s", host)
 
-    refs = measure_front_refs(mcfg, corpus, uni, res.l0)
-    clf = HistogramClassifier(refs, {u: l for u, l in TASKS}, tau_hi=0.55, tau_lo=0.40)
-    baselines = measure_baseline_miss(mcfg, corpus, uni, plcs, res.l0)
-    log.info("      通道二基线（实测）: %s", {u: f"{v:.1%}" for u, v in baselines.items()})
+    clf = None
+    if args.lr_model:
+        # 外面训练好的 LR：控制机上装载、核对维度、化成纯 numpy 下发给前段 tail。
+        # 动态模式下它**替代**直方图识别器；静态模式下只做旁路识别（量准确率）。
+        try:
+            clf = LRClassifier.load(
+                args.lr_model, l0=l0, n_experts=setup.n_experts,
+                priors=dict(tasks_lam), class_map=args.lr_classes,
+                features=args.lr_features, feature_fn=args.lr_feature_fn,
+                tau_hi=args.tau_hi, tau_lo=args.tau_lo)
+        except (ValueError, KeyError, OSError) as e:
+            log.error("LR 模型装不上：%s", e)
+            log.error("  先离线核对：python3 -m p2pmoe.deploy.lr_tool inspect "
+                      "--model %s --l0 %d --n-experts %d", args.lr_model, l0,
+                      setup.n_experts)
+            return 2
+        log.info("      识别器：%s", clf.describe())
+        # 选择器按**完整模型**的路由训练：它看的那几层，前段每台都得装全部专家。
+        # 缺专家时第 l 层的输出被 drop-expert 近似改写，第 l+1 层起的路由（= 特征）
+        # 就整体偏了 —— 不报错，只是准确率悄悄掉。
+        short = sorted({(p.node, l.layer, len(l.experts)) for p in man.nodes
+                        if p.role.startswith("front") for l in p.layers
+                        if l.layer in clf.layers and len(l.experts) < setup.n_experts})
+        if short:
+            nid, l, k = short[0]
+            log.warning("      ⚠ 前段没装全识别器要看的层：%s 第 %d 层只有 %d/%d 个专家"
+                        "（共 %d 处）。选择器是按完整模型的路由训练的，缺专家会让特征偏离 "
+                        "—— 用 examples/task_deploy.py --front-full 重新规划",
+                        nid, l, k, setup.n_experts, len(short))
+        log.info("      置信三区 τ_hi=%.2f τ_lo=%.2f%s", clf.tau_hi, clf.tau_lo,
+                 "（静态模式：只旁路上报，不影响配对）" if args.static else "")
+        if clf.unrecognised:
+            log.warning("      ⚠ 部署了 %s，但 LR 不认识它们 —— 这些池只能靠先验/换绑进请求",
+                        clf.unrecognised)
+        extra = sorted(set(clf.classes) - set(clf.priors))
+        if extra:
+            log.info("      LR 还认识 %s（没部署）—— 判成它们的请求在已部署的 task 间重归一",
+                     extra)
+    elif not args.static:
+        if setup.backend == "numpy":
+            # toy 模型：拿同一份合成语料实测参考直方图
+            refs = measure_front_refs(mcfg, corpus, front_plc, l0)
+            clf = HistogramClassifier(refs, dict(tasks_lam), tau_hi=0.55, tau_lo=0.40)
+        elif profiles_raw is not None:
+            # 真模型：参考直方图 = 各 task 在前段层上的激活质量之和。
+            # **这是动态模式在真模型上唯一的分类器来源** —— 没有画像就没有识别，
+            # 而没有识别就只能走 --static（配对定死、请求自报 task）。
+            clf = HistogramClassifier.from_profiles(profiles_raw, l0,
+                                                    dict(tasks_lam),
+                                                    tau_hi=0.55, tau_lo=0.40)
+            log.info("      分类器：从 %s 的前 %d 层激活质量构造",
+                     args.profile, l0)
+        else:
+            log.error("动态模式在真模型上需要 --profile 来构造分类器 —— "
+                      "没有它就没有识别。要么给 --profile，要么用 --static")
+            return 2
+    if setup.backend == "numpy":
+        # toy 模型能**实测**基线：拿同一份语料、同一条轨迹跑一遍就知道了
+        baselines = measure_baseline_miss(mcfg, corpus, front_plc, plcs, l0)
+        how = "实测"
+    else:
+        # 真模型没有可回放的语料，只能用「1 − 覆盖率」这个估计值。
+        # 注意它**偏低 3–6 倍**（README「与文档的偏差」第八条）—— 动态模式下
+        # 拿它当告警线会对绑对的池持续误报。静态模式不触发换绑，所以只是个读数。
+        baselines = {u: p_.baseline_miss(l0 + 1, setup.n_layers)
+                     for u, p_ in plcs.items()}
+        how = "按 1−覆盖率 估计，偏低，仅供参考"
+    measured = setup.backend == "numpy"
+    log.info("      通道二基线（%s）: %s%s", how,
+             {u: f"{v:.1%}" for u, v in baselines.items()},
+             "（静态模式下只统计，不触发换绑）" if args.static else "")
+    if not measured and not args.static:
+        log.info("      估计值不做告警线 —— 先在线自校准（拿没换过绑的请求实测），"
+                 "攒够 %d 条再启用换绑", 6)
 
-    coord = Coordinator(man, baselines=baselines, priors={u: l for u, l in TASKS},
-                        alarm_factor=3.0, host=args.bind)
+    # ---- 文本层：只在控制机上 ---- #
+    textio = None
+    if args.model_dir:
+        try:
+            textio = TextIO.from_model_dir(args.model_dir, chat=args.chat)
+            log.info("      tokenizer: vocab %d，停止 token %s，%s",
+                     textio.tok.vocab_size, sorted(textio.stop.ids),
+                     "套对话模板" if args.chat else "completion 模式")
+        except (FileNotFoundError, ImportError) as e:
+            log.warning("      没有文本层（%s）→ 请求仍走 token id", e)
+    elif args.prompt:
+        log.warning("      给了 --prompt 但没有 --model-dir，tokenizer 无从加载 —— 忽略")
+
+    # ---- task 选择器的口径：只数 body token、非思考模式 ---- #
+    body = bool(getattr(clf, "needs_body", False))
+    if body:
+        if textio is None:
+            log.error("识别器只数 body token（用户内容本身，不含对话模板）—— 要文本入口才"
+                      "知道哪些 token 是 body。给 --model-dir（控制机上有 tokenizer 就行）")
+            return 2
+        if not args.chat:
+            log.error("识别器是在对话模板下训练的（moe_prefill_probe 的 PromptEncoder）。"
+                      "不套模板时前几层的路由与训练不同，特征对不上 —— 加 --chat")
+            return 2
+    thinking = args.thinking
+    if thinking == "auto":
+        thinking = "off" if body else "default"
+    if textio is not None and thinking != "default":
+        textio.template_kw["enable_thinking"] = thinking == "on"
+        log.info("      对话模板 enable_thinking=%s%s", thinking == "on",
+                 "（选择器训练时就是非思考模式）" if body and thinking == "off" else "")
+        if body and thinking == "on":
+            log.warning("      ⚠ 选择器是在非思考模式下训练的，开思考会改变模板 → 路由 → 特征")
+
+    coord = Coordinator(man, baselines=baselines, priors=dict(tasks_lam),
+                        alarm_factor=3.0, baselines_measured=measured,
+                        host=args.bind, static_wiring=wired or None,
+                        textio=textio, relay=RELAY)
+    coord.count_body = body
+    if body:
+        log.info("      逐层统计只数 body token：prompt 按选择器训练时的方式构造，"
+                 "body 区间随 prefill 下发给前段")
     coord_addr = (host, coord.port)
     log.info("[4/5] 下发清单（协调器 %s:%d）", *coord_addr)
-    distribute(man, addrs, mcfg, clf, coord_addr, res.l0)
+    distribute(man, addrs, setup, clf, coord_addr, l0, wired or None,
+               stop_ids=sorted(textio.stop.ids) if textio else None,
+               model_dir=args.model_dir, device=args.device,
+               miss_policy=args.miss_policy, node_caps=nodes,
+               caps_raw=raw_caps, report_layers=bool(args.dump_front_stats))
 
     pool = PeerPool("__coord__", LinkTable(), seed=0)
+    pool.use_relay(RELAY)
     for n, a in addrs.items():
         pool.register(n, a)
     coord.start(pool)
@@ -304,33 +1410,140 @@ def main(argv: list[str] | None = None) -> int:
     pool.warm(addrs)   # 保温网格（II.4 Step 6）
 
     # ---------------- 5. 在线服务 ---------------------------------------- #
-    log.info("[5/5] 在线服务：%d 条请求 × %d token，并发 %d（池子 %d 前段 / %s 后段）",
-             args.requests, args.tokens, args.concurrency,
-             len(coord.free_fronts), {u: len(q) for u, q in coord.free_backs.items()})
-    names = [t for t, _ in TASKS]
+    if args.static:
+        names = sorted({t for _, t in wired.values()})
+        log.info("[5/5] 在线服务（静态）：%d 条请求 × %d token，并发 %d，"
+                 "通道 %s —— task 由请求给定，不识别",
+                 args.requests, args.tokens, args.concurrency,
+                 {u: len(q) for u, q in coord.front_pools.items()})
+    else:
+        names = [u for u, _ in tasks_lam]
+        # 有 task 一条后段都没有的话，**现在**就说 —— 否则每条被识别成它的请求
+        # 都会排进一个永远不会有人归还的队列，300 秒后报「超时」，而日志只说
+        # 「池无空闲后段」，看起来像拥塞。
+        empty = [u for u in names if coord.back_capacity.get(u, 0) == 0]
+        if empty:
+            have = {u: n for u, n in coord.back_capacity.items() if n}
+            log.error("规划给这些 task 分到了 0 条后段：%s", empty)
+            log.error("  现有通道 %s —— 被识别成 %s 的请求会全部失败。",
+                      have or "无", "/".join(empty))
+            log.error("  规划器按内存与跳数约束分配整数条通道，配额不够时"
+                      "**会给某个 task 分到 0** —— 这是离散配平的正常结果，不是崩溃。")
+            log.error("  三条路：")
+            log.error("    · 降 --coverage（现在 %.2f）—— 每条段更小，同样的机器能建更多条",
+                      args.coverage)
+            log.error("    · 调 --tasks 的到达比 —— 现在 %s，把权重挪向拿不到通道的那个",
+                      dict(tasks_lam))
+            log.error("    · 加节点")
+            log.error("  注意覆盖率与通道数**不是单调的**（段的组成是离散的、跳数是整数），"
+                      "0.60 未必比 0.70 建得多 —— 挨个试比推理快。")
+            return 2
+        log.info("[5/5] 在线服务：%d 条请求 × %d token，并发 %d（池子 %d 前段 / %s 后段）",
+                 args.requests, args.tokens, args.concurrency,
+                 len(coord.free_fronts), {u: len(q) for u, q in coord.free_backs.items()})
+    # 来自 --prompts-file 的测试集：[(true_task|None, 文本), ...]
+    cases: list[tuple[str | None, "str | dict"]] = []
+    if args.prompts_file:
+        cases = load_cases(args.prompts_file, names)
+        if not cases:
+            log.error("%s 里一条 prompt 都没有", args.prompts_file)
+            return 2
+        blank = [i for i, (_, t) in enumerate(cases) if not _case_text(t).strip()]
+        if blank:
+            log.warning("  第 %s 行的 prompt 是空的 —— 采集端的问题。"
+                        "它们会照样发出去（0 token 的请求），"
+                        "好让问题露出来而不是被悄悄跳过",
+                        ", ".join(str(i + 1) for i in blank[:10]))
+        labelled = sum(1 for u, _ in cases if u)
+        log.info("测试集 %s：%d 条，其中 %d 条带 task 标注%s",
+                 args.prompts_file, len(cases), labelled,
+                 "" if labelled == len(cases) else "（没标注的按轮转指派真实 task）")
+        if args.requests > len(cases):
+            log.info("  --requests %d > %d 条 —— 会循环重跑",
+                     args.requests, len(cases))
+        elif args.requests < len(cases):
+            log.info("  --requests %d < %d 条 —— 只跑前 %d 条",
+                     args.requests, len(cases), args.requests)
+
     rows, batch = [], []
 
     def drain(batch_):
         for rec in batch_:
-            if not rec.done.wait(timeout=300):
-                log.error("%s 超时。已发生的事件：", rec.req)
+            if not rec.done.wait(timeout=args.req_timeout):
+                log.error("%s 等了 %.0fs 还没完成。协调器这边看到的：",
+                          rec.req, args.req_timeout)
                 for e in rec.events:
                     log.error("    %s", e)
+                try:
+                    _where_is_it_stuck(rec, coord, addrs, pool)
+                except Exception as e:      # 诊断本身不该盖住原始故障
+                    log.debug("问节点失败：%s", e)
                 continue
             per = sorted(rec.token_ms)
             p50 = per[len(per) // 2] if per else 0.0
             rows.append((rec, p50))
-            log.info("  %-7s 真实 %s → 识别 %s %s  %s×%s  换绑 %d  "
-                     "排队 %.0f/%.0fms  首token %.0fms  逐token p50 %.0fms",
-                     rec.req, rec.true_task, rec.task, "✓" if rec.correct else "✗",
-                     rec.front, rec.back, rec.rebinds,
-                     rec.wait_front_ms, rec.wait_back_ms,
-                     (rec.t_first - rec.t0) * 1000, p50)
+            if rec.text:
+                log.info("  %-7s %s×%s  停于 %s  %d token  首token %.0fms  «%s»",
+                         rec.req, rec.front, rec.back, rec.stop_reason,
+                         len(rec.tokens), (rec.t_first - rec.t0) * 1000,
+                         rec.text[:80].replace("\n", "⏎"))
+            elif args.static:
+                sh = rec.shadow
+                log.info("  %-7s task %s  %s×%s（定死）  排队 %.0fms  "
+                         "首token %.0fms  逐token p50 %.0fms%s",
+                         rec.req, rec.task, rec.front, rec.back,
+                         rec.wait_front_ms, (rec.t_first - rec.t0) * 1000, p50,
+                         "" if not sh else
+                         f"  旁路LR {sh['task']} {'✓' if sh['task'] == rec.true_task else '✗'}"
+                         f" c={sh['conf']:.2f} {sh['zone']}"
+                         + (f"（{sh['note']}）" if sh.get("note") else ""))
+            else:
+                log.info("  %-7s 真实 %s → 识别 %s %s  %s×%s  换绑 %d  "
+                         "排队 %.0f/%.0fms  首token %.0fms  逐token p50 %.0fms",
+                         rec.req, rec.true_task, rec.task, "✓" if rec.correct else "✗",
+                         rec.front, rec.back, rec.rebinds,
+                         rec.wait_front_ms, rec.wait_back_ms,
+                         (rec.t_first - rec.t0) * 1000, p50)
+
+    if args.warmup:
+        log.info("  预热 %d 条（不计入结果）—— torch 首次前向含 kernel 选择、"
+                 "显存池分配、权重进页缓存，只发生一次", args.warmup)
+        wrows_at = len(rows)
+        for i in range(args.warmup):
+            u = names[i % len(names)]
+            if textio and cases:
+                tu, txt = cases[i % len(cases)]
+                r = _submit_case(coord, f"warm{i}", txt, true_task=tu or u,
+                                 channel_task=(tu if tu in names else u),
+                                 static=args.static)
+            elif textio and args.prompt:
+                r = coord.submit(f"warm{i}", text=args.prompt[i % len(args.prompt)],
+                                 true_task=u, task=u if args.static else None)
+            else:
+                r = coord.submit(f"warm{i}", sample_prompt(corpus, u, 12, seed=9000 + i),
+                                 true_task=u, task=u if args.static else None)
+            r.done.wait(timeout=300)
+        # 丢掉预热产生的记录 —— 它们混进 p50 就白预热了
+        del rows[wrows_at:]
+        coord.pairings[:] = [x for x in coord.pairings
+                             if not x[0].startswith("warm")]
+        log.info("  预热完成，开始正式测量")
 
     for i in range(args.requests):
         u = names[i % len(names)]
-        batch.append(coord.submit(f"req{i}", sample_prompt(corpus, u, 12, seed=1000 + i),
-                                  true_task=u))
+        if textio and cases:
+            true_u, txt = cases[i % len(cases)]
+            true_u = true_u or u
+            # 标注可以是没部署的类（如 no_robots）—— 静态模式下它走轮转到的通道
+            batch.append(_submit_case(coord, f"req{i}", txt, true_task=true_u,
+                                      channel_task=(true_u if true_u in names else u),
+                                      static=args.static))
+        elif textio and args.prompt:
+            batch.append(coord.submit(f"req{i}", text=args.prompt[i % len(args.prompt)],
+                                      true_task=u, task=u if args.static else None))
+        else:
+            batch.append(coord.submit(f"req{i}", sample_prompt(corpus, u, 12, seed=1000 + i),
+                                      true_task=u, task=u if args.static else None))
         if len(batch) >= args.concurrency:
             if args.concurrency > 1:
                 log.info("  已打入 %d 条；池深 %s", len(batch), coord.queue_depths())
@@ -340,13 +1553,115 @@ def main(argv: list[str] | None = None) -> int:
         drain(batch)
 
     if rows:
-        ok = sum(r.correct for r, _ in rows)
         p50 = float(np.median([m for _, m in rows]))
-        log.info("汇总：识别 %d/%d，逐 token p50 %.0fms，换绑 %d 次", 
-                 ok, len(rows), p50, sum(r.rebinds for r, _ in rows))
+        # 汇总行**必须带上跑的是什么** —— 时延数字脱离了后端就没有意义。
+        who = (f"{setup.label}/{setup.backend}"
+               if setup.backend != "numpy" else "toy 玩具模型（非真实权重）")
+        if args.static:
+            log.info("汇总[%s]：%d 条完成，逐 token p50 %.0fms，换绑 %d 次（静态模式恒为 0）",
+                     who, len(rows), p50, sum(r.rebinds for r, _ in rows))
+            sh = [(r.shadow["task"] == r.true_task) for r, _ in rows
+                  if r.shadow and r.true_task]
+            if sh:
+                log.info("      旁路 LR 识别 %d/%d = %.0f%%（不影响配对）",
+                         sum(sh), len(sh), 100 * sum(sh) / len(sh))
+        else:
+            log.info("汇总[%s]：识别 %d/%d，逐 token p50 %.0fms，换绑 %d 次",
+                     who, sum(r.correct for r, _ in rows), len(rows), p50,
+                     sum(r.rebinds for r, _ in rows))
         log.info("配对历史（每条请求用了哪对段）：")
         for req, f, b, u in coord.pairings:
             log.info("    %-7s %s × %s  (%s)", req, f, b, u)
+    if args.save_results and rows:
+        from p2pmoe.runtime.timing import summarise_request
+
+        out = {
+            "model": setup.label,
+            "classifier": clf.describe() if clf is not None else None,
+            "l0": int(getattr(spec, "l0", 0) or 0),
+            "backend": setup.backend,
+            "mode": "static" if args.static else "dynamic",
+            "miss_policy": args.miss_policy,
+            "coverage": args.coverage,
+            "tokens": args.tokens,
+            "concurrency": args.concurrency,
+            "requests": [],
+        }
+        for rec, p50 in rows:
+            # 先等埋点到齐再总结。以前这里**根本没等**（只有 run.py 等），
+            # 于是节点忙着算下一条时它那份埋点还在路上，总结就已经做完了。
+            # 缺席节点的计算会被反推进「网络」那一栏 —— 真机上漏的偏偏是 N08，
+            # 一台占 48% 的计算，把网络顶到了 30–52%。
+            # 埋点齐了就立刻返回，所以正常情况下这行几乎不花时间。
+            coord.wait_trace(rec, timeout=5.0)
+            t = summarise_request(rec, coord)
+            out["requests"].append({
+                "req": rec.req,
+                "prompt": rec.prompt,
+                "text": rec.text,
+                "stop_reason": rec.stop_reason,
+                "true_task": rec.true_task,
+                "task": rec.task,
+                # 静态模式不识别，correct 恒真没有信息量 —— 置 None 免得被当成 100%
+                "correct": None if args.static else bool(rec.correct),
+                "confidence": round(rec.conf, 4),
+                "zone": rec.zone,
+                **({"raw_scores": rec.raw_scores} if rec.raw_scores else {}),
+                **({"n_body": sum(b - a for a, b in rec.body)}
+                   if rec.body is not None else {}),
+                **({"shadow": rec.shadow} if rec.shadow else {}),
+                "rebinds": rec.rebinds,
+                "front": rec.front, "back": rec.back,
+                "n_prompt": t.n_prompt, "n_generated": t.n_generated,
+                "total_ms": round(t.total_ms, 2),
+                "queue_ms": round(t.queue_ms, 2),
+                "queue_back_ms": round(t.queue_back_ms, 2),
+                "prefill_ms": round(t.prefill_ms, 2),
+                "decode_ms": round(t.decode_ms, 2),
+                "per_token_p50_ms": round(p50, 2),
+                "compute_ms": round(t.compute_ms, 2),
+                # 反推的，不是测量值：15 台没有时钟同步，跨机时刻拼不到一条轴上。
+                # 只在 traces_complete 为真时可信 —— 否则缺席节点的计算也在里面。
+                "network_and_overhead_ms": round(t.other_ms, 2),
+                "traces_complete": t.complete,
+                "utilisation": round(t.utilisation, 4),
+                "token_ms": [round(x, 2) for x in t.token_ms],
+                "nodes": [{
+                    "node": n.node, "role": n.role, "segment": n.segment,
+                    "layers": n.layer_span, "n_experts": n.n_experts,
+                    "compute_ms": round(n.compute_ms, 2),
+                    "n_forward": n.n_forward, "bytes_out": n.bytes_out,
+                    "share": round(t.node_utilisation(n), 4),
+                } for n in t.nodes],
+                "missing_traces": t.missing_traces,
+            })
+        rs = out["requests"]
+        out["summary"] = {
+            "n": len(rs),
+            "total_ms_p50": round(float(np.median([r["total_ms"] for r in rs])), 2),
+            "per_token_ms_p50": round(float(np.median(
+                [r["per_token_p50_ms"] for r in rs])), 2),
+            "utilisation_mean": round(float(np.mean(
+                [r["utilisation"] for r in rs])), 4),
+            "rebinds": sum(r["rebinds"] for r in rs),
+            "accuracy": (None if args.static else round(
+                sum(bool(r["correct"]) for r in rs) / len(rs), 4)),
+            # 静态模式下 LR 的旁路识别准确率（只算有真实标注的）
+            "shadow_accuracy": _shadow_acc(rs),
+            "errors": len(coord.errors),
+        }
+        args.save_results.parent.mkdir(parents=True, exist_ok=True)
+        args.save_results.write_text(
+            json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+        log.info("结果已写入 %s（%d 条）—— 算力使用率均值 %.1f%%，总时延 p50 %.0fms",
+                 args.save_results, len(rs),
+                 out["summary"]["utilisation_mean"] * 100,
+                 out["summary"]["total_ms_p50"])
+
+    if args.dump_front_stats and rows:
+        _dump_front_stats(args.dump_front_stats, [r for r, _ in rows], l0,
+                          setup.n_experts, deployed=names)
+
     if coord.errors:
         log.error("节点上报的错误：")
         for e in coord.errors[:5]:
@@ -362,6 +1677,29 @@ def main(argv: list[str] | None = None) -> int:
     coord.stop()
     pool.close()
     return 1 if coord.errors else 0
+
+
+def coordinator_host(advertise: str | None, addrs: dict) -> tuple[str, bool]:
+    """协调器要告诉 15 台节点「回报打到哪儿」。返回 (地址, 是不是推断出来的)。
+
+    **空串必须和缺省同等对待。** 原来的判断是 `if advertise is None`，而
+    `deploy_15.sh` 在 ADVERTISE 没设时会原样传 `--advertise ""` —— 空串不是
+    None，于是推断分支被跳过，`host` 就是空串，然后被下发给全部 15 台节点，
+    它们各自 `pool.register("__coord__", ("", port))`。
+
+    那之后的表现是这套系统里最难查的一种：控制机 → 节点方向全通（configure
+    成功、权重装好、`check` 全绿），节点算完往空地址回报时 `OSError` 被
+    `_serve_conn` 的 `except (ConnectionError, OSError): pass` 静静吃掉，连接
+    一关，线程退出。协调器永远等不到识别事件，请求超时，而现场看起来是
+    「节点空闲、GPU 0%、零连接」—— 像是从没收到过活。
+
+    实测代价是四个小时。空串在这里没有任何合法含义，一律当没给。
+    """
+    if advertise:
+        return advertise, False
+    if all(a[0] in ("127.0.0.1", "localhost") for a in addrs.values()):
+        return "127.0.0.1", True
+    return _guess_local_ip(next(iter(addrs.values()))), True
 
 
 def _guess_local_ip(peer: Addr) -> str:

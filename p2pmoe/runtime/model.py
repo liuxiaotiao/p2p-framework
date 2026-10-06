@@ -38,6 +38,8 @@ import numpy as np
 __all__ = [
     "ToyMoEConfig",
     "MoEStats",
+    "LayerStat",
+    "torch_layer_counts",
     "PartialExpertMoEBlock",
     "SegmentModel",
     "embed_tokens",
@@ -99,41 +101,125 @@ class ToyMoEConfig:
 
 # --------------------------------------------------------------------------- #
 @dataclass
+class LayerStat:
+    """一条请求在**某一层**上的路由统计 —— LR 识别的原料（`runtime/lr_classifier.py`）。
+
+    与 task/*.csv 的列一一对应：`count` ↔ `prefill_count`，`mass` ↔ 门控权重之和，
+    `mass / count` ↔ `prefill_mean_weight`。口径同样是**全量路由的 top-k**，不是
+    「驻留集里实际用到的」—— 见 `torch_model.py` 里「统计口径」那段。
+    """
+
+    count: np.ndarray
+    """[n_experts] 该层上每个专家进 top-k 的次数（对 token 求和）。"""
+    mass: np.ndarray
+    """[n_experts] 该层上每个专家的门控权重之和。"""
+    n_tokens: int = 0
+    """计入统计的 token 数。masked 时是 body token 数，不是整条 prompt 的长度。"""
+    masked: bool = False
+    """只统计了一部分位置（body token）。按 body 训练的识别器只认这种。"""
+
+    def __add__(self, o: "LayerStat") -> "LayerStat":
+        return LayerStat(self.count + o.count, self.mass + o.mass,
+                         self.n_tokens + o.n_tokens, self.masked and o.masked)
+
+    def to_wire(self) -> dict:
+        # 稀疏编码：prefill 几十个 token × top-k 只碰到一部分专家，
+        # 512 个里通常只有一两百个非零，按下标发省掉大半。
+        nz = np.flatnonzero(self.count)
+        return {"i": nz.tolist(), "c": self.count[nz].astype(int).tolist(),
+                "w": [round(float(x), 6) for x in self.mass[nz]],
+                "t": int(self.n_tokens), "e": int(self.count.shape[0]),
+                **({"m": 1} if self.masked else {})}
+
+    @classmethod
+    def from_wire(cls, d: Mapping) -> "LayerStat":
+        e = int(d["e"])
+        c = np.zeros(e, dtype=np.int64)
+        w = np.zeros(e, dtype=np.float64)
+        idx = np.asarray(d["i"], dtype=np.int64)
+        c[idx] = np.asarray(d["c"], dtype=np.int64)
+        w[idx] = np.asarray(d["w"], dtype=np.float64)
+        return cls(c, w, int(d["t"]), bool(d.get("m", 0)))
+
+
+@dataclass
 class MoEStats:
     """一次前向在一段上累计的路由统计。"""
 
     hist: np.ndarray
-    """[n_experts] 路由质量直方图 —— 捎带在 hidden state 后传，用于识别 task。"""
+    """[n_experts] 路由质量直方图（各层**求和**）—— 捎带在 hidden state 后传，用于识别 task。"""
     n_token_layer: int = 0
     """(token × 层) 计数，miss 率的分母。"""
     miss_token_layer: int = 0
     """至少有一个 top-k 专家不在本地的 (token, 层) 数。"""
     miss_mass: float = 0.0
     """缺失掉的门控质量之和 —— drop-expert 重归一影响的大小。"""
+    count: np.ndarray | None = None
+    """[n_experts] 单层前向的 top-k 次数。只在一个 block 的返回值里有，
+    由 `SegmentModel.forward` 收进 `layers[l]`；合并后的统计不再用它。
+    给了 count_mask 时只数被选中的位置。"""
+    lmass: np.ndarray | None = None
+    """[n_experts] 给了 count_mask 时，被选中位置的门控质量（hist 仍是全部位置的）。"""
+    ltok: int | None = None
+    """给了 count_mask 时，被选中的 token 数。"""
+    layers: dict = field(default_factory=dict)
+    """{层号(规划器口径, 1-based): LayerStat} —— **逐层**的统计，不求和。
+
+    求和的 `hist` 把「第 3 层偏爱专家 7」和「第 9 层偏爱专家 7」混成一个数，
+    LR 要的恰恰是这个区分。只在前段 prefill 时随 hidden state 捎带
+    （`node._advance` 负责剥掉其余情况），decode 每步不付这份字节。"""
 
     @property
     def miss_rate(self) -> float:
         return self.miss_token_layer / self.n_token_layer if self.n_token_layer else 0.0
 
     def merge(self, other: "MoEStats") -> "MoEStats":
+        lay = dict(self.layers)
+        for l, s in other.layers.items():
+            lay[l] = lay[l] + s if l in lay else s
         return MoEStats(
             hist=self.hist + other.hist,
             n_token_layer=self.n_token_layer + other.n_token_layer,
             miss_token_layer=self.miss_token_layer + other.miss_token_layer,
             miss_mass=self.miss_mass + other.miss_mass,
+            layers=lay,
         )
+
+    def at_layer(self, layer: int) -> "MoEStats":
+        """把单层 block 的统计挂到 `layers[layer]` 下（`SegmentModel.forward` 用）。"""
+        cnt = self.count
+        if cnt is None:
+            cnt = np.zeros(self.hist.shape[0], dtype=np.int64)
+        masked = self.ltok is not None
+        mass = self.lmass if masked else self.hist
+        return MoEStats(
+            hist=self.hist, n_token_layer=self.n_token_layer,
+            miss_token_layer=self.miss_token_layer, miss_mass=self.miss_mass,
+            layers={int(layer): LayerStat(
+                np.asarray(cnt, dtype=np.int64),
+                np.asarray(mass, dtype=np.float64).copy(),
+                int(self.ltok if masked else self.n_token_layer), masked)},
+        )
+
+    def without_layers(self) -> "MoEStats":
+        return MoEStats(self.hist, self.n_token_layer, self.miss_token_layer,
+                        self.miss_mass)
 
     @classmethod
     def zeros(cls, n_experts: int) -> "MoEStats":
         return cls(hist=np.zeros(n_experts, dtype=np.float64))
 
-    def to_wire(self) -> dict:
-        return {
+    def to_wire(self, *, layers: bool = True) -> dict:
+        d = {
             "hist": [round(float(x), 6) for x in self.hist],
             "ntl": self.n_token_layer,
             "miss": self.miss_token_layer,
             "mass": round(self.miss_mass, 6),
         }
+        # 没有逐层统计时不出这个键 —— 旧节点、decode 步、后段的报文与以前逐字节一样
+        if layers and self.layers:
+            d["lay"] = {str(l): s.to_wire() for l, s in sorted(self.layers.items())}
+        return d
 
     @classmethod
     def from_wire(cls, d: Mapping) -> "MoEStats":
@@ -142,7 +228,37 @@ class MoEStats:
             n_token_layer=int(d["ntl"]),
             miss_token_layer=int(d["miss"]),
             miss_mass=float(d["mass"]),
+            layers={int(l): LayerStat.from_wire(s)
+                    for l, s in (d.get("lay") or {}).items()},
         )
+
+
+# --------------------------------------------------------------------------- #
+def _check_mask(count_mask, T: int) -> np.ndarray | None:
+    if count_mask is None:
+        return None
+    m = np.asarray(count_mask, dtype=bool).reshape(-1)
+    if m.shape[0] != T:
+        raise ValueError(f"count_mask 长 {m.shape[0]}，这一步有 {T} 个 token")
+    return m
+
+
+def torch_layer_counts(torch, topi, topw, hist, n_experts: int, count_mask):
+    """torch 后端两个 block 共用：(hist, count, lmass|None, ltok|None)，一次搬回 CPU。
+
+    count_mask 给了就只数这些位置（body token）。hist 恒按全部位置 —— 直方图识别器、
+    画像、miss 都不受影响。"""
+    E = n_experts
+    if count_mask is None:
+        hc = torch.stack([hist, torch.bincount(topi.reshape(-1), minlength=E)
+                          .to(torch.float64)]).cpu().numpy()
+        return hc[0], hc[1].astype(np.int64), None, None
+    m = torch.as_tensor(_check_mask(count_mask, topi.shape[0]), device=topi.device)
+    si, sw = topi[m].reshape(-1), topw[m].reshape(-1).double()
+    lm = torch.zeros(E, dtype=torch.float64, device=topi.device).index_add_(0, si, sw)
+    hc = torch.stack([hist, torch.bincount(si, minlength=E).to(torch.float64),
+                      lm]).cpu().numpy()
+    return hc[0], hc[1].astype(np.int64), hc[2], int(m.sum().item())
 
 
 # --------------------------------------------------------------------------- #
@@ -260,8 +376,12 @@ class PartialExpertMoEBlock:
         scores = np.where(idx, -1e30, scores)
         return _softmax(scores) @ v @ self.wo
 
-    def forward(self, x: np.ndarray, cache: dict) -> tuple[np.ndarray, MoEStats]:
-        """x: [T, d]（prefill 时 T>1，decode 时 T=1）。返回 (y, 本层统计)。"""
+    def forward(self, x: np.ndarray, cache: dict,
+                count_mask: np.ndarray | None = None) -> tuple[np.ndarray, MoEStats]:
+        """x: [T, d]（prefill 时 T>1，decode 时 T=1）。返回 (y, 本层统计)。
+
+        count_mask: [T] bool，给了就只对这些位置计逐层统计（body token）。
+        不影响计算，也不影响 hist / miss —— 那两个照旧按全部位置算。"""
         h = x + self._attend(x, cache)
 
         hn = h / np.maximum(np.linalg.norm(h, axis=-1, keepdims=True), 1e-9)
@@ -271,6 +391,11 @@ class PartialExpertMoEBlock:
         topk = np.argpartition(-probs, kth=k - 1, axis=-1)[:, :k]
 
         stats = MoEStats.zeros(self.cfg.n_experts)
+        stats.count = np.zeros(self.cfg.n_experts, dtype=np.int64)
+        cm = _check_mask(count_mask, h.shape[0])
+        if cm is not None:
+            stats.lmass = np.zeros(self.cfg.n_experts)
+            stats.ltok = int(cm.sum())
         out = np.zeros_like(h)
 
         for t in range(h.shape[0]):
@@ -279,6 +404,10 @@ class PartialExpertMoEBlock:
             here = np.array([int(e) in self.resident for e in picks])
 
             stats.hist[picks] += gates            # 激活质量直方图（捎带用）
+            if cm is None or cm[t]:
+                stats.count[picks] += 1           # 进 top-k 的次数（逐层 LR 特征）
+                if cm is not None:
+                    stats.lmass[picks] += gates
             stats.n_token_layer += 1
 
             if not here.all():
@@ -318,6 +447,13 @@ class SegmentModel:
             for l, es in layer_experts.items()
         }
         self._kv: dict[str, dict[int, dict]] = {}
+        self.profiler = None
+        """逐层激活画像的累加器。默认 None —— 见 runtime/profile.py。"""
+
+    def enable_profiling(self) -> None:
+        from .profile import LayerProfiler
+
+        self.profiler = LayerProfiler(self.cfg.n_experts)
 
     # -- 计量 -------------------------------------------------------------- #
     @property
@@ -329,13 +465,17 @@ class SegmentModel:
         return sum(b.full_bytes for b in self.blocks.values())
 
     # -- 前向 -------------------------------------------------------------- #
-    def forward(self, req: str, x: np.ndarray) -> tuple[np.ndarray, MoEStats]:
+    def forward(self, req: str, x: np.ndarray,
+                count_mask: np.ndarray | None = None) -> tuple[np.ndarray, MoEStats]:
         kv = self._kv.setdefault(req, {})
         total = MoEStats.zeros(self.cfg.n_experts)
         h = x
         for l in self.layers:
-            h, st = self.blocks[l].forward(h, kv.setdefault(l, {}))
-            total = total.merge(st)
+            h, st = self.blocks[l].forward(h, kv.setdefault(l, {}), count_mask=count_mask)
+            if self.profiler is not None:
+                # 逐层记，不是合并后再记 —— 驻留集是逐层决定的（n_{u,l} 异构）
+                self.profiler.record(l, st.hist, st.n_token_layer)
+            total = total.merge(st.at_layer(l))   # 逐层统计也留下（LR 识别用）
         return h, total
 
     # -- KV 生命周期 -------------------------------------------------------- #

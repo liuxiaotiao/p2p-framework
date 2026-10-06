@@ -39,6 +39,13 @@ class Verdict:
     zone: str
     """"commit" | "observe" | "prior" —— 置信三区（II.5）。"""
     scores: dict[str, float]
+    raw: dict[str, float] | None = None
+    """LR 识别器：在**全部**类别上的原始概率（含没部署的 task）。scores 是只在
+    部署了的 task 之间重归一过的。直方图识别器不填。"""
+    error: str | None = None
+    """识别器没法正常打分时的原因（如缺层）。此时 zone 为 prior。"""
+    note: str | None = None
+    """不是错误、但值得记一笔的情况（如判给了没有部署的类）。"""
 
     @property
     def keep_cache(self) -> bool:
@@ -107,6 +114,15 @@ class HistogramClassifier:
     def _norm(v: np.ndarray) -> np.ndarray:
         n = np.linalg.norm(v)
         return v / n if n > 1e-12 else v
+
+    kind = "hist"
+
+    def predict_stats(self, st) -> Verdict:
+        """与 LRClassifier 同一个入口 —— 节点只调这个，不管装的是哪种识别器。"""
+        return self.predict(st.hist)
+
+    def describe(self) -> str:
+        return f"直方图余弦 {len(self.tasks)} 类 {self.tasks}"
 
     def predict(self, hist: Sequence[float]) -> Verdict:
         h = self._norm(np.asarray(hist, dtype=float))

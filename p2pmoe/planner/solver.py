@@ -105,8 +105,15 @@ def deploy_path(
     *,
     beam_width: int = 12,
     prune_topk: int = 10,
+    exhaustive_short: bool = False,
 ) -> Segment | None:
-    """在可用节点集上放置 spec 描述的层区间，返回最优段；不可行返回 None。"""
+    """在可用节点集上放置 spec 描述的层区间，返回最优段；不可行返回 None。
+
+    exhaustive_short=True 时，0 跳与 1 跳的解精确穷举后并进候选（见下方注释）。
+    默认关：开了它主流程的规划结果会变（实测 L₀=11 时多建一条通道，但一张 T4
+    被选进前段，核心终审从 6.1% 变成 49.4%）—— 那是要单独决定的事，目前只给
+    补位（fill.py）用。
+    """
     lo0, hi0 = spec.layer_lo, spec.layer_hi
     n_layers = spec.n_layers
     if n_layers <= 0 or not avail:
@@ -149,6 +156,59 @@ def deploy_path(
             p.compute_ms, p.hop_ms, p.jitter_ms, p.nodes, nodes, partial=False
         )
 
+    # --- 0 跳与 1 跳：精确穷举 --------------------------------------------- #
+    # beam 只留前 W 个前缀，而完成下界假设「剩下的层能放进最大那台」—— 那台很可能
+    # 已经在前缀里用掉了。于是明明存在的 1 跳解会在截断里丢掉，甚至整轮返回 None。
+    # 实测（15 台真拓扑，L₀=11）：gsm8k 后段 24.1GB、候选 {N12,N13,N14,N15}，
+    # N13+N14 两台就装得下；beam=12 返回 None，beam=50 给出一个白多一跳的三节点解，
+    # beam=400 才找到那个两节点解。
+    #
+    # 本文件开头写的是「单节点/少跳解显式优先」，所以 0 跳与 1 跳不交给 beam，直接
+    # 穷举（O(|V|²·L)，前缀和让每次内存判定 O(1)），并进候选集。只增不减：按同一个
+    # 目标函数取最小，结果不会比原来差。≥2 跳仍然交给 beam。
+    #
+    # 先判内存、再碰网络：只对内存可行的节点对调 p50 / blocked，不额外触发探测。
+    #
+    # 默认不开（exhaustive_short=False）：它会改变主流程的规划结果，见 docstring。
+    cum = [0.0]
+    for l in range(lo0, hi0 + 1):
+        cum.append(cum[-1] + spec.gb_per_layer(l) + spec.kv_gb_per_layer)
+
+    def gb(a: int, b: int) -> float:  # 段内第 a..b 层（1-based，含两端）
+        return cum[b] - cum[a - 1]
+
+    scale = spec.ms_per_layer_scale
+    exact_best: _Partial | None = None
+    exact_score = float("inf")
+
+    def offer(p: _Partial) -> None:
+        nonlocal exact_best, exact_score
+        s = score_final(p)
+        if s < exact_score:
+            exact_best, exact_score = p, s
+
+    for v in (avail if exhaustive_short else ()):
+        if not spec.head_ok(v):
+            continue
+        nv = nodes[v]
+        if gb(1, n_layers) <= nv.usable_gb + 1e-9 and spec.tail_ok(v):
+            offer(_Partial((v,), ((lo0, hi0),), n_layers,
+                           n_layers * nv.ms_per_layer * scale, 0.0, 0.0))
+        for k in range(1, n_layers):
+            if gb(1, k) > nv.usable_gb + 1e-9:
+                break
+            rest = gb(k + 1, n_layers)
+            for v2 in avail:
+                if v2 == v or not spec.tail_ok(v2) or rest > nodes[v2].usable_gb + 1e-9:
+                    continue
+                if net.blocked(v, v2):
+                    continue
+                offer(_Partial(
+                    (v, v2), ((lo0, lo0 + k - 1), (lo0 + k, hi0)), n_layers,
+                    (k * nv.ms_per_layer + (n_layers - k) * nodes[v2].ms_per_layer) * scale,
+                    net.p50(v, v2), net.jitter(v, v2),
+                ))
+
     # --- 起点：每个候选起点 × 每种首段长度 ------------------------------- #
     starts = [v for v in avail if spec.head_ok(v)]
     starts.sort(key=lambda v: (-nodes[v].usable_gb, -nodes[v].avail))
@@ -173,7 +233,7 @@ def deploy_path(
                     jitter_ms=0.0,
                 )
             )
-    if not beam:
+    if not beam and exact_best is None:
         return None
     beam.sort(key=score_partial)
     beam = beam[:beam_width]
@@ -220,6 +280,8 @@ def deploy_path(
         finished.extend(p for p in cand if p.placed == n_layers)
         frontier = [p for p in cand if p.placed < n_layers]
 
+    if exact_best is not None:
+        finished.append(exact_best)
     if not finished:
         return None
     best = min(finished, key=score_final)

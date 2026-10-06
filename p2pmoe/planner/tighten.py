@@ -206,6 +206,7 @@ def tighten_lex(
             got = deploy_path(
                 spec, sorted(pool), nodes, net, obj,
                 beam_width=cfg.beam_width, prune_topk=cfg.prune_topk,
+                exhaustive_short=cfg.exhaustive_short,
             ) or segs[i]
             new[i] = got
             pool -= set(got.nodes)
@@ -225,6 +226,7 @@ def tighten_lex(
             got = deploy_path(
                 spec, sorted(pool), nodes, net, obj,
                 beam_width=cfg.beam_width, prune_topk=cfg.prune_topk,
+                exhaustive_short=cfg.exhaustive_short,
             ) or segs[i]
             new[i] = got
             pool -= set(got.nodes)

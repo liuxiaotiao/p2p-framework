@@ -117,12 +117,57 @@ def _rotate_half(x):
     return torch.cat((-b, a), dim=-1)
 
 
-def _rope(q, k, pos, head_dim: int, theta: float):
-    """标准 RoPE。pos 是**绝对位置**，decode 时由 KV 长度给出偏移。"""
+def _fast_decode_enabled() -> bool:
+    import os
+
+    return os.environ.get("P2P_FAST_DECODE", "1") not in ("0", "false", "no", "off")
+
+
+def _rope_inv(head_dim: int, theta: float, device):
     import torch
 
-    inv = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=q.device,
-                                        dtype=torch.float32) / head_dim))
+    return 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=device,
+                                         dtype=torch.float32) / head_dim))
+
+
+def _lin(x, w):
+    """x @ w.T —— 与之逐位相同（aten::linear 无 bias 时就是 matmul(x, w.t())），
+    但少一次 `.T` 派发。decode 每层有 ~17 个这样的转置。"""
+    import torch
+
+    return torch.nn.functional.linear(x, w)
+
+
+_ROPE_TABLES: dict = {}
+
+
+def _rope_table(head_dim: int, theta: float, device, dtype, n: int):
+    """cos/sin 表 [n, head_dim]，按 (head_dim, theta, 设备, dtype) 进程内共享，不够长时翻倍。
+
+    与逐次现算逐位相同（同样的 float32 乘法、同样的逐元素 cos/sin、同样的 cast），
+    但 decode 每层每步省掉 ~10 次 kernel 启动。"""
+    import torch
+
+    key = (head_dim, float(theta), str(device), dtype)
+    tab = _ROPE_TABLES.get(key)
+    if tab is None or tab[0].shape[0] < n:
+        m = max(n, 2 * (tab[0].shape[0] if tab is not None else 1024))
+        inv = _rope_inv(head_dim, theta, device)
+        fr = torch.arange(m, device=device).to(torch.float32)[:, None] * inv[None, :]
+        emb = torch.cat((fr, fr), dim=-1)
+        tab = _ROPE_TABLES[key] = (emb.cos().to(dtype), emb.sin().to(dtype))
+    return tab
+
+
+def _rope(q, k, pos, head_dim: int, theta: float, inv=None):
+    """标准 RoPE。pos 是**绝对位置**，decode 时由 KV 长度给出偏移。
+
+    inv（频率表）可以由调用方缓存 —— 它只取决于 head_dim 与 theta，每层每步
+    重算一遍是 5 次白白的 kernel 启动。"""
+    import torch
+
+    if inv is None:
+        inv = _rope_inv(head_dim, theta, q.device)
     fr = pos.to(torch.float32)[:, None] * inv[None, :]
     emb = torch.cat((fr, fr), dim=-1)
     cos, sin = emb.cos()[:, None, :], emb.sin()[:, None, :]
@@ -214,9 +259,9 @@ class TorchPartialExpertMoEBlock:
 
         c = self.cfg
         T = x.shape[0]
-        q = (x @ self.wq.T).view(T, c.n_heads, c.head_dim)
-        k = (x @ self.wk.T).view(T, c.n_kv_heads, c.head_dim)
-        v = (x @ self.wv.T).view(T, c.n_kv_heads, c.head_dim)
+        q = _lin(x, self.wq).view(T, c.n_heads, c.head_dim)
+        k = _lin(x, self.wk).view(T, c.n_kv_heads, c.head_dim)
+        v = _lin(x, self.wv).view(T, c.n_kv_heads, c.head_dim)
 
         # Qwen3 特有：q/k 各自过一次 RMSNorm（按 head_dim）再进 RoPE
         q = _rms_norm(q, self.q_norm, c.rms_eps)
@@ -225,7 +270,9 @@ class TorchPartialExpertMoEBlock:
         past = cache.get("k")
         offset = 0 if past is None else past.shape[0]
         pos = torch.arange(offset, offset + T, device=x.device)
-        q, k = _rope(q, k, pos, c.head_dim, c.rope_theta)
+        cos_t, sin_t = _rope_table(c.head_dim, c.rope_theta, q.device, q.dtype, offset + T)
+        cos, sin = cos_t[offset:offset + T, None, :], sin_t[offset:offset + T, None, :]
+        q, k = q * cos + _rotate_half(q) * sin, k * cos + _rotate_half(k) * sin
 
         if past is not None:
             k = torch.cat([past, k], dim=0)
@@ -241,39 +288,23 @@ class TorchPartialExpertMoEBlock:
         # [H, T, D]
         qh, kh, vh = q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)
         scores = (qh @ kh.transpose(1, 2)) / math.sqrt(c.head_dim)
-        # 因果 mask：第 i 个新 token 只能看到前 offset+i 个
-        idx = (torch.arange(T_all, device=x.device)[None, :]
-               > (offset + torch.arange(T, device=x.device))[:, None])
-        scores = scores.masked_fill(idx[None, :, :], torch.finfo(scores.dtype).min)
+        # 因果 mask：第 i 个新 token 只能看到前 offset+i 个。
+        # decode（T=1）时它看得见全部 —— mask 全假，masked_fill 是空操作，省掉 4 次启动
+        if T > 1:
+            idx = (torch.arange(T_all, device=x.device)[None, :]
+                   > (offset + torch.arange(T, device=x.device))[:, None])
+            scores = scores.masked_fill(idx[None, :, :], torch.finfo(scores.dtype).min)
         out = (torch.softmax(scores.float(), dim=-1).to(scores.dtype) @ vh)
-        return out.transpose(0, 1).reshape(T, c.n_heads * c.head_dim) @ self.wo.T
+        return _lin(out.transpose(0, 1).reshape(T, c.n_heads * c.head_dim), self.wo)
 
     # -- 前向 -------------------------------------------------------------- #
-    def forward(self, x, cache: dict, count_mask=None):
-        """x: [T, d_model]。返回 (y, 本层统计)。count_mask 见 model.PartialExpertMoEBlock。"""
+    def _choose(self, probs, topw, topi, here):
+        """→ (use_w, use_i, use_here, alive)：按 miss_policy 决定实际算哪些专家。"""
         import torch
 
         c = self.cfg
-        h = x + self._attend(_rms_norm(x, self.ln_in, c.rms_eps), cache)
-        z = _rms_norm(h, self.ln_post, c.rms_eps)
-        T = z.shape[0]
-
-        logits = z @ self.router.T                       # [T, E]
-        probs = torch.softmax(logits.float(), dim=-1)
-
-        # ---- 统计口径：**永远按全量路由算** ----
-        # 直方图与 miss 率必须反映「路由真正想要谁」，而不是「我们最后用了谁」。
-        # 否则画像只会不断确认已有的驻留集（`runtime/profile.py` 开头的那条前提），
-        # 通道二也会因为看不见缺失而永远不报警。这与下面用哪种补救策略无关。
-        topw, topi = torch.topk(probs, c.top_k, dim=-1)  # [T, k]，全量 top-k
-        if c.norm_topk_prob:
-            topw = topw / topw.sum(-1, keepdim=True)
-        here = torch.isin(topi, self._resident_idx)       # [T, k]
-        miss_tok = int((~here).any(-1).sum().item())
-        miss_mass = float((topw * ~here).sum().item())
-        hist = torch.zeros(c.n_experts, dtype=torch.float64, device=z.device)
-        hist.index_add_(0, topi.reshape(-1), topw.reshape(-1).double())
-
+        T = probs.shape[0]
+        z_dev = probs.device
         # ---- 计算口径：缺专家时怎么补救 ----
         if self.miss_policy == "local_topk":
             # **在驻留集内部重新取 top-k。** 与 drop 的区别只在缺失发生时：
@@ -284,14 +315,17 @@ class TorchPartialExpertMoEBlock:
             # 限制到驻留集再取 top-k 选出的是同一批。所以「驻留集覆盖实际路由
             # 时逐位一致」这条性质在两种策略下都成立。
             neg = torch.finfo(probs.dtype).min
-            mask = torch.zeros(c.n_experts, dtype=torch.bool, device=z.device)
-            mask[self._resident_idx] = True
-            local = probs.masked_fill(~mask[None, :], neg)
+            nmask = getattr(self, "_nonres_mask", None)
+            if nmask is None or nmask.device != z_dev:
+                mask = torch.zeros(c.n_experts, dtype=torch.bool, device=z_dev)
+                mask[self._resident_idx] = True
+                nmask = self._nonres_mask = ~mask[None, :]   # 每层固定，缓存
+            local = probs.masked_fill(nmask, neg)
             kk = min(c.top_k, len(self.resident))
             use_w, use_i = torch.topk(local, kk, dim=-1)
             use_w = use_w / use_w.sum(-1, keepdim=True).clamp_min(1e-9)
             use_here = torch.ones_like(use_i, dtype=torch.bool)
-            alive = torch.ones(T, dtype=torch.bool, device=z.device)
+            alive = torch.ones(T, dtype=torch.bool, device=z_dev)
         elif self.miss_policy == "drop_noscale":
             # 跳过缺失专家但**不重归一**：活下来的保持原权重，和 < 1。
             # 于是这一层的 FFN 贡献按丢掉的门控质量成比例缩小 —— 缺得越多越接近
@@ -310,16 +344,92 @@ class TorchPartialExpertMoEBlock:
                                 torch.zeros_like(kept))
             use_i, use_here = topi, here
 
+        return use_w, use_i, use_here, alive
+
+    def forward_decode(self, x, cache: dict, acc: dict):
+        """decode 快路径（单 token）：与 `forward` **逐位一致**，但每层只同步一次。
+
+        `forward` 每层要 ~12 次 GPU→CPU 同步（两个 .item()、unique().tolist()、
+        每个专家一次 nonzero、统计搬回 CPU）外加一堆 numpy 簿记。decode 一步只有
+        一个 token，这些开销盖过了真正的计算：真机上 A30 与 T4 每层都是 4–5ms，
+        与显卡快慢无关。这里：
+          * 选中的专家号一次性搬回（唯一一次同步），按专家号升序累加 ——
+            与 `forward` 的 index_add 顺序相同，所以结果逐位相同；
+          * hist / miss 累加在 GPU 上的 `acc` 里，整段算完由调用方搬一次。
+        逐层统计（LayerStat）不产出 —— decode 本来就不捎带它。
+        """
+        import torch
+
+        c = self.cfg
+        h = x + self._attend(_rms_norm(x, self.ln_in, c.rms_eps), cache)
+        z = _rms_norm(h, self.ln_post, c.rms_eps)
+        probs = torch.softmax(_lin(z, self.router).float(), dim=-1)
+        topw, topi = torch.topk(probs, c.top_k, dim=-1)
+        if c.norm_topk_prob:
+            topw = topw / topw.sum(-1, keepdim=True)
+        here = torch.isin(topi, self._resident_idx)
+        acc["miss_tok"] += (~here).any(-1).sum()
+        acc["miss_mass"] += (topw * ~here).sum()
+        acc["hist"].index_add_(0, topi.reshape(-1), topw.reshape(-1).double())
+
+        use_w, use_i, use_here, alive = self._choose(probs, topw, topi, here)
+        pick = torch.where(use_here, use_i, torch.full_like(use_i, -1))
+        sel = pick.reshape(-1).tolist()                   # 唯一一次同步
+        w = use_w.to(z.dtype)
         out = torch.zeros_like(z)
-        for e in sorted(self.resident):
-            sel = (use_i == e) & use_here
-            if not sel.any():
+        for j, e in sorted(((j, e) for j, e in enumerate(sel) if e >= 0),
+                           key=lambda t: t[1]):
+            if e not in self._gate:
                 continue
+            ti, slot = divmod(j, use_i.shape[1])
+            xi = z[ti:ti + 1]
+            hi = torch.nn.functional.silu(_lin(xi, self._gate[e])) * _lin(xi, self._up[e])
+            out[ti:ti + 1] += _lin(hi, self._down[e]) * w[ti, slot]
+        out = out * alive[:, None].to(out.dtype)
+        return h + out
+
+    def forward(self, x, cache: dict, count_mask=None):
+        """x: [T, d_model]。返回 (y, 本层统计)。count_mask 见 model.PartialExpertMoEBlock。"""
+        import torch
+
+        c = self.cfg
+        h = x + self._attend(_rms_norm(x, self.ln_in, c.rms_eps), cache)
+        z = _rms_norm(h, self.ln_post, c.rms_eps)
+        T = z.shape[0]
+
+        logits = _lin(z, self.router)                    # [T, E]
+        probs = torch.softmax(logits.float(), dim=-1)
+
+        # ---- 统计口径：**永远按全量路由算** ----
+        # 直方图与 miss 率必须反映「路由真正想要谁」，而不是「我们最后用了谁」。
+        # 否则画像只会不断确认已有的驻留集（`runtime/profile.py` 开头的那条前提），
+        # 通道二也会因为看不见缺失而永远不报警。这与下面用哪种补救策略无关。
+        topw, topi = torch.topk(probs, c.top_k, dim=-1)  # [T, k]，全量 top-k
+        if c.norm_topk_prob:
+            topw = topw / topw.sum(-1, keepdim=True)
+        here = torch.isin(topi, self._resident_idx)       # [T, k]
+        miss_tok = int((~here).any(-1).sum().item())
+        miss_mass = float((topw * ~here).sum().item())
+        hist = torch.zeros(c.n_experts, dtype=torch.float64, device=z.device)
+        hist.index_add_(0, topi.reshape(-1), topw.reshape(-1).double())
+
+        use_w, use_i, use_here, alive = self._choose(probs, topw, topi, here)
+
+        out = torch.zeros_like(z)
+        # 只遍历**这一批 token 真正选中的**专家：先一次性取出去重后的专家号
+        # （一次 GPU→CPU 同步），再逐个算。早先是遍历全部驻留专家、每个都
+        # `if sel.any()` —— 前段一层 128 个专家就是 128 次同步 + ~400 次 kernel
+        # 启动，decode 一个 token 一层要 4–6ms，而真正有活的只有 top-k=8 个。
+        active = torch.unique(use_i[use_here]).tolist()
+        for e in active:
+            if e not in self._gate:      # 防御：use_here 已保证驻留，不会走到
+                continue
+            sel = (use_i == e) & use_here
             tok, slot = sel.nonzero(as_tuple=True)
             w = use_w[tok, slot].to(z.dtype)
             xi = z[tok]
-            hi = torch.nn.functional.silu(xi @ self._gate[e].T) * (xi @ self._up[e].T)
-            out.index_add_(0, tok, (hi @ self._down[e].T) * w[:, None])
+            hi = torch.nn.functional.silu(_lin(xi, self._gate[e])) * _lin(xi, self._up[e])
+            out.index_add_(0, tok, _lin(hi, self._down[e]) * w[:, None])
 
         # hist 与 count 一起搬回 CPU —— 一次同步，不是两次
         h_, cnt, lm, lt = torch_layer_counts(torch, topi, topw, hist, c.n_experts,
@@ -414,9 +524,32 @@ class TorchSegmentModel:
         arr = np.array(x, dtype=np.float32, copy=True, order="C")
         return torch.from_numpy(arr).to(device=self.device, dtype=self.cfg.torch_dtype)
 
-    def forward(self, req: str, x, count_mask=None):
+    fast_decode = True
+    """节点在 decode 阶段可以走 `forward(..., decode=True)`（见 forward_decode）。
+    设环境变量 P2P_FAST_DECODE=0 可以退回逐层统计的慢路径做对照。"""
+
+    def _forward_decode(self, x, kv: dict):
+        import torch
+
+        E = self.cfg.n_experts
+        dev = x.device
+        acc = {"hist": torch.zeros(E, dtype=torch.float64, device=dev),
+               "miss_tok": torch.zeros((), dtype=torch.int64, device=dev),
+               "miss_mass": torch.zeros((), dtype=torch.float64, device=dev)}
+        h = x
+        for l in self.layers:
+            h = self.blocks[l].forward_decode(h, kv.setdefault(l, {}), acc)
+        v = torch.cat([acc["hist"], acc["miss_tok"].double()[None],
+                       acc["miss_mass"][None]]).cpu().numpy()   # 整段只搬一次
+        return h, MoEStats(hist=v[:E].copy(), n_token_layer=len(self.layers) * x.shape[0],
+                           miss_token_layer=int(v[E]), miss_mass=float(v[E + 1]))
+
+    def forward(self, req: str, x, count_mask=None, *, decode: bool = False):
         x = self._coerce(x)
         kv = self._kv.setdefault(req, {})
+        if (decode and count_mask is None and self.profiler is None
+                and _fast_decode_enabled()):
+            return self._forward_decode(x, kv)
         total = MoEStats.zeros(self.cfg.n_experts)
         h = x
         for l in self.layers:
@@ -430,7 +563,7 @@ class TorchSegmentModel:
         """只有后段的 tail 会调 —— 最终 norm + 输出头。"""
         if self.final_norm is None or self.lm_head is None:
             raise RuntimeError("本节点没有输出头（只有后段的 tail 需要）")
-        return _rms_norm(h, self.final_norm, self.cfg.rms_eps) @ self.lm_head.T
+        return _lin(_rms_norm(h, self.final_norm, self.cfg.rms_eps), self.lm_head)
 
     def sample(self, h, *, temperature: float = 0.0, seed: int = 0) -> int:
         """从最后一个位置采一个 token id。

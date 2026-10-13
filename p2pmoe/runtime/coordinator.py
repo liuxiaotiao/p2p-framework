@@ -94,7 +94,15 @@ class RequestRecord:
     t_front: float = 0.0
     """拿到前段的时刻。与 t0 的差就是前段排队时长。"""
     t_back: float = 0.0
-    """拿到后段的时刻。"""
+    """（最近一次）拿到后段的时刻。换绑会更新它。"""
+    t_back_first: float = 0.0
+    """**第一次**拿到后段的时刻。后段排队只算到这里 —— 换绑发生在 decode 中途，
+    用 t_back 算会把换绑前已经生成 token 的时间也记成「排队」（sel 连续测试里
+    出现过「后段排队 > TTFT」）。"""
+    alarms: int = 0
+    """通道二报警次数（换绑关掉时只记不换）。"""
+    rebind_log: list = field(default_factory=list)
+    """每次换绑：{t_ms（相对 t0）, from, to, at_token}。"""
     _last: float = 0.0
     done: threading.Event = field(default_factory=threading.Event)
 
@@ -119,9 +127,10 @@ class RequestRecord:
         # 静态模式没有识别这一步（_t_classified 恒为 0），前后段是一起拿的 ——
         # 后段排队就是 0。不判这一条的话减出来的是 perf_counter 的绝对值，
         # 报表「后排」一栏会是一个七位数的毫秒数，还把时延构成整个带歪。
-        if not (self.t_back and self._t_classified):
+        tb = self.t_back_first or self.t_back
+        if not (tb and self._t_classified):
             return 0.0
-        return max(0.0, (self.t_back - self._t_classified) * 1000)
+        return max(0.0, (tb - self._t_classified) * 1000)
 
     _t_classified: float = 0.0
     finished: bool = False
@@ -165,6 +174,10 @@ class Coordinator:
         self.baselines = dict(baselines)
         self.priors = dict(priors)
         self.alarm_factor = alarm_factor
+        self.allow_rebind = True
+        """False：通道二只报警不换绑。中途换绑目前只给新后段重做 prompt 的 prefill，
+        已生成 token 的上下文不在新后段的 KV 里 —— 换过去的请求输出会退化（连续
+        测试里 11 次误报换绑，6 条变成 2048 token 的复读）。识别器足够准时应关掉。"""
         self.min_window = min_window
 
         # ---- 通道二的告警线：来源比数值更要紧 -------------------------- #
@@ -596,6 +609,12 @@ class Coordinator:
         old, rec.back = rec.back, b
         rec.task = task
         rec.t_back = time.perf_counter()
+        if not rec.t_back_first:
+            rec.t_back_first = rec.t_back
+        if rebind:
+            rec.rebind_log.append({"t_ms": round((rec.t_back - rec.t0) * 1000, 1),
+                                   "from": old, "to": b, "task": task,
+                                   "at_token": len(rec.tokens)})
         w = rec.wait_back_ms
         rec.log(f"{'换绑' if rebind else '派发'}: pop({task} 池) → {b}"
                 + (f"（原 {old}）" if rebind and old else "")
@@ -666,12 +685,20 @@ class Coordinator:
                 and len(rec.miss_window) >= self.min_window
                 and rec.window_miss > base * self.alarm_factor
                 and rec.rebinds < 2):
-            rec.log(
-                f"通道二报警: 滑窗 miss 率 {rec.window_miss:.1%} > 基线 {base:.1%}"
-                f" × {self.alarm_factor:g} —— 误绑的直接症状"
-            )
-            self._rebind(rec)
-            return
+            rec.alarms += 1
+            if not self.allow_rebind:
+                # 只记不换：清窗口，免得每个 token 都报一次
+                if rec.alarms == 1:
+                    rec.log(f"通道二报警（换绑已关闭，只记录）: 滑窗 miss 率 "
+                            f"{rec.window_miss:.1%} > 基线 {base:.1%} × {self.alarm_factor:g}")
+                rec.miss_window.clear()
+            else:
+                rec.log(
+                    f"通道二报警: 滑窗 miss 率 {rec.window_miss:.1%} > 基线 {base:.1%}"
+                    f" × {self.alarm_factor:g} —— 误绑的直接症状"
+                )
+                self._rebind(rec)
+                return
 
         if len(rec.tokens) >= self.max_tokens:
             rec.stop_reason = "max_tokens"

@@ -21,6 +21,7 @@ import importlib.util
 import queue
 import socket
 import threading
+from collections import OrderedDict
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -217,7 +218,7 @@ def _cuda_state() -> dict:
 
 
 _REPLIES = frozenset({"echo", "capabilities", "check_model", "configure",
-                      "probe", "profile"})
+                      "probe", "profile", "usage"})
 
 
 class NodeServer:
@@ -256,6 +257,16 @@ class NodeServer:
         self.load_ms = 0.0
 
         self._reqs: dict[str, ReqState] = {}
+        # 已释放的请求。环是自转的：tail(b) 采样完直接回环给 head(f)，不等协调器。
+        # 协调器判 max_tokens 发 release 时，环上总还有一步在途 —— 早先节点收到
+        # 这一步就用 setdefault 重建状态与 KV 接着算，静态模式下前段出口又有
+        # static_peer 可送，于是这条请求**永远转下去**（「僵尸环」）：KV 从 0 重新
+        # 长、不停抢本通道的算力，每结束一条 max_tokens 请求就多一个。sel_static2
+        # 实测同一通道逐 token 281→1111ms 逐条变慢、N13 最后 OOM，都是它。
+        # 只拦 decode：同名请求的新 prefill（下一轮 measure 又从 req0 起）会把它
+        # 从这里移出。
+        self._released: "OrderedDict[str, None]" = OrderedDict()
+        self.n_dropped_stale = 0
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self.compute_ms = 0.0
@@ -312,6 +323,9 @@ class NodeServer:
         （`forward(req, x) -> (y, MoEStats)`、`drop_kv` 等）。
         """
         self._release_model()   # 先放旧的，再装新的 —— 见上面的注释
+        with self._lock:
+            self._released.clear()
+            self._reqs.clear()
         self.cfg = cfg
         t0 = time.perf_counter()
         extra: dict = {}
@@ -471,6 +485,13 @@ class NodeServer:
             if conn is not None:
                 send_msg(conn, {"type": "capabilities_ack", **self.capabilities()})
             return
+        if t == "usage":
+            # 连续测试的资源采样：累计计算时间 + 显存/利用率快照。
+            # 每条连接一个线程，所以算得正忙时也答得了。
+            if conn is not None:
+                send_msg(conn, {"type": "usage_ack", **self.usage(
+                    reset_peak=bool(h.get("reset_peak")))})
+            return
         if t == "probe":
             res = self.probe_peer(tuple(h["addr"]), int(h.get("k", 8)),
                                   peer=h.get("peer"))
@@ -496,6 +517,8 @@ class NodeServer:
                                 "trace": f"收到 {t} 但还没配置"})
             return
 
+        if self._stale(t, h):
+            return
         if t == "prefill":
             self._on_prefill(h)
         elif t == "hop":
@@ -526,9 +549,17 @@ class NodeServer:
                     "local_span_ms": round((st_.last_seen - st_.first_seen) * 1000, 3)
                     if st_.first_seen else 0.0,
                 })
-            self.model.drop_kv(h["req"])
+            # 先标记、后释放：与此同时在算的那一步（别的连接线程）要么在入口被
+            # _stale 拦下，要么算完在 _advance 入口被拦下并清掉它重建的 KV。
+            # 反过来（先释放后标记）中间有个窗口，KV 会被重建且没人再清 ——
+            # sel_dyn 跑完 N11 剩了 1 条就是它。
             with self._lock:
                 self._reqs.pop(h["req"], None)
+                self._released[h["req"]] = None
+                self._released.move_to_end(h["req"])
+                while len(self._released) > 4096:
+                    self._released.popitem(last=False)
+            self.model.drop_kv(h["req"])
         elif t == "get_profile":
             if conn is not None:
                 send_msg(conn, {"type": "profile_ack", "node": self.me,
@@ -540,17 +571,41 @@ class NodeServer:
             self._report({"type": "node_stats", "node": self.me, **self.stats()})
 
     # -- 数据面 ------------------------------------------------------------ #
+    def _stale(self, t: str, h: dict) -> bool:
+        """这条数据面消息属于一个已经 release 的请求吗？是就丢掉（并清掉残留 KV）。
+
+        prefill 阶段的消息代表同名请求重新开始，把它从已释放集合里移出、放行。"""
+        if t not in ("prefill", "hop", "seg_in", "loop"):
+            return False
+        req = h.get("req")
+        phase = "prefill" if t == "prefill" else h.get("phase", "decode")
+        with self._lock:
+            if req not in self._released:
+                return False
+            if phase == "prefill":
+                del self._released[req]
+                return False
+            self.n_dropped_stale += 1
+            self._reqs.pop(req, None)
+        if self.model is not None:
+            self.model.drop_kv(req)
+        return True
+
     def _state(self, req: str) -> ReqState:
         with self._lock:
             return self._reqs.setdefault(req, ReqState())
 
     def _forward(self, x: np.ndarray, req: str,
-                 cmask: list | None = None) -> tuple[np.ndarray, MoEStats]:
+                 cmask: list | None = None, *,
+                 decode: bool = False) -> tuple[np.ndarray, MoEStats]:
         st_ = self._state(req)
         t0 = time.perf_counter()
         if not st_.first_seen:
             st_.first_seen = t0
-        if cmask is None:
+        if cmask is None and decode and getattr(self.model, "fast_decode", False):
+            # decode 快路径：每层只同步一次，不产出逐层统计（decode 本来就不捎带）
+            h, st = self.model.forward(req, x, decode=True)
+        elif cmask is None:
             h, st = self.model.forward(req, x)
         else:
             h, st = self.model.forward(req, x, count_mask=_ranges_to_mask(cmask, len(x)))
@@ -578,7 +633,7 @@ class NodeServer:
         """段内下一跳收到 hidden state（+ 捎带的直方图）。"""
         req = h["req"]
         cm = h.get("cmask")
-        y, st = self._forward(arr, req, cm)
+        y, st = self._forward(arr, req, cm, decode=h.get("phase") == "decode")
         st = st.merge(MoEStats.from_wire(h["stats"]))
         self._advance(req, h["phase"], y, st, h.get("loop_to"), cmask=cm)
 
@@ -592,7 +647,7 @@ class NodeServer:
             self._state(req).loop_to = loop_to
         else:
             loop_to = self._state(req).loop_to
-        y, st = self._forward(arr, req)
+        y, st = self._forward(arr, req, decode=h.get("phase") == "decode")
         self._advance(req, h["phase"], y, st, loop_to)
 
     def _advance(
@@ -600,6 +655,13 @@ class NodeServer:
         *, cmask: list | None = None,
     ) -> None:
         """算完本节点的层之后往下走：段内还有下一跳就转发，否则按角色出段。"""
+        if phase != "prefill" and req in self._released:
+            # 这一步开算之后请求被 release 了：结果作废，清掉算的过程中重建的 KV
+            with self._lock:
+                self._reqs.pop(req, None)
+                self.n_dropped_stale += 1
+            self.model.drop_kv(req)
+            return
         if self.cfg.next_hop:
             # 逐层统计只在**前段 prefill** 捎带 —— 识别只在那一刻做。
             # decode 每步、后段都不带，报文与以前逐字节相同。
@@ -730,7 +792,7 @@ class NodeServer:
         s.n_decode += 1
         x = (self.model.embed_tokens([h["token"]]) if self.cfg.backend == "torch"
              else embed_tokens(self.mcfg, [h["token"]]))
-        y, st = self._forward(x, req)
+        y, st = self._forward(x, req, decode=True)
         self._advance(req, "decode", y, st, self.cfg.seg_head)
 
     # -- 后段出口：采样 + 回环 --------------------------------------------- #
@@ -766,6 +828,23 @@ class NodeServer:
         self.pool.send(loop_to, {"type": "loop", "req": req, "token": token})
 
     # -- 未配置态：能力与探测 ---------------------------------------------- #
+    def usage(self, *, reset_peak: bool = False) -> dict:
+        try:
+            from .weights import gpu_usage, reset_peak_memory
+            if reset_peak:
+                reset_peak_memory()
+            gpu = gpu_usage() if self.cfg is not None and self.cfg.backend == "torch" else {}
+        except Exception as e:                      # 执行层导不进来也别让采样挂掉
+            gpu = {"error": f"{type(e).__name__}: {e}"[:200]}
+        return {
+            "node": self.me,
+            "compute_ms": round(self.compute_ms, 3),
+            "msgs": self.n_msgs,
+            "active_reqs": len(self.model.active_requests())
+            if self.model is not None and hasattr(self.model, "active_requests") else 0,
+            "gpu": gpu,
+        }
+
     def capabilities(self) -> dict:
         """上报本机能力。规划器的 Node 表就是由这些回包拼出来的。"""
         cuda = _cuda_state()
@@ -780,6 +859,10 @@ class NodeServer:
             "ms_per_layer": _bench_ms_per_layer(),
             "configured": self.model is not None,
             "relay": list(self.relay) if self.relay else None,
+            # 在途请求数（持有 KV 的）与丢掉的过期消息数 —— 跑完一轮应该是 0 / 小数
+            "active_reqs": len(self.model.active_requests()) if self.model is not None
+            and hasattr(self.model, "active_requests") else 0,
+            "dropped_stale": self.n_dropped_stale,
         }
 
     def resolve_dir(self, model_dir: str | None) -> str | None:

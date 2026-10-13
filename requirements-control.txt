@@ -21,3 +21,4 @@ jinja2>=3.0             # 渲染 checkpoint 自带的 chat template。
 scikit-learn>=1.0       # 只有 --lr-model 读 sklearn 的 pkl/joblib 时才用到（反序列化要它）。
 joblib>=1.0             # 模型给成 npz/json 就都不需要。节点永远不需要 ——
                         # 控制机把模型化成纯 numpy 的 (W, b, 仿射预处理) 再下发
+pyarrow            # examples/build_cases.py 读 HF 数据集的 parquet（连续性测试的样本）

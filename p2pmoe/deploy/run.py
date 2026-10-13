@@ -159,7 +159,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--timing", action="store_true",
                     help="每条请求打一份时序报告：总时延怎么分掉的、"
                          "各节点算了多久、算力使用率")
-    ap.add_argument("--miss-policy", default="drop",
+    ap.add_argument("--miss-policy", default="local_topk",
                     choices=("drop", "drop_noscale", "local_topk"),
                     help="专家不在本地时怎么补救。见 runtime/node.py 的 NodeConfig")
     ap.add_argument("--relay", default=None, metavar="HOST:PORT",

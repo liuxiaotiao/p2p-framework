@@ -680,6 +680,22 @@ class LRClassifier:
         return v
 
 
+def verdict_label(v) -> "str | None":
+    """LR **自己判成了哪一类**（原始概率的 argmax），不是最后路由去了哪个池。
+
+    两者在「判给了没部署的类」时不同：模型说 humaneval（p≈1），路由只能退到
+    先验池（比如 gsm8k）。拿路由结果算识别准确率，会把判对的 humaneval 记成
+    「判成 gsm8k ✗」。收 Verdict 或它的线上字典（`_verdict_wire`）。"""
+    if v is None:
+        return None
+    raw = v.get("raw") if isinstance(v, dict) else getattr(v, "raw", None)
+    task = v.get("task") if isinstance(v, dict) else getattr(v, "task", None)
+    if raw:
+        # 下标类别重名时显示名带 "#下标"（见 _display_labels），比较时去掉
+        return str(max(raw, key=raw.get)).split("#")[0]
+    return task
+
+
 def _display_labels(classes: Sequence, cmap: Mapping[str, str]) -> list[str]:
     """原始概率按什么名字上报：类别本来就有名字就用它（humaneval 并进 mbpp 池时
     仍报 humaneval）；类别是 0、1、2 这种下标时用映射后的 task 名，重名再缀下标。"""

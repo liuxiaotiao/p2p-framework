@@ -152,8 +152,11 @@ def test_diagnosis_never_masks_the_original_failure(caplog) -> None:
     src = (Path(__file__).resolve().parent.parent
            / "p2pmoe" / "deploy" / "control.py").read_text(encoding="utf-8")
     # 注意别匹配到函数定义那一行 —— 它长得一模一样
-    i = src.index("                    _where_is_it_stuck(rec, coord")
-    assert "try:" in src[i - 120:i], "调用点没有 try 保护"
+    import re
+    calls = [m.start() for m in re.finditer(r"\n\s+_where_is_it_stuck\(rec, coord", src)]
+    assert calls, "找不到调用点"
+    for i in calls:
+        assert "try:" in src[i - 120:i], "调用点没有 try 保护"
 
 
 def test_layer_span_is_readable() -> None:

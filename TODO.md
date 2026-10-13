@@ -10,6 +10,15 @@
 
 ---
 
+## P1 · 计算加速与 vLLM 对照（见 `VLLM_MIGRATION.md`）
+
+实测每 token ~140ms，通信只占 4–7%，主体是每层 ~2.9ms 的派发开销。路线：
+先在框架内加速（专家堆叠 + 融合 MoE、静态 KV、decode CUDA Graph、节点批 decode），
+再用 vLLM 原生流水线做同硬件、同专家子集的对照基线。顺带要修：换绑不补上下文、
+通道二对 no_robots 过敏、no_robots 通道数不足。里程碑 M0–M5 与验收标准都在那份文档里。
+
+---
+
 ## ~~P0 · 真实模型执行层~~ · 部分完成
 
 **已完成**：`runtime/torch_model.py` + `runtime/weights.py`，在真实 key 命名的微型

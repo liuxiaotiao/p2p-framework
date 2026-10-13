@@ -97,6 +97,7 @@ FETCH_TIMEOUT=${FETCH_TIMEOUT:-14400}           # 单节点下载超时（秒）
 PROGRESS_EVERY=${PROGRESS_EVERY:-30}            # 下载期间多久报一次进度（0=关）
 PROMPTS=${PROMPTS:-task/cases.txt}              # 测试集：一行一条 prompt
 RESULTS=${RESULTS:-results/run.json}            # 逐请求结果落盘
+MISS_POLICY=${MISS_POLICY:-local_topk}           # 后段只在本层驻留（裁剪后）的专家里取 top-8
 WARMUP=${WARMUP:-2}                             # measure 前丢掉几条（冷启动）
 # 前段出口的 LR 识别器（可选）。给了 LR_MODEL 就用它：动态模式下替代直方图识别，
 # 静态模式下只旁路上报准确率。模型只在控制机上读，节点不需要 sklearn。
@@ -538,7 +539,7 @@ cmd_serve() {
       --load-plan "$PLAN" \
       --model-dir "$WEIGHTS" --device "$DEVICE" --ctx 2048 \
       --profile "$PROFILE" --coverage "$COVERAGE" \
-      --tasks "$TASKS" --chat \
+      --tasks "$TASKS" --chat --miss-policy "$MISS_POLICY" \
       --tokens "$TOKENS" --requests "$REQUESTS" --concurrency 3 \
       ${PROMPTS:+$([ -f "$PROMPTS" ] && echo "--prompts-file $PROMPTS")} \
       ${RESULTS:+--save-results "$RESULTS"} \
@@ -549,6 +550,28 @@ cmd_serve() {
       ${DUMP_FRONT:+--dump-front-stats "$DUMP_FRONT"} \
       ${THINKING:+--thinking "$THINKING"} \
       --once "$@"
+}
+
+# 连续性测试（闭环）：TestSamples 里的样本按 task 轮转进同一个池，所有前段共享；
+# 同时在途 = 后段通道数，每条后段完成一条就放出下一条；最大生成 MAX_TOKENS。
+# 记录 生成时延 / TTFT / TPOT 的均值与 p99、吞吐、各节点计算占用 / GPU 利用率 / 显存。
+#     python3 examples/build_cases.py          # samples.txt → TestSamples/cases.jsonl（一次）
+#     bash ./deploy_15.sh continuous
+cmd_continuous() {
+  say "5''. 连续性测试（闭环，共享请求池）"
+  local cases=${CASES:-TestSamples/cases.jsonl}
+  if [ ! -f "$cases" ]; then
+    echo "  没有 $cases —— 先生成："
+    echo "      python3 examples/build_cases.py --samples TestSamples/samples.txt --out $cases"
+    return 1
+  fi
+  local PROMPTS="$cases"
+  local RESULTS=${RESULTS:-results/continuous.json}
+  echo "  样本 $cases（$(wc -l < "$cases") 条），最大生成 ${MAX_TOKENS:-2048} token，结果 → $RESULTS"
+  cmd_serve --warmup "$WARMUP" --verbose --closed-loop --requests 0 \
+      --tokens "${MAX_TOKENS:-2048}" --req-timeout "${REQ_TIMEOUT:-3600}" \
+      --usage-interval "${USAGE_INTERVAL:-2}" \
+      $([ "${REBIND:-0}" = 1 ] || echo --no-rebind) "$@"
 }
 
 cmd_measure() {
@@ -572,9 +595,9 @@ print(f"\n{B}{d['model']}  L₀={d['l0']}  {d['mode']}  "
 if d.get("classifier"):
     print(f"  识别器：{d['classifier']}"
           + ("（静态：旁路，不影响配对）" if d["mode"] == "static" else ""))
-print(f"{'req':<7}{'真实':<7}{'识别':<7}{'':<3}{'通道':<16}"
+print(f"{'req':<7}{'真实':<10}{'识别':<10}{'':<3}{'通道':<16}"
       f"{'总ms':>8}{'前排':>7}{'后排':>7}{'首tok':>7}{'/tok':>7}{'算力':>7}{'':>3}")
-print("─" * 85)
+print("─" * 91)
 # 静态模式没有后段排队（前后段一起拿）。旧版协调器在静态模式下把 perf_counter
 # 的绝对值记成了 queue_back_ms，网络残差也因此被夹成 0 —— 读的时候改正，
 # 已经落盘的 results/*.json 不用重跑集群
@@ -588,22 +611,35 @@ for r in rs:
     mark = "" if r["correct"] is None else ("✓" if r["correct"] else "✗")
     shown = r["task"]
     if r["correct"] is None and r.get("shadow"):
-        # 静态模式 + LR 旁路：「识别」列显示 LR 判成什么，对错按真实 task 算
-        shown = r["shadow"]["task"]
+        # 静态模式 + LR 旁路：「识别」列显示 LR **自己判的类**（原始概率 argmax），
+        # 对错按真实 task 算。判给没部署的类时路由会退到先验池，那不是 LR 的判断
+        raw = r["shadow"].get("raw")
+        shown = (max(raw, key=raw.get).split("#")[0] if raw else r["shadow"]["task"])
         mark = "✓" if shown == r["true_task"] else "✗"
     # 埋点没到齐的请求打个记号：它的「算力」偏低、「网络」偏高，都不可信
     # 旧结果文件没有 traces_complete，但有 missing_traces —— 用它回落，
     # 这样过去跑的 results/*.json 不用重跑集群就能得到修正后的构成表
     flag = "" if r.get("traces_complete", not r.get("missing_traces")) else "!"
-    print(f"{r['req']:<7}{str(r['true_task']):<7}{str(shown):<7}{mark:<3}"
+    print(f"{r['req']:<7}{str(r['true_task']):<10}{str(shown):<10}{mark:<3}"
           f"{r['front']+'×'+r['back']:<16}"
           f"{r['total_ms']:>8.0f}{r['queue_ms']:>7.0f}"
           f"{r.get('queue_back_ms', 0):>7.0f}{r['prefill_ms']:>7.0f}"
           f"{r['per_token_p50_ms']:>7.1f}{r['utilisation']:>6.0%}{flag:>3}")
-print("─" * 85)
+print("─" * 91)
 acc = "—" if sm["accuracy"] is None else f"{sm['accuracy']:.0%}"
 if sm["accuracy"] is None and sm.get("shadow_accuracy") is not None:
-    acc = f"{sm['shadow_accuracy']:.0%}（旁路 LR）"
+    # 读时按 LR 自己判的类重算 —— 旧结果文件里存的是按路由池算的
+    xs = []
+    for r in rs:
+        sh = r.get("shadow")
+        if sh and r.get("true_task"):
+            raw = sh.get("raw")
+            lab = max(raw, key=raw.get).split("#")[0] if raw else sh["task"]
+            xs.append(lab == r["true_task"])
+    if xs:
+        acc = f"{sum(xs)}/{len(xs)} = {sum(xs) / len(xs):.0%}（旁路 LR，按它自己判的类）"
+    else:
+        acc = f"{sm['shadow_accuracy']:.0%}（旁路 LR）"
 print(f"  {len(rs)} 条：总时延 p50 {sm['total_ms_p50']:.0f}ms，"
       f"逐 token p50 {sm['per_token_ms_p50']:.1f}ms，"
       f"算力使用率均值 {sm['utilisation_mean']:.1%}，"
@@ -656,6 +692,64 @@ if miss:
     print(f"\n  ⚠ 这些节点没上报埋点：{sorted(miss)}（{n_bad}/{len(rs)} 条请求受影响）")
     print("    受影响的请求在表里标 ! ，且已被剔出「时延构成」的均值 ——")
     print("    它们的「算力」偏低、「网络」偏高，两个数都不能用。")
+
+# 连续性测试（--closed-loop）的指标
+run = d.get("run")
+if run:
+    def S(m, k, f="{:.0f}"):
+        v = m.get(k)
+        return "—" if v is None else f.format(v)
+    print(f"\n{B}  连续性测试：{run['n_requests']} 条（超时 {run['n_timeout']}），"
+          f"在途 {run['inflight']}，最大生成 {run.get('max_tokens')}，"
+          f"墙钟 {run['wall_s']:.0f}s{R}")
+    print(f"    {'指标':<16}{'均值':>10}{'p50':>10}{'p90':>10}{'p99':>10}{'最大':>10}")
+    for name, k, f in (("生成时延 ms", "latency_ms", "{:.0f}"), ("TTFT ms", "ttft_ms", "{:.0f}"),
+                       ("TTFT(去排队) ms", "ttft_service_ms", "{:.0f}"),
+                       ("TPOT ms/token", "tpot_ms", "{:.1f}"),
+                       ("后段排队 ms", "queue_back_ms", "{:.0f}"),
+                       ("生成长度 token", "gen_len", "{:.0f}")):
+        m = run.get(k) or {}
+        print(f"    {name:<16}" + "".join(f"{S(m, q, f):>10}"
+                                         for q in ("mean", "p50", "p90", "p99", "max")))
+    th = run["throughput"]
+    print(f"    吞吐：输出 {th['output_tok_per_s']:.2f} token/s，"
+          f"含 prompt {th['total_tok_per_s']:.2f} token/s，{th['req_per_min']:.2f} 请求/分钟"
+          f"（输出共 {run['output_tokens']} token；停止原因 {run['stop_reasons']}）")
+    a = run.get("accuracy")
+    if a:
+        print(f"    识别：{a['correct']}/{a['n']} = {a['rate']:.1%}（选择器自己判的类）；"
+              f"通道二报警 {run.get('alarms', 0)} 次，换绑 {run.get('rebinds', 0)} 次")
+    print(f"\n    {'task':<11}{'条数':>5}{'时延均值':>10}{'时延p99':>10}{'TTFT均值':>10}"
+          f"{'去排队TTFT':>11}{'TPOT均值':>10}{'后段排队':>10}{'生成均长':>9}{'识别':>8}{'换绑':>5}")
+    for u, m in run["by_task"].items():
+        acc = m.get("accuracy")
+        acc_s = "{:.0%}".format(acc["rate"]) if acc else "—"
+        print(f"    {u:<11}{m['n']:>5}{S(m['latency_ms'],'mean'):>10}"
+              f"{S(m['latency_ms'],'p99'):>10}{S(m['ttft_ms'],'mean'):>10}"
+              f"{S(m.get('ttft_service_ms') or {},'mean'):>11}"
+              f"{S(m['tpot_ms'],'mean','{:.1f}'):>10}{S(m['queue_back_ms'],'mean'):>10}"
+              f"{S(m['gen_len'],'mean'):>9}"
+              f"{acc_s:>8}"
+              f"{m.get('rebinds', 0):>5}")
+    if run.get("nodes"):
+        print(f"\n{B}  资源占用（连续测试窗口内）{R}")
+        print(f"    {'节点':<6}{'段':<13}{'计算占用':>8}{'GPU均值%':>9}{'GPU p95%':>9}"
+              f"{'显存峰值/总量 MB':>20}{'torch峰值MB':>12}{'功耗W':>7}")
+        seg = {n["node"]: n["segment"] for r in rs for n in r["nodes"]}
+        for nd, v in sorted(run["nodes"].items(), key=lambda kv: kv[0]):
+            if "error" in v:
+                print(f"    {nd:<6}{seg.get(nd, ''):<13}  采样失败：{v['error']}")
+                continue
+            mem = (f"{S(v,'mem_used_max_mb')}/{S(v,'mem_total_mb')}")
+            print(f"    {nd:<6}{seg.get(nd, ''):<13}{v['compute_util']:>8.1%}"
+                  f"{S(v,'gpu_util_mean','{:.1f}'):>9}{S(v,'gpu_util_p95','{:.0f}'):>9}"
+                  f"{mem:>20}{S(v,'torch_allocated_max_mb'):>12}{S(v,'power_mean_w'):>7}")
+        rr = run.get("resources") or {}
+        if rr:
+            print(f"    合计/均值：计算占用 {S(rr, 'compute_util_mean', '{:.1%}')}，GPU 利用率 "
+                  f"{S(rr, 'gpu_util_mean', '{:.1f}%')}，显存峰值合计 "
+                  f"{S(rr, 'mem_used_max_total_mb')} / {S(rr, 'mem_total_mb')} MB")
+        print("    计算占用 = 节点 forward 时间 / 墙钟；GPU 利用率 = nvidia-smi 采样（SM 有活的时间比）")
 PYEOF
 }
 
@@ -1272,6 +1366,11 @@ dev=\$(stat -c %d:%i $(printf %q "$WEIGHTS") 2>/dev/null)\"" \
   return 0
 }
 
+cmd_status() {
+  say "agent 状态"
+  $PY -m p2pmoe.deploy.launch status --hosts "$HOSTS" "${SSHARG[@]}"
+}
+
 cmd_stop() {
   say "停 agent"
   local extra=()
@@ -1306,7 +1405,9 @@ case "$action" in
   logs)    cmd_logs "${1:-}" ;;
   doctor)  cmd_doctor "${1:-}" ;;
   stop)    cmd_stop "${1:-}" ;;
+  status)  cmd_status ;;
+  continuous) cmd_continuous "$@" ;;
   all)     cmd_sync && cmd_check && cmd_fetch && cmd_start && cmd_serve "$@" ;;
-  *) echo "用法: $0 {sync|bootstrap|cmds|check|fetch|meta|diag|serve-weights|verify|refetch|identity|whereis|disk|start|serve|measure|report|logs|doctor|stop|all}
+  *) echo "用法: $0 {sync|bootstrap|cmds|check|fetch|meta|diag|serve-weights|verify|refetch|identity|whereis|disk|start|status|serve|measure|continuous|report|logs|doctor|stop|all}
        serve/measure 后面的参数原样透传给 control.py"; exit 1 ;;
 esac

@@ -30,6 +30,7 @@ from ..runtime.lr_classifier import (
     _cmap_str,
     load_lr_params,
     parse_class_map,
+    verdict_label,
 )
 from ..runtime.model import LayerStat, MoEStats
 
@@ -131,23 +132,39 @@ def main(argv: Sequence[str] | None = None) -> int:
     print("  ", clf.describe())
     conf: Counter = Counter()
     agree = n_ok = n_lab = 0
+    n_dep = n_dep_ok = n_undep = 0
     for r in rows:
         st = MoEStats(hist=np.zeros(E), layers={
             int(l): LayerStat.from_wire(s) for l, s in r["layers"].items()})
         v = clf.predict_stats(st)
+        lab = verdict_label(v)          # LR 自己判的类（argmax，含没部署的）
         if r.get("lr_task") is not None:
             agree += v.task == r["lr_task"]
-        if r.get("true_task"):
+        t = r.get("true_task")
+        if t:
             n_lab += 1
-            n_ok += v.task == r["true_task"]
-            conf[(r["true_task"], v.task)] += 1
-        print(f"  {r['req']:<8} 真实 {str(r.get('true_task')):<7} 重算 {v.task:<7}"
-              f" c={v.confidence:.2f} {v.zone:<7} 在线 {r.get('lr_task')}"
+            n_ok += lab == t
+            conf[(t, lab)] += 1
+            if t in clf.priors:
+                n_dep += 1
+                n_dep_ok += v.task == t
+            else:
+                n_undep += 1
+        pc = (v.raw or {}).get(lab)
+        print(f"  {r['req']:<8} 真实 {str(t):<10} LR 判 {str(lab):<10}"
+              + (f" p={pc:.2f}" if pc is not None else "       ")
+              + f"  → 路由 {v.task:<10} {v.zone:<7}"
+              + (f" 在线 {r.get('lr_task')}" if r.get("lr_task") is not None else "")
               + (f"  ⚠ {v.error}" if v.error else ""))
     if n_lab:
-        print(f"\n  准确率 {n_ok}/{n_lab} = {n_ok / n_lab:.0%}")
+        print(f"\n  LR 判类准确率 {n_ok}/{n_lab} = {n_ok / n_lab:.0%}"
+              "（按 LR 自己的 argmax，含没部署的类）")
+        if n_dep:
+            print(f"  已部署 task 的路由正确 {n_dep_ok}/{n_dep}"
+                  + (f"；另有 {n_undep} 条真实 task 没部署（{sorted(set(clf.classes) - set(clf.priors))}），"
+                     "只能退到先验池" if n_undep else ""))
         ts = sorted({t for t, _ in conf} | {p for _, p in conf})
-        print("  混淆（行=真实，列=判成）：")
+        print("  混淆（行=真实，列=LR 判成）：")
         print(f"  {'':<12}" + "".join(f"{t[:10]:>11}" for t in ts))
         for t in ts:
             print(f"  {t[:10]:<12}" + "".join(f"{conf[(t, p)]:>11}" for p in ts))

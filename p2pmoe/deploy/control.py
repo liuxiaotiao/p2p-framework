@@ -26,6 +26,7 @@ import json
 import logging
 import sys
 import time
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -53,7 +54,7 @@ from ..runtime.corpus import (
 )
 from ..runtime.coordinator import Coordinator
 from ..runtime.identify import HistogramClassifier
-from ..runtime.lr_classifier import LRClassifier
+from ..runtime.lr_classifier import LRClassifier, verdict_label
 from ..runtime.model import ToyMoEConfig
 from ..runtime.text import TextIO
 from ..runtime.node import NodeConfig
@@ -354,6 +355,106 @@ def _case_text(payload: "str | dict") -> str:
     return payload
 
 
+def _closed_loop(args, coord, cases, names, textio, addrs, log_done, stuck) -> dict:
+    """连续性测试：共享请求池 + 闭环在途 N 条。返回墙钟与资源采样，供落盘汇总。"""
+    from ..runtime.wire import rpc
+    from .continuous import UsageMonitor, interleave, run_closed_loop
+
+    if not (textio and cases):
+        raise SystemExit("--closed-loop 要配 --prompts-file（带 task 标注的 JSONL）与 --chat")
+    if args.save_results is None:
+        args.save_results = Path("results/continuous.json")
+        log.info("  没给 --save-results，结果写到 %s", args.save_results)
+    pool_ = interleave(cases) if args.order == "interleave" else list(cases)
+    n = len(pool_) if args.requests <= 0 else args.requests
+    if args.static:
+        cap = {u: len(q) for u, q in coord.front_pools.items()}
+    else:
+        cap = {u: int(coord.back_capacity.get(u, 0)) for u in names}
+    inflight = args.inflight or sum(cap.values())
+    share = defaultdict(int)
+    for i in range(n):
+        share[pool_[i % len(pool_)][0]] += 1
+    log.info("[连续测试] %d 条请求（池 %d 条，顺序 %s），同时在途 %d，最大生成 %d token，"
+             "单条超时 %.0fs", n, len(pool_), args.order, inflight, args.tokens,
+             args.req_timeout)
+    log.info("  请求 task 分布 %s；后段通道 %s", dict(share), cap)
+    lop = {u: share.get(u, 0) / max(c, 1) for u, c in cap.items() if share.get(u)}
+    if lop and max(lop.values()) > 1.5 * min(lop.values()):
+        hot = max(lop, key=lop.get)
+        log.info("  ⚠ 每条通道分到的请求数不均：%s —— %s 会是瓶颈，它的请求在后段排队",
+                 {u: round(v, 1) for u, v in lop.items()}, hot)
+
+    def ask(nd, reset):
+        return rpc(addrs[nd], {"type": "usage", "reset_peak": reset}, timeout=8.0,
+                   relay=RELAY, to=nd)
+    mon = UsageMonitor(sorted(addrs), ask, interval_s=args.usage_interval)
+    mon.start()
+
+    def submit(i):
+        tu, txt = pool_[i % len(pool_)]
+        u = tu if tu in names else names[i % len(names)]
+        return _submit_case(coord, f"req{i}", txt, true_task=tu or u, channel_task=u,
+                            static=args.static)
+
+    def done(rec, k, total):
+        log_done(rec)
+        if k % 5 == 0 or k == total:
+            log.info("  [%d/%d] 池深 %s", k, total, coord.queue_depths())
+
+    recs, dead, t0, t1 = run_closed_loop(
+        n, submit, inflight=inflight, timeout_s=args.req_timeout,
+        on_done=done, on_timeout=stuck)
+    mon.stop()
+    if mon.errors:
+        log.warning("  资源采样有节点失败：%s", mon.errors)
+    return {"t0": t0, "wall_s": t1 - t0, "inflight": inflight, "n_timeout": len(dead),
+            "usage": mon.summary(t0, t1)}
+
+
+def _log_run(m: dict) -> None:
+    L, T, P, th = m["latency_ms"], m["ttft_ms"], m["tpot_ms"], m["throughput"]
+    log.info("══ 连续测试汇总：%d 条（超时 %d），墙钟 %.1fs，在途 %s",
+             m["n_requests"], m["n_timeout"], m["wall_s"], m["inflight"])
+    log.info("  生成时延  均值 %.0fms  p50 %.0f  p90 %.0f  p99 %.0f",
+             L.get("mean", 0), L.get("p50", 0), L.get("p90", 0), L.get("p99", 0))
+    log.info("  TTFT      均值 %.0fms  p50 %.0f  p99 %.0f",
+             T.get("mean", 0), T.get("p50", 0), T.get("p99", 0))
+    S_ = m.get("ttft_service_ms", {})
+    log.info("  TTFT(去排队) 均值 %.0fms  p50 %.0f  p99 %.0f",
+             S_.get("mean", 0), S_.get("p50", 0), S_.get("p99", 0))
+    log.info("  TPOT      均值 %.1fms  p50 %.1f  p99 %.1f",
+             P.get("mean", 0), P.get("p50", 0), P.get("p99", 0))
+    log.info("  吞吐      %.2f 输出 token/s，%.2f 请求/分钟（输出共 %d token）",
+             th["output_tok_per_s"] or 0, th["req_per_min"] or 0, m["output_tokens"])
+    a = m.get("accuracy")
+    if a:
+        log.info("  识别      %d/%d = %.1f%%（选择器自己判的类）；通道二报警 %d 次，换绑 %d 次",
+                 a["correct"], a["n"], a["rate"] * 100, m.get("alarms", 0), m.get("rebinds", 0))
+    if m.get("resources"):
+        r = m["resources"]
+        log.info("  资源      计算占用均值 %.1f%%，GPU 利用率均值 %s%%，显存峰值合计 %s / %s MB",
+                 (r["compute_util_mean"] or 0) * 100, r["gpu_util_mean"],
+                 r["mem_used_max_total_mb"], r["mem_total_mb"])
+
+
+def _warmup_plan(coord, names: Sequence[str], static: bool, n_min: int) -> list[str]:
+    """预热打哪些 task：每条通道（静态）/ 每条后段（动态）至少一条，再补到
+    前段数与 --warmup 两者中的大值。按 task 排好，调用方一次全打进去。"""
+    if static:
+        cap = {u: len(q) for u, q in coord.front_pools.items()}
+        n_front = sum(cap.values())
+    else:
+        cap = {u: int(coord.back_capacity.get(u, 0)) for u in names}
+        n_front = len(coord.free_fronts)
+    out = [u for u in names for _ in range(cap.get(u, 0))]
+    i = 0
+    while names and len(out) < max(n_min, n_front):
+        out.append(names[i % len(names)])
+        i += 1
+    return out
+
+
 def _submit_case(coord, req: str, payload: "str | dict", *, true_task: str | None,
                  channel_task: str | None, static: bool):
     """测试集里的一条 → coord.submit。静态模式要指定走哪个 task 的通道。"""
@@ -479,7 +580,7 @@ def _where_is_it_stuck(rec, coord, addrs, pool) -> None:
 
 
 def _shadow_acc(rs: list[dict]) -> float | None:
-    xs = [r["shadow"]["task"] == r["true_task"] for r in rs
+    xs = [verdict_label(r["shadow"]) == r["true_task"] for r in rs
           if r.get("shadow") and r.get("true_task")]
     return round(sum(xs) / len(xs), 4) if xs else None
 
@@ -503,6 +604,7 @@ def _dump_front_stats(path: Path, recs: list, l0: int, n_experts: int,
                 "req": rec.req, "true_task": rec.true_task,
                 **({"case_id": rec.case_id} if rec.case_id else {}),
                 "lr_task": on["task"] if on else None,
+                "lr_label": verdict_label(on) if on else None,
                 "lr_conf": on["conf"] if on else None,
                 "l0": l0, "n_experts": n_experts, "layer_base": 1,
                 "deployed": list(deployed),
@@ -1004,11 +1106,13 @@ def main(argv: list[str] | None = None) -> int:
                     help="人工指定前后段连接的 JSON。省略则自动配对（贪心最小化组合延迟）")
     ap.add_argument("--save-wiring", type=Path, default=None,
                     help="把这次用的连接导出来 —— 改完可以用 --wiring 喂回去")
-    ap.add_argument("--miss-policy", default="drop",
+    ap.add_argument("--miss-policy", default="local_topk",
                     choices=("drop", "drop_noscale", "local_topk"),
-                    help="路由到的专家不在本地时怎么补救。drop=文档 II.5 的重归一；"
+                    help="路由到的专家不在本地时怎么补救。默认 local_topk="
+                         "只在本层驻留（裁剪后）的专家里取 top-k，每个 token 永远用满 k 个；"
+                         "drop=全量 top-k 里丢掉没装的、剩下的重归一（文档 II.5）；"
                          "drop_noscale=不重归一（实测更好）；"
-                         "local_topk=在驻留集里重新取 top-k")
+                         "（统计与 miss 率始终按全量路由算，不受这里影响）")
     ap.add_argument("--relay", default=None, metavar="HOST:PORT",
                     help="节点之间没有直连时的中继（deploy/relay.py）。"
                          "各节点的 agent 也要加同一个 --relay")
@@ -1016,6 +1120,21 @@ def main(argv: list[str] | None = None) -> int:
                     help="跳过「每台节点能不能读到 checkpoint」的预检")
     ap.add_argument("--prompt", action="append", default=None,
                     help="文本 prompt，可重复。需要 --model-dir")
+    g2 = ap.add_argument_group(
+        "连续性测试（闭环）",
+        "一个共享请求池，同时在途 N 条，任意一条完成立刻放出下一条；记录时延 / TTFT / "
+        "TPOT / p99 / 吞吐 / 各节点 GPU 利用率与显存。见 deploy/continuous.py")
+    ap.add_argument("--no-rebind", action="store_true",
+                    help="通道二只报警、不换绑。中途换绑目前不补已生成 token 的上下文，"
+                         "换过去的请求输出会退化；识别器准确时建议关掉")
+    g2.add_argument("--closed-loop", action="store_true",
+                    help="闭环跑完测试集（--requests 0 = 全部样本各一次）")
+    g2.add_argument("--inflight", type=int, default=0, metavar="N",
+                    help="同时在途的请求数。默认 = 后段通道总数（每条后段完成一条再放一条）")
+    g2.add_argument("--order", choices=("interleave", "file"), default="interleave",
+                    help="请求池顺序：interleave=按 task 轮转（各 task 均匀进入）；file=文件顺序")
+    g2.add_argument("--usage-interval", type=float, default=2.0, metavar="秒",
+                    help="资源采样间隔")
     ap.add_argument("--req-timeout", type=float, default=300.0, metavar="秒",
                     help="单条请求等多久算超时。默认 300s —— 第一条要等模型装载"
                          "（真模型几十 GB，几分钟很正常）。调试时调小些能更快看到"
@@ -1407,6 +1526,9 @@ def main(argv: list[str] | None = None) -> int:
         pool.register(n, a)
     coord.start(pool)
     coord.max_tokens = args.tokens
+    coord.allow_rebind = not args.no_rebind
+    if args.no_rebind and not args.static:
+        log.info("  通道二：只报警、不换绑（--no-rebind）")
     pool.warm(addrs)   # 保温网格（II.4 Step 6）
 
     # ---------------- 5. 在线服务 ---------------------------------------- #
@@ -1467,18 +1589,25 @@ def main(argv: list[str] | None = None) -> int:
 
     rows, batch = [], []
 
+    def stuck(rec):
+        log.error("%s 等了 %.0fs 还没完成。协调器这边看到的：",
+                  rec.req, args.req_timeout)
+        for e in rec.events:
+            log.error("    %s", e)
+        try:
+            _where_is_it_stuck(rec, coord, addrs, pool)
+        except Exception as e:      # 诊断本身不该盖住原始故障
+            log.debug("问节点失败：%s", e)
+
     def drain(batch_):
         for rec in batch_:
             if not rec.done.wait(timeout=args.req_timeout):
-                log.error("%s 等了 %.0fs 还没完成。协调器这边看到的：",
-                          rec.req, args.req_timeout)
-                for e in rec.events:
-                    log.error("    %s", e)
-                try:
-                    _where_is_it_stuck(rec, coord, addrs, pool)
-                except Exception as e:      # 诊断本身不该盖住原始故障
-                    log.debug("问节点失败：%s", e)
+                stuck(rec)
                 continue
+            log_done(rec)
+
+    def log_done(rec):
+        if True:
             per = sorted(rec.token_ms)
             p50 = per[len(per) // 2] if per else 0.0
             rows.append((rec, p50))
@@ -1494,7 +1623,8 @@ def main(argv: list[str] | None = None) -> int:
                          rec.req, rec.task, rec.front, rec.back,
                          rec.wait_front_ms, (rec.t_first - rec.t0) * 1000, p50,
                          "" if not sh else
-                         f"  旁路LR {sh['task']} {'✓' if sh['task'] == rec.true_task else '✗'}"
+                         f"  旁路LR {verdict_label(sh)} "
+                         f"{'✓' if verdict_label(sh) == rec.true_task else '✗'}"
                          f" c={sh['conf']:.2f} {sh['zone']}"
                          + (f"（{sh['note']}）" if sh.get("note") else ""))
             else:
@@ -1506,30 +1636,48 @@ def main(argv: list[str] | None = None) -> int:
                          (rec.t_first - rec.t0) * 1000, p50)
 
     if args.warmup:
-        log.info("  预热 %d 条（不计入结果）—— torch 首次前向含 kernel 选择、"
-                 "显存池分配、权重进页缓存，只发生一次", args.warmup)
+        # 冷启动是**逐节点**的（首次前向的 kernel 选择、显存池分配），所以预热
+        # 要让每条通道都走一遍，不是随便打几条。早先按测试集顺序取前 N 条，
+        # 前两条都是 gsm8k → 只热了 gsm8k 的通道，其余通道的第一条正式请求
+        # 首 token 白白多出 ~11s（sel_static 实测 req4/5/7）。
+        plan_w = _warmup_plan(coord, names, args.static, args.warmup)
+        log.info("  预热 %d 条（不计入结果，每条通道至少一条：%s）—— torch 首次前向"
+                 "含 kernel 选择、显存池分配，只发生一次",
+                 len(plan_w), dict(Counter(plan_w)))
         wrows_at = len(rows)
-        for i in range(args.warmup):
-            u = names[i % len(names)]
+        warm = []
+        # 预热只为踩冷启动（kernel 选择、显存池），不用生成满 —— 连续测试的
+        # --tokens 2048 拿来预热要白等好几分钟
+        keep_max = coord.max_tokens
+        coord.max_tokens = min(keep_max, 32)
+        for i, u in enumerate(plan_w):
             if textio and cases:
-                tu, txt = cases[i % len(cases)]
+                pick = [c for c in cases if c[0] == u] or cases
+                tu, txt = pick[i % len(pick)]
                 r = _submit_case(coord, f"warm{i}", txt, true_task=tu or u,
-                                 channel_task=(tu if tu in names else u),
-                                 static=args.static)
+                                 channel_task=u, static=args.static)
             elif textio and args.prompt:
                 r = coord.submit(f"warm{i}", text=args.prompt[i % len(args.prompt)],
                                  true_task=u, task=u if args.static else None)
             else:
                 r = coord.submit(f"warm{i}", sample_prompt(corpus, u, 12, seed=9000 + i),
                                  true_task=u, task=u if args.static else None)
+            warm.append(r)
+        # 一起打进去再一起等：同时在途的请求各占一条空闲通道，才能把每条都踩到
+        for r in warm:
             r.done.wait(timeout=300)
+        coord.max_tokens = keep_max
         # 丢掉预热产生的记录 —— 它们混进 p50 就白预热了
         del rows[wrows_at:]
         coord.pairings[:] = [x for x in coord.pairings
                              if not x[0].startswith("warm")]
         log.info("  预热完成，开始正式测量")
 
-    for i in range(args.requests):
+    run_info = None
+    if args.closed_loop:
+        run_info = _closed_loop(args, coord, cases, names, textio, addrs,
+                                log_done, stuck)
+    for i in range(0 if args.closed_loop else args.requests):
         u = names[i % len(names)]
         if textio and cases:
             true_u, txt = cases[i % len(cases)]
@@ -1560,15 +1708,22 @@ def main(argv: list[str] | None = None) -> int:
         if args.static:
             log.info("汇总[%s]：%d 条完成，逐 token p50 %.0fms，换绑 %d 次（静态模式恒为 0）",
                      who, len(rows), p50, sum(r.rebinds for r, _ in rows))
-            sh = [(r.shadow["task"] == r.true_task) for r, _ in rows
+            sh = [(verdict_label(r.shadow) == r.true_task) for r, _ in rows
                   if r.shadow and r.true_task]
             if sh:
-                log.info("      旁路 LR 识别 %d/%d = %.0f%%（不影响配对）",
+                log.info("      旁路 LR 识别 %d/%d = %.0f%%（按 LR 自己判的类，"
+                         "含没部署的类；不影响配对）",
                          sum(sh), len(sh), 100 * sum(sh) / len(sh))
         else:
             log.info("汇总[%s]：识别 %d/%d，逐 token p50 %.0fms，换绑 %d 次",
                      who, sum(r.correct for r, _ in rows), len(rows), p50,
                      sum(r.rebinds for r, _ in rows))
+            lab = [(max(r.raw_scores, key=r.raw_scores.get).split("#")[0] == r.true_task)
+                   for r, _ in rows if r.raw_scores and r.true_task]
+            if lab:
+                log.info("      其中 LR 自己判的类（含没部署的类）%d/%d = %.0f%%"
+                         " —— 上面的「识别」是路由对不对，没部署的类永远算错",
+                         sum(lab), len(lab), 100 * sum(lab) / len(lab))
         log.info("配对历史（每条请求用了哪对段）：")
         for req, f, b, u in coord.pairings:
             log.info("    %-7s %s × %s  (%s)", req, f, b, u)
@@ -1611,6 +1766,8 @@ def main(argv: list[str] | None = None) -> int:
                    if rec.body is not None else {}),
                 **({"shadow": rec.shadow} if rec.shadow else {}),
                 "rebinds": rec.rebinds,
+                **({"rebind_log": rec.rebind_log} if rec.rebind_log else {}),
+                "alarms": rec.alarms,
                 "front": rec.front, "back": rec.back,
                 "n_prompt": t.n_prompt, "n_generated": t.n_generated,
                 "total_ms": round(t.total_ms, 2),
@@ -1626,6 +1783,10 @@ def main(argv: list[str] | None = None) -> int:
                 "traces_complete": t.complete,
                 "utilisation": round(t.utilisation, 4),
                 "token_ms": [round(x, 2) for x in t.token_ms],
+                **({"t_submit_s": round(rec.t0 - run_info["t0"], 3),
+                    "t_done_s": round((rec._last or rec.t0) - run_info["t0"], 3)}
+                   if run_info else {}),
+                **({"case_id": rec.case_id} if getattr(rec, "case_id", None) else {}),
                 "nodes": [{
                     "node": n.node, "role": n.role, "segment": n.segment,
                     "layers": n.layer_span, "n_experts": n.n_experts,
@@ -1650,6 +1811,14 @@ def main(argv: list[str] | None = None) -> int:
             "shadow_accuracy": _shadow_acc(rs),
             "errors": len(coord.errors),
         }
+        if run_info:
+            from .continuous import run_metrics
+            out["run"] = run_metrics(rs, run_info["wall_s"], usage=run_info["usage"],
+                                     inflight=run_info["inflight"],
+                                     n_timeout=run_info["n_timeout"])
+            out["run"]["order"] = args.order
+            out["run"]["max_tokens"] = args.tokens
+            _log_run(out["run"])
         args.save_results.parent.mkdir(parents=True, exist_ok=True)
         args.save_results.write_text(
             json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")

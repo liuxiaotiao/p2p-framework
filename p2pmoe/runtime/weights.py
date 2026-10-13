@@ -60,6 +60,40 @@ def cuda_state() -> dict:
     return {"ok": True, "n": n, "name": torch.cuda.get_device_name(0)}
 
 
+def gpu_usage() -> dict:
+    """资源占用快照：torch 分配器视角（本进程）+ NVML 视角（整卡，与 nvidia-smi 同源）。
+
+    两者都要：torch 的 allocated 是模型 + KV 真正占着的，reserved 是缓存分配器
+    攥在手里的；nvidia-smi 的 memory.used 还含 CUDA 上下文（~300–500MB）与别的
+    进程。利用率只有 nvidia-smi 给得出（采样窗口内 SM 有活的时间占比）。"""
+    from .gpu_stats import snapshot
+
+    out: dict = {"smi": snapshot()}
+    try:
+        import torch
+
+        if torch.cuda.is_available() and torch.cuda.is_initialized():
+            mb = 1024 * 1024
+            out["torch"] = {
+                "allocated_mb": round(torch.cuda.memory_allocated() / mb, 1),
+                "reserved_mb": round(torch.cuda.memory_reserved() / mb, 1),
+                "max_allocated_mb": round(torch.cuda.max_memory_allocated() / mb, 1),
+            }
+    except Exception:
+        pass
+    return out
+
+
+def reset_peak_memory() -> None:
+    try:
+        import torch
+
+        if torch.cuda.is_available() and torch.cuda.is_initialized():
+            torch.cuda.reset_peak_memory_stats()
+    except Exception:
+        pass
+
+
 def release_cuda_cache() -> None:
     """把缓存分配器手里的空闲块还给驱动。
 

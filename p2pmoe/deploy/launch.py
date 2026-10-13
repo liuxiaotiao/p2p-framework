@@ -135,10 +135,17 @@ def _local_stop(h: Host) -> tuple[bool, str]:
 def _start_cmd(h: Host, workdir: str, python: str, logdir: str) -> str:
     args = [python, "-m", "p2pmoe.deploy.agent",
             "--id", h.node_id, "--bind", f"0.0.0.0:{h.port}"] + h.extra
+    # **`&` 只能挂在 agent 那一条命令上**（用 `{ …; }` 圈住）。
+    #
+    # 以前是 `mkdir … && cd … && setsid nohup … & echo $!`：`&` 作用于整条 `&&` 链，
+    # bash 为整条链开一个后台子 shell，那个子 shell 自己仍连着 ssh 的输出管道、要等
+    # agent 退出才结束 —— 于是 ssh 永远不返回，start 报「超过 60s 没返回」0/15，
+    # 而 agent 其实已经起来了。圈住之后后台作业只有那一条命令，它的三个 fd 都已重定向，
+    # 外层 shell 打完 pid 就退出，ssh 立即返回。
     return (
         f"mkdir -p {shlex.quote(logdir)} && cd {shlex.quote(workdir)} && "
-        f"setsid nohup {' '.join(shlex.quote(a) for a in args)} "
-        f">> {shlex.quote(logdir)}/agent-{h.node_id}.log 2>&1 < /dev/null & echo $!"
+        f"{{ setsid nohup {' '.join(shlex.quote(a) for a in args)} "
+        f">> {shlex.quote(logdir)}/agent-{h.node_id}.log 2>&1 < /dev/null & }} && echo $!"
     )
 
 
@@ -272,8 +279,12 @@ def probe_status(h: Host) -> tuple[Host, str]:
     except Exception as e:
         return h, f"✗ 不可达（{type(e).__name__}）"
     tag = "已配置" if r.get("configured") else "空闲"
+    act = int(r.get("active_reqs", 0) or 0)
     return h, (f"✓ {tag}  内存 {r['mem_mb']:.0f}MB  基准 {r['ms_per_layer']:.3f}ms"
-               + (f"  接入模拟 {r['access_ms']:.0f}ms" if r.get("access_ms") else ""))
+               + (f"  接入模拟 {r['access_ms']:.0f}ms" if r.get("access_ms") else "")
+               # 没在跑实验时还持有 KV 的请求 = 没释放干净（早先的「僵尸环」就是这样）
+               + (f"  ⚠ 持有 KV 的请求 {act} 条" if act else "")
+               + (f"  丢弃过期消息 {r['dropped_stale']}" if r.get("dropped_stale") else ""))
 
 
 def _probe_matrix(hosts: list[Host], *, k: int, parallel: int) -> int:

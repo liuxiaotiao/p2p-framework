@@ -22,10 +22,39 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import signal
 import sys
 
-from ..runtime.node import NodeServer
+
+def _allocator_env(environ=os.environ) -> str | None:
+    """让 PyTorch 显存分配器按需扩段（expandable_segments），返回设下的值。
+
+    专家张量 2048×768×bf16 = 3MiB。默认分配器把 1–10MiB 的请求放进 20MiB 的段里切，
+    一段只放得下 6 个，剩下 2MiB 谁也用不上 —— 装 20GB 专家要多占约 10%。实测 N13
+    （RTX6000，21.97GiB）装 no_robots 15–48 层：已分配 19.89GiB + 段内碎片 1.88GiB → OOM。
+    按需扩段没有这部分浪费。
+
+    必须在 import torch 之前设；用户自己设了 PYTORCH_CUDA_ALLOC_CONF 就不动。
+    torch < 2.1 不认这个选项（会在第一次分配时报错），那时也不设。
+    """
+    if "PYTORCH_CUDA_ALLOC_CONF" in environ:
+        return None
+    try:
+        from importlib.metadata import version
+
+        major, minor = (int(x) for x in version("torch").split("+")[0].split(".")[:2])
+    except Exception:
+        return None
+    if (major, minor) < (2, 1):
+        return None
+    environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    return environ["PYTORCH_CUDA_ALLOC_CONF"]
+
+
+_ALLOC = _allocator_env()
+
+from ..runtime.node import NodeServer  # noqa: E402  （必须在设好分配器之后）
 
 log = logging.getLogger("p2pmoe.agent")
 
@@ -82,6 +111,8 @@ def main(argv: list[str] | None = None) -> int:
         f"；模拟接入段 {args.access_ms:.0f}±{args.access_jitter_ms:.0f}ms"
         if args.access_ms > 0 else "",
     )
+    log.info("显存分配器 PYTORCH_CUDA_ALLOC_CONF=%s",
+             os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "（未设，PyTorch 默认）"))
     log.info("等待控制器下发清单…（未配置态只响应 capabilities / echo / probe）")
 
     def _bye(*_a):

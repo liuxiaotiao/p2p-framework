@@ -421,6 +421,8 @@ def plan(
                 spec, sorted(free), node_map, net, build_obj,
                 beam_width=cfg.beam_width, prune_topk=cfg.prune_topk,
                 exhaustive_short=cfg.exhaustive_short,
+                legacy_beam=cfg.beam_legacy,
+                hop_slack=cfg.max_hops_slack,
             )
             if s is None:
                 log.append(
@@ -432,7 +434,7 @@ def plan(
             floor_hops = hops_min(
                 spec.total_gb(), max(node_map[v].usable_gb for v in free)
             )
-            if s.hops > floor_hops + cfg.max_hops_slack:
+            if cfg.max_hops_slack is not None and s.hops > floor_hops + cfg.max_hops_slack:
                 log.append(
                     f"[Step 3] task {t.name} 第 {len(segs) + 1} 条被质量下限否决："
                     f"{s.label()} 用了 {s.hops} 跳，而剩余池的跳数下界只有 {floor_hops}"
@@ -669,6 +671,8 @@ def plan(
             front_spec, sorted(pool), node_map, net, front_obj,
             beam_width=cfg.beam_width_front, prune_topk=cfg.prune_topk,
             exhaustive_short=cfg.exhaustive_short,
+            legacy_beam=cfg.beam_legacy,
+            hop_slack=cfg.max_hops_slack,
         )
         if s is None:
             break
@@ -839,6 +843,8 @@ def _rebuild_entry(
                 back_specs[u], sorted(pool), node_map, net, obj,
                 beam_width=cfg.beam_width, prune_topk=cfg.prune_topk,
                 exhaustive_short=cfg.exhaustive_short,
+                legacy_beam=cfg.beam_legacy,
+                hop_slack=cfg.max_hops_slack,
             )
             if got is None:
                 return False

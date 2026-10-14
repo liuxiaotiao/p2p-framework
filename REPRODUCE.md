@@ -161,7 +161,83 @@ bash ./deploy_15.sh status                                                # 不�
 | 改最大生成长度 | `MAX_TOKENS=512` |
 | 只跑前 N 条 | `continuous` 后面加 `--requests N` |
 | 按文件顺序而不是 task 轮转 | `continuous` 后面加 `--order file` |
+| 原样重出现在用的方案 | 规划命令加 `--beam-legacy`（2026-10-14 修了 beam 之后，默认参数重出的方案在 gsm8k-0、mbpp-0 的切层点上会不同；`qwen3-30b/plan_es90_fill.json` 本身没变，直接用它就不受影响） |
+| 调链长上限 | 规划命令加 `--hop-slack N`：每条段的跳数 ≤ 整数下界 hops_min（按段驻留量 ÷ 最大单机可用算）+ N，默认 1；`--hop-slack -1` 不限。求解器搜索时就剪掉超长前缀，防止 beam 交出吃光节点的长链（`--beam-legacy` 下不生效）。用现在的部署参数重出方案，开不开它结果逐字节相同 |
 | 给 no_robots 两条通道 | 重新规划（`examples/task_deploy.py … --tasks gsm8k=1,mbpp=1,no_robots=2`），换 `PLAN` 后从第 3 步的 `fetch`/`verify` 重来 |
+
+### 5.5 对照组：严格按文档规划的方案（`qwen3-30b/plan_doc_l8.json`）
+
+规划命令（Mac 或 wash1 上跑都行，结果逐字节相同，`tests/test_hop_cap.py` 有校验）：
+
+```bash
+python3 examples/task_deploy.py --data task3 --config qwen3-30b-a3b --phase prefill \
+  --tasks gsm8k=1,mbpp=1,no_robots=1 \
+  --expert-sets qwen3-30b/expert_sets_90/expert_sets_90_union.json \
+  --l0 8 --front-full --reserve-gb 2.5 --hop-slack 0 \
+  --rent-policy largest --endpoint-w 0 \
+  --save-plan qwen3-30b/plan_doc_l8.json
+```
+
+文档六步流水线 + 文档的租金规则（R_F 取内存最大者）+ 文档目标函数（无端点项）+ 新 beam；
+L₀=8、前段装全部专家、预留 2.5GB、链长 = 内存所需最少台数（`--hop-slack 0`）。不开 `--fill-idle`。
+
+| 角色 | 节点 |
+|---|---|
+| 前段（层 1–8） | N03、N04、N01、N02；N12 备胎（不进池） |
+| gsm8k | N07(9–24)→N08(25–48)、N05(9–24)→N06(25–48) |
+| mbpp | N10(9–23)→N11(24–48) |
+| no_robots | N09(9–14)→N13(15–48) |
+| 不用 | N14、N15 |
+
+4 条通道（gsm8k 2、mbpp 1、no_robots 1）；静态配对组合 p50 19–49ms（no_robots 那条跨 4.x 子网）。
+驻留集与现方案相同，`PROFILE` 不用换。
+
+**权重放到新目录 `weights-q3-30b-doc`**，现方案的 `weights-q3-30b` 一个字节都不动，做完随时切回。
+`sync` 会排除所有 `weights*/`，所以新旧两个目录都安全。
+
+```bash
+# 0) Mac → wash1 推代码（同第 1 步的 rsync，带上 plan_doc_l8.json）
+
+# 1) 环境
+cd /home/ubuntu/p2p-framework && conda activate moe && source qwen3-30b/env.sh
+export ADVERTISE=192.168.3.4 && mkdir -p results
+
+# 2) 先用原来的 15 台清单把现在的 agent 全停掉（N14/N15 上的也要停，否则一直占显存）
+bash ./deploy_15.sh stop
+
+# 3) 切到对照组：清单、权重目录、只含 13 台的 hosts
+export PLAN=qwen3-30b/plan_doc_l8.json
+export WEIGHTS=$WORKDIR/weights-q3-30b-doc
+awk '$1!="N14" && $1!="N15"' task/hosts.txt > task/hosts_doc.txt
+export HOSTS=task/hosts_doc.txt
+
+# 4) 磁盘够不够（新目录每台 4–21GB，合计约 170GB）
+bash ./deploy_15.sh disk
+
+# 5) 控制机元数据 → 推代码与清单 → 各节点拉自己那份 → 核对
+bash ./deploy_15.sh meta
+bash ./deploy_15.sh sync
+bash ./deploy_15.sh fetch          # 会问 [y/N]；当初走 HF 镜像就先 export HF_ENDPOINT=…
+bash ./deploy_15.sh verify         # 13 台都 ✓；哪台不是就 refetch <节点>
+
+# 6) 起 agent
+bash ./deploy_15.sh start
+bash ./deploy_15.sh status         # 13/13，无残留 KV
+
+# 7) 连续性测试：与 5.3 完全同样的设置（150 条、三 task 轮转、共享池、闭环、2048）
+export DUMP_FRONT=results/cont_front_doc.jsonl
+RESULTS=results/run_doc.json bash ./deploy_15.sh continuous 2>&1 | tee results/continuous_doc.log
+
+# 8) 看结果
+bash ./deploy_15.sh report results/run_doc.json | sed -n '/连续性测试/,$p'
+python3 examples/analyze_run.py results/run_doc.json --csv results/run_doc_latency.csv
+```
+
+* 同时在途 = 4（后段通道数）。三个 task 各 50 条、mbpp 与 no_robots 各只有 1 条通道，开头会提示
+  「每条通道分到的请求数不均」—— 这是该方案的容量结构，不是故障；预计约 1 小时；
+* 资源表的平均 GPU 利用率含备胎 N12（一直空闲），逐节点表里能单独看；
+* **切回现方案**：`bash ./deploy_15.sh stop`（此时 HOSTS 还是 13 台）→ 新开终端
+  `source qwen3-30b/env.sh`（PLAN / WEIGHTS 回到原值，HOSTS 回到默认的 15 台）→ `bash ./deploy_15.sh start`。
 
 ## 6. 参考数值（用来判断复现是否正常）
 

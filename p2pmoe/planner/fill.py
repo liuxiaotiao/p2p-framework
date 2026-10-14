@@ -137,12 +137,14 @@ def fill_idle(
     def build_front(pool: set[str]) -> Segment | None:
         return deploy_path(front_spec, sorted(pool), node_map, net, obj,
                            beam_width=cfg.beam_width_front, prune_topk=cfg.prune_topk,
-                           exhaustive_short=True)
+                           exhaustive_short=True, legacy_beam=cfg.beam_legacy,
+                           hop_slack=cfg.max_hops_slack)
 
     def build_back(u: str, pool: set[str]) -> Segment | None:
         return deploy_path(back_specs[u], sorted(pool), node_map, net, obj,
                            beam_width=cfg.beam_width, prune_topk=cfg.prune_topk,
-                           exhaustive_short=True)
+                           exhaustive_short=True, legacy_beam=cfg.beam_legacy,
+                           hop_slack=cfg.max_hops_slack)
 
     while True:
         nf, nb = len(fronts), _n_back(backs)

@@ -78,8 +78,11 @@ def test_exhaustive_short_is_off_by_default() -> None:
 @pytest.mark.slow
 def test_the_real_qwen3_30b_plan(tmp_path, capsys) -> None:
     """用 qwen3-30b/ 下的真实驻留集出一份方案：L₀=8、前段装全、15 台全上岗。
-    不开 --exhaustive-short 时 beam 截断会让这份规划失败（N09 一台就装得下前段）。"""
-    es = ROOT / "qwen3-30b" / "expert_sets_90_union.json"
+
+    早先不开 --exhaustive-short 时这份规划会失败：beam 把完整解和半成品放进同一
+    张榜截断，1 跳的 no_robots 后段排第 217 名被截掉（见 solver.deploy_path 的
+    「完整解不参与截断」）。修好之后，只靠 beam 也应建出全部三个池。"""
+    es = ROOT / "qwen3-30b" / "expert_sets_90" / "expert_sets_90_union.json"
     if not es.exists() or not (ROOT / "task3" / "gsm8k_expert_activation.csv").exists():
         pytest.skip("没有 qwen3-30b/ 或 task3/ 的数据")
     import examples.task_deploy as td
@@ -89,8 +92,14 @@ def test_the_real_qwen3_30b_plan(tmp_path, capsys) -> None:
             "--l0", "8", "--front-full", "--reserve-gb", "2.5"]
     old = sys.argv
     try:
-        sys.argv = ["task_deploy"] + base
-        assert td.main() == 2, "不开 --exhaustive-short 应当规划失败（beam 截断）"
+        beam_only = tmp_path / "beam.json"
+        sys.argv = ["task_deploy"] + base + ["--save-plan", str(beam_only)]
+        assert td.main() == 0, "只靠 beam 也应规划成功（完整解不参与截断）"
+        from p2pmoe.planner.manifest import DeploymentManifest as _M
+        bm = _M.from_json(beam_only.read_text())
+        nr = [s for s in bm.segments.values() if s["role"] == "back:no_robots"]
+        assert nr and all(len(s["nodes"]) <= 2 for s in nr), \
+            "no_robots 后段应是 ≤1 跳（旧缺陷下 beam 只交得出 7 跳长链）"
         plan, prof = tmp_path / "p.json", tmp_path / "prof.json"
         sys.argv = ["task_deploy"] + base + ["--exhaustive-short", "--fill-idle",
                                              "--save-plan", str(plan), "--save-profile", str(prof)]

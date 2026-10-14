@@ -207,6 +207,8 @@ def tighten_lex(
                 spec, sorted(pool), nodes, net, obj,
                 beam_width=cfg.beam_width, prune_topk=cfg.prune_topk,
                 exhaustive_short=cfg.exhaustive_short,
+                legacy_beam=cfg.beam_legacy,
+                hop_slack=cfg.max_hops_slack,
             ) or segs[i]
             new[i] = got
             pool -= set(got.nodes)
@@ -227,6 +229,8 @@ def tighten_lex(
                 spec, sorted(pool), nodes, net, obj,
                 beam_width=cfg.beam_width, prune_topk=cfg.prune_topk,
                 exhaustive_short=cfg.exhaustive_short,
+                legacy_beam=cfg.beam_legacy,
+                hop_slack=cfg.max_hops_slack,
             ) or segs[i]
             new[i] = got
             pool -= set(got.nodes)

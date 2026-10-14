@@ -133,6 +133,9 @@ def main() -> int:
     ap.add_argument("--exhaustive-short", action="store_true",
                     help="求解器额外精确枚举 0/1 跳放置，修 beam 截断漏解（PlannerConfig."
                          "exhaustive_short）。Qwen3-30B-A3B 的 L₀=8 规划不开会失败")
+    ap.add_argument("--beam-legacy", action="store_true",
+                    help="用修复前的 beam（完整解与半成品同榜截断）。只为复现旧方案；"
+                         "见 PlannerConfig.beam_legacy")
     ap.add_argument("--front-full", action="store_true",
                     help="前段每层装**全部**专家，不按并集裁。前段出口接 task 选择器时要它："
                          "选择器是按完整模型的路由训练的（SELECTOR_USAGE.md：前 8 层不屏蔽），"
@@ -146,6 +149,15 @@ def main() -> int:
     ap.add_argument("--eta", type=float, default=0.15)
     ap.add_argument("--j-cap", type=float, default=30.0)
     ap.add_argument("--seed", type=int, default=3)
+    ap.add_argument("--hop-slack", type=int, default=1,
+                    help="链长上限：段的跳数 ≤ 整数下界 hops_min（按段大小算）+ 此值；"
+                         "负数表示不限（PlannerConfig.max_hops_slack）")
+    ap.add_argument("--rent-policy", default="smallest_sufficient",
+                    choices=("smallest_sufficient", "largest"),
+                    help="影子租金 R_F 怎么选：largest = 文档 III.8.4（内存最大的 N 台）；"
+                         "smallest_sufficient = 现行默认（够装前段的最小 N 台）")
+    ap.add_argument("--endpoint-w", type=float, default=None,
+                    help="后段端点项权重（PlannerConfig.endpoint_w，默认 1.0）；0 = 文档原始目标函数")
     ap.add_argument("--fill-idle", action="store_true",
                     help="主流程之后补位：提拔备胎、用空闲节点加通道、剩下的分摊到显存最紧的段，"
                          "让每台节点都有活干。补位段不过公共带（见 planner/fill.py）")
@@ -266,7 +278,11 @@ def main() -> int:
     cfg = PlannerConfig(eta=args.eta, beta=1.3, j_cap_ms=args.j_cap, theta=0.8,
                         kappa_over=0.3, n_standby=0, seed=args.seed,
                         fill_idle=args.fill_idle,
-                        exhaustive_short=args.exhaustive_short)
+                        exhaustive_short=args.exhaustive_short,
+                        beam_legacy=args.beam_legacy,
+                        max_hops_slack=None if args.hop_slack < 0 else args.hop_slack)
+    if args.endpoint_w is not None:
+        cfg.endpoint_w = args.endpoint_w
     oracle = FabricOracle(topo, jitter_frac=args.jitter_frac)
     net = MeasurementCache(oracle, k=cfg.k_probe, j_cap_ms=cfg.j_cap_ms,
                            k_gate=cfg.k_gate)
@@ -285,7 +301,8 @@ def main() -> int:
         front_plc = full_placement(L, info.n_experts)
         print(f"  前段装全部 {info.n_experts} 个专家/层（--front-full），不用并集")
     try:
-        res = plan(topo.nodes, spec, tasks, front_plc, net, cfg, p_curve, p_min=0.80)
+        res = plan(topo.nodes, spec, tasks, front_plc, net, cfg, p_curve, p_min=0.80,
+                   rent_policy=args.rent_policy)
     except PlanningError as e:
         for line in e.log:
             print("  " + line)

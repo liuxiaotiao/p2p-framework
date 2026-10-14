@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from math import ceil
 from typing import Mapping, Sequence
 
 from .network import MeasurementCache
@@ -96,31 +97,16 @@ def segment_from_nodes(
     )
 
 
-def deploy_path(
-    spec: SegmentSpec,
-    avail: Sequence[str],
-    nodes: Mapping[str, Node],
-    net: MeasurementCache,
-    objective: Objective,
-    *,
-    beam_width: int = 12,
-    prune_topk: int = 10,
-    exhaustive_short: bool = False,
-) -> Segment | None:
-    """在可用节点集上放置 spec 描述的层区间，返回最优段；不可行返回 None。
+def _scorers(spec: SegmentSpec, avail: Sequence[str], nodes: Mapping[str, Node],
+             net: MeasurementCache, objective: Objective):
+    """→ (score_partial, score_final, completion_lb)。
 
-    exhaustive_short=True 时，0 跳与 1 跳的解精确穷举后并进候选（见下方注释）。
-    默认关：开了它主流程的规划结果会变（实测 L₀=11 时多建一条通道，但一张 T4
-    被选进前段，核心终审从 6.1% 变成 49.4%）—— 那是要单独决定的事，目前只给
-    补位（fill.py）用。
+    score_partial(p) 必须是 p 任何补全方式的 score_final 的**下界**：beam 用它给
+    不同进度的半成品排序，分支定界用它剪掉「补完也赢不了现有最好完整解」的半成品。
+    抽成模块级函数是为了让测试直接验证这条性质（tests/test_beam_complete_solutions.py）。
     """
     lo0, hi0 = spec.layer_lo, spec.layer_hi
     n_layers = spec.n_layers
-    if n_layers <= 0 or not avail:
-        return None
-
-    avail = list(avail)
-    peers = avail  # δ̂ 的对端取全体可用节点
 
     # --- 完成下界 -------------------------------------------------------- #
     # 部分解不能按「已累计代价」直接比较：那样「少放几层」永远分数更低，beam 会
@@ -156,6 +142,44 @@ def deploy_path(
             p.compute_ms, p.hop_ms, p.jitter_ms, p.nodes, nodes, partial=False
         )
 
+
+    return score_partial, score_final, completion_lb
+
+
+def deploy_path(
+    spec: SegmentSpec,
+    avail: Sequence[str],
+    nodes: Mapping[str, Node],
+    net: MeasurementCache,
+    objective: Objective,
+    *,
+    beam_width: int = 12,
+    prune_topk: int = 10,
+    exhaustive_short: bool = False,
+    legacy_beam: bool = False,
+    hop_slack: int | None = None,
+) -> Segment | None:
+    """在可用节点集上放置 spec 描述的层区间，返回最优段；不可行返回 None。
+
+    hop_slack 给定时按段的大小限制链长：节点数 ≤ ⌈段驻留量 / 最大单机可用⌉ + hop_slack，
+    即跳数 ≤ hops_min（命题 III.5.2）+ hop_slack。None 表示不限（见下方「链长上限」）。
+    exhaustive_short=True 时，0 跳与 1 跳的解精确穷举后并进候选（见下方注释）。
+    legacy_beam=True 时退回旧的 beam：完整解与半成品同榜截断、不剪枝 —— 只为复现
+    修复前的方案（PlannerConfig.beam_legacy / task_deploy --beam-legacy）。
+    默认关：开了它主流程的规划结果会变（实测 L₀=11 时多建一条通道，但一张 T4
+    被选进前段，核心终审从 6.1% 变成 49.4%）—— 那是要单独决定的事，目前只给
+    补位（fill.py）用。
+    """
+    lo0, hi0 = spec.layer_lo, spec.layer_hi
+    n_layers = spec.n_layers
+    if n_layers <= 0 or not avail:
+        return None
+
+    avail = list(avail)
+    peers = avail  # δ̂ 的对端取全体可用节点
+
+    score_partial, score_final, completion_lb = _scorers(spec, avail, nodes, net, objective)
+
     # --- 0 跳与 1 跳：精确穷举 --------------------------------------------- #
     # beam 只留前 W 个前缀，而完成下界假设「剩下的层能放进最大那台」—— 那台很可能
     # 已经在前缀里用掉了。于是明明存在的 1 跳解会在截断里丢掉，甚至整轮返回 None。
@@ -178,6 +202,32 @@ def deploy_path(
         return cum[b] - cum[a - 1]
 
     scale = spec.ms_per_layer_scale
+
+    # --- 链长上限：按段的大小定（命题 III.5.2） ---------------------------- #
+    # 一条段最少要 n_min = ⌈驻留量 / 最大单机可用⌉ 台节点；链长上限取 n_min + hop_slack。
+    # 不设上限时，beam 的完成下界又过于乐观（最小跳 p50 可以接近 0、每加一台节点的
+    # 稳定性罚 μ 不计入下界），「每台只放一两层」的短前缀会一直排在前面，最后拼成
+    # 一条长链。实测（15 台真拓扑，L₀=8、前段装全部专家、预留 2.5GB、租金按最大取）：
+    # mbpp 后段 31.8GB，N10+N11 两台 1 跳即可（评分 21.8），beam=12 交出的是
+    # N09+…+N04 共 9 台 8 跳（评分 89.7），把剩余节点全部吃光，前段无处可放。
+    #
+    # 实现为**可行性剪枝**：前缀已用 k 台、剩余驻留 r GB 时，至少还要 ⌈r / 最大单机⌉ 台；
+    # k + 它 > 上限就丢掉。这条下界对任何补全方式都成立，所以只剪掉违反上限的解，
+    # 不会误剪合规解；分支定界的可容许性不受影响。
+    # legacy_beam 下不生效：旧 beam 只用来逐字节复现旧方案。
+    max_cap = max(nodes[v].usable_gb for v in avail)
+    if hop_slack is not None and not legacy_beam and max_cap > 0:
+        node_cap = max(1, ceil(gb(1, n_layers) / max_cap - 1e-9)) + max(0, hop_slack)
+    else:
+        node_cap = None
+
+    def within_cap(n_nodes: int, placed: int) -> bool:
+        if node_cap is None:
+            return True
+        rem = gb(placed + 1, n_layers) if placed < n_layers else 0.0
+        need = ceil(rem / max_cap - 1e-9) if rem > 1e-9 else 0
+        return n_nodes + need <= node_cap
+
     exact_best: _Partial | None = None
     exact_score = float("inf")
 
@@ -194,6 +244,8 @@ def deploy_path(
         if gb(1, n_layers) <= nv.usable_gb + 1e-9 and spec.tail_ok(v):
             offer(_Partial((v,), ((lo0, hi0),), n_layers,
                            n_layers * nv.ms_per_layer * scale, 0.0, 0.0))
+        if node_cap is not None and node_cap < 2:
+            continue
         for k in range(1, n_layers):
             if gb(1, k) > nv.usable_gb + 1e-9:
                 break
@@ -223,6 +275,8 @@ def deploy_path(
                 break  # 内存单调：更长只会更不可行
             if seg_len == n_layers and not spec.tail_ok(v):
                 continue
+            if not within_cap(1, seg_len):
+                continue
             beam.append(
                 _Partial(
                     nodes=(v,),
@@ -235,11 +289,46 @@ def deploy_path(
             )
     if not beam and exact_best is None:
         return None
-    beam.sort(key=score_partial)
-    beam = beam[:beam_width]
 
-    finished: list[_Partial] = [p for p in beam if p.placed == n_layers]
-    frontier = [p for p in beam if p.placed < n_layers]
+    # --- 完整解不参与截断 -------------------------------------------------- #
+    # 半成品的分数 = 已花代价 + 剩余部分的**乐观下界**；完整解的分数是真实代价。
+    # 两者放进同一张榜截断，半成品永远排在「由它自己补完的完整解」前面 ——
+    # 于是完整解被挤出 beam，半成品继续加节点，最后交出的是一条长链。
+    # 实测（15 台真拓扑、L₀=8）：no_robots 后段第 1 轮就有 1 跳、24.2 分的
+    # 完整解，排第 217 名被截；beam 一路扩到第 7 轮，交出 8 台 7 跳、107.5 分的
+    # 链，再被跳数下限否决 —— 那一池整个建不出来。加宽 beam 到 800 也一样。
+    # 所以：完整解一出现就收下，截断只在半成品之间做。
+    if legacy_beam:
+        # 旧行为（--beam-legacy）：完整解与半成品同榜截断、不剪枝。只为复现旧方案。
+        beam.sort(key=score_partial)
+        beam = beam[:beam_width]
+        finished: list[_Partial] = [p for p in beam if p.placed == n_layers]
+        frontier = [p for p in beam if p.placed < n_layers]
+    else:
+        finished = [p for p in beam if p.placed == n_layers]
+        frontier = sorted((p for p in beam if p.placed < n_layers),
+                          key=score_partial)[:beam_width]
+
+    # --- 用当前最好的完整解剪掉没希望的半成品（分支定界） ------------------ #
+    # 半成品的分数是它任何补全方式的下界，前提是下界真是下界：
+    #   * min_hop_p50 在 ≤ 40 个节点时取全对最小值（更大的池是抽样估计，不保证）；
+    #   * 目标函数各项权重非负（新增节点只会加分，不会减分）。
+    # 满足时，乐观分已不低于现有最好完整解的半成品，补完只会更差，可以丢掉。
+    prune_ok = (not legacy_beam and len(avail) <= 40 and objective.mu_ms >= 0 and objective.jitter_w >= 0
+                and objective.rent_nu_ms >= 0 and objective.good_gamma_ms >= 0
+                and objective.endpoint_w >= 0)
+
+    def incumbent() -> float:
+        best = min((score_final(p) for p in finished), default=float("inf"))
+        return min(best, exact_score)
+
+    def bound(front: list[_Partial]) -> list[_Partial]:
+        if not prune_ok:
+            return front
+        inc = incumbent()
+        return [p for p in front if score_partial(p) < inc]
+
+    frontier = bound(frontier)
 
     # --- 逐轮扩展 --------------------------------------------------------- #
     while frontier:
@@ -262,6 +351,8 @@ def deploy_path(
                     is_last = seg_len == remaining
                     if is_last and not spec.tail_ok(v2):
                         continue
+                    if not within_cap(len(p.nodes) + 1, p.placed + seg_len):
+                        continue
                     cand.append(
                         _Partial(
                             nodes=p.nodes + (v2,),
@@ -275,10 +366,15 @@ def deploy_path(
                     )
         if not cand:
             break
-        cand.sort(key=score_partial)
-        cand = cand[:beam_width]
-        finished.extend(p for p in cand if p.placed == n_layers)
-        frontier = [p for p in cand if p.placed < n_layers]
+        if legacy_beam:
+            cand.sort(key=score_partial)
+            cand = cand[:beam_width]
+            finished.extend(p for p in cand if p.placed == n_layers)
+            frontier = [p for p in cand if p.placed < n_layers]
+            continue
+        finished.extend(p for p in cand if p.placed == n_layers)   # 不参与截断
+        frontier = bound(sorted((p for p in cand if p.placed < n_layers),
+                                key=score_partial)[:beam_width])
 
     if exact_best is not None:
         finished.append(exact_best)

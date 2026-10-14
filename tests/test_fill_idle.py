@@ -273,8 +273,13 @@ def _real(*extra: str):
 
 @pytest.fixture(scope="module")
 def deployed():
-    """线上正在用的那份配置：L₀=11。主流程 3 条通道，N12–N15 是备胎。"""
-    return _real("--l0", "11"), _real("--l0", "11", "--fill-idle")
+    """线上用过的那份配置：L₀=11。主流程 3 条通道，N12–N15 是备胎。
+
+    那份方案是修复 beam 之前规划的 —— 用 --beam-legacy 复现它（与旧代码逐字节
+    一致，见 test_beam_complete_solutions.py::test_beam_legacy_reproduces_the_deployed_plan）。新 beam 在这组输入
+    上主流程就能建出 4 条，结论见 test_new_beam_on_the_qwen3_next_pool。"""
+    return (_real("--l0", "11", "--beam-legacy"),
+            _real("--l0", "11", "--fill-idle", "--beam-legacy"))
 
 
 def test_deployed_plan_gains_a_channel_not_just_a_busy_standby(deployed) -> None:
@@ -304,3 +309,13 @@ def test_spreading_spares_core_segments_on_the_real_pool() -> None:
     res = _real("--fill-idle")
     assert not [l for l in res.fill.log if "动了核心段" in l], "\n".join(res.fill.log)
     assert ("N06", "N08") in {tuple(s.nodes) for s in res.backs["mbpp"]}
+
+
+def test_new_beam_on_the_qwen3_next_pool() -> None:
+    """修好 beam（完整解不参与截断）之后，同一组输入的主流程直接建出 4 条通道 ——
+    但其中一条把 T4 选进了前段，核心终审从 6.1% 变成 49.7%，与开 exhaustive_short
+    的效果一样：单条段搜得更好，贪心逐条建段的整体均匀性却可能变差。这是规划
+    策略层面的取舍，不是搜索的错；记录在 PlannerConfig.beam_legacy。"""
+    new = _real("--l0", "11")
+    assert _concurrency(new) == 4
+    assert not new.audit.passed and new.audit.worst_rel_spread > 0.4

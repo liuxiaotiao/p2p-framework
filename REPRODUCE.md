@@ -192,8 +192,21 @@ L₀=8、前段装全部专家、预留 2.5GB、链长 = 内存所需最少台�
 4 条通道（gsm8k 2、mbpp 1、no_robots 1）；静态配对组合 p50 19–49ms（no_robots 那条跨 4.x 子网）。
 驻留集与现方案相同，`PROFILE` 不用换。
 
-**权重放到新目录 `weights-q3-30b-doc`**，现方案的 `weights-q3-30b` 一个字节都不动，做完随时切回。
-`sync` 会排除所有 `weights*/`，所以新旧两个目录都安全。
+**权重就地替换**（磁盘放不下新旧两份）：`REPLACE=1 bash ./deploy_15.sh fetch` 让每台先看
+`$WEIGHTS` 里已有的是不是新清单要的那份张量 —— 是就跳过，不是就**先删旧权重**
+（`*.safetensors` / 索引；config 与 tokenizer 保留）再下新的。从现方案换到对照组：
+
+| 节点 | 现方案 → 对照组 | 动作 |
+|---|---|---|
+| N01、N12 | 前段 → 前段（N12 改为备胎，张量相同） | 跳过 |
+| N09 | no_robots 9–14 → no_robots 9–14 | 跳过 |
+| N02、N03、N04 | gsm8k 后段 → 前段 | 删旧下新 |
+| N05、N06、N07、N08 | 各自 → gsm8k 9–24 / 25–48 | 删旧下新 |
+| N10、N11 | 前段 → mbpp 9–23 / 24–48 | 删旧下新 |
+| N13 | mbpp 9–35 → no_robots 15–48 | 删旧下新 |
+| N14、N15 | 对照组不用 | 不动（hosts 里去掉了） |
+
+合计下载约 144GB。删掉的现方案权重，切回去时要重新下（同一条命令，见下）。
 
 ```bash
 # 0) Mac → wash1 推代码（同第 1 步的 rsync，带上 plan_doc_l8.json）
@@ -202,33 +215,28 @@ L₀=8、前段装全部专家、预留 2.5GB、链长 = 内存所需最少台�
 cd /home/ubuntu/p2p-framework && conda activate moe && source qwen3-30b/env.sh
 export ADVERTISE=192.168.3.4 && mkdir -p results
 
-# 2) 先用原来的 15 台清单把现在的 agent 全停掉（N14/N15 上的也要停，否则一直占显存）
+# 2) 先用原来的 15 台清单把现在的 agent 全停掉（N14/N15 上的也停，否则一直占显存）
 bash ./deploy_15.sh stop
 
-# 3) 切到对照组：清单、权重目录、只含 13 台的 hosts
+# 3) 切到对照组：清单 + 只含 13 台的 hosts（WEIGHTS 不变，就地替换）
 export PLAN=qwen3-30b/plan_doc_l8.json
-export WEIGHTS=$WORKDIR/weights-q3-30b-doc
 awk '$1!="N14" && $1!="N15"' task/hosts.txt > task/hosts_doc.txt
 export HOSTS=task/hosts_doc.txt
 
-# 4) 磁盘够不够（新目录每台 4–21GB，合计约 170GB）
-bash ./deploy_15.sh disk
-
-# 5) 控制机元数据 → 推代码与清单 → 各节点拉自己那份 → 核对
-bash ./deploy_15.sh meta
+# 4) 推代码与清单 → 各节点就地换权重 → 核对
 bash ./deploy_15.sh sync
-bash ./deploy_15.sh fetch          # 会问 [y/N]；当初走 HF 镜像就先 export HF_ENDPOINT=…
-bash ./deploy_15.sh verify         # 13 台都 ✓；哪台不是就 refetch <节点>
+REPLACE=1 bash ./deploy_15.sh fetch   # 会问 [y/N]；当初走 HF 镜像就先 export HF_ENDPOINT=…
+bash ./deploy_15.sh verify            # 13 台都 ✓；某台失败就再跑一次上一条（已完成的会跳过）
 
-# 6) 起 agent
+# 5) 起 agent
 bash ./deploy_15.sh start
-bash ./deploy_15.sh status         # 13/13，无残留 KV
+bash ./deploy_15.sh status            # 13/13，无残留 KV
 
-# 7) 连续性测试：与 5.3 完全同样的设置（150 条、三 task 轮转、共享池、闭环、2048）
+# 6) 连续性测试：与 5.3 完全同样的设置（150 条、三 task 轮转、共享池、闭环、2048）
 export DUMP_FRONT=results/cont_front_doc.jsonl
 RESULTS=results/run_doc.json bash ./deploy_15.sh continuous 2>&1 | tee results/continuous_doc.log
 
-# 8) 看结果
+# 7) 看结果
 bash ./deploy_15.sh report results/run_doc.json | sed -n '/连续性测试/,$p'
 python3 examples/analyze_run.py results/run_doc.json --csv results/run_doc_latency.csv
 ```
@@ -236,8 +244,18 @@ python3 examples/analyze_run.py results/run_doc.json --csv results/run_doc_laten
 * 同时在途 = 4（后段通道数）。三个 task 各 50 条、mbpp 与 no_robots 各只有 1 条通道，开头会提示
   「每条通道分到的请求数不均」—— 这是该方案的容量结构，不是故障；预计约 1 小时；
 * 资源表的平均 GPU 利用率含备胎 N12（一直空闲），逐节点表里能单独看；
-* **切回现方案**：`bash ./deploy_15.sh stop`（此时 HOSTS 还是 13 台）→ 新开终端
-  `source qwen3-30b/env.sh`（PLAN / WEIGHTS 回到原值，HOSTS 回到默认的 15 台）→ `bash ./deploy_15.sh start`。
+* `REPLACE=1` 下某台中途下载失败时，那台此时没有可用权重 —— 重跑同一条命令即可；
+* **切回现方案**（同样就地替换，N01、N09、N12、N14、N15 会跳过）：
+
+```bash
+bash ./deploy_15.sh stop                       # 此时 HOSTS 还是 13 台
+# 新开终端：PLAN 回到 plan_es90_fill.json，HOSTS 回到默认 15 台
+cd /home/ubuntu/p2p-framework && conda activate moe && source qwen3-30b/env.sh
+export ADVERTISE=192.168.3.4
+REPLACE=1 bash ./deploy_15.sh fetch
+bash ./deploy_15.sh verify
+bash ./deploy_15.sh start
+```
 
 ## 6. 参考数值（用来判断复现是否正常）
 

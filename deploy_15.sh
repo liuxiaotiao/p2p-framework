@@ -12,6 +12,7 @@
 #   ./deploy_15.sh serve-weights <目录>  # 上游拉不动时：一台发，15 台切片
 #   ./deploy_15.sh verify     # 逐台核对权重齐不齐（只读文件头，几秒）
 #   ./deploy_15.sh refetch <节点>  # 清掉旧产物再单独重拉一台
+#   REPLACE=1 ./deploy_15.sh fetch   # 换方案：与新清单一致的节点跳过，其余先删旧权重再下
 #   ./deploy_15.sh identity   # 15 个 id 是不是落在 15 台不同机器/目录上
 #   ./deploy_15.sh whereis    # 权重在哪、内存被谁占着（目录空了但内存满时用）
 #   ./deploy_15.sh disk       # 逐台磁盘：份额 vs 实占 vs 幽灵，一张表
@@ -478,11 +479,20 @@ PYEOF
   echo "  超时上限 ${FETCH_TIMEOUT}s（FETCH_TIMEOUT=），不够就调大。"
   echo "  每 ${PROGRESS_EVERY}s 报一次逐台进度（PROGRESS_EVERY=0 关掉）——"
   echo "  问的是目录大小，所以「进程还在但一个字节没动」也看得见。"
+  local REPARG=()
+  if [ "${REPLACE:-0}" = 1 ]; then
+    REPARG=(--replace)
+    echo
+    echo "  ⚠ REPLACE=1：就地换方案。每台先看 $WEIGHTS 里是不是已经是这份清单要的张量 ——"
+    echo "    是就跳过；不是就**先删掉旧权重**（*.safetensors / 索引；config 与 tokenizer 保留）"
+    echo "    再下新的。删掉的旧方案权重，以后切回去要重新下。"
+    echo "    某台中途失败：那台此时没有可用权重，重跑同一条命令即可（已完成的会跳过）。"
+  fi
   read -rp "  继续？[y/N] " a; [ "$a" = y ] || return 0
   $PY -m p2pmoe.deploy.launch fetch --hosts "$HOSTS" --plan "$PLAN" \
       --out "$WEIGHTS" --python "$NODE_PY" --workdir "$WORKDIR" \
       --mode "$MODE" --timeout "$FETCH_TIMEOUT" --transport "$TRANSPORT" \
-      --progress-every "$PROGRESS_EVERY" \
+      --progress-every "$PROGRESS_EVERY" "${REPARG[@]}" \
       "${SSHARG[@]}" "${SRCARG[@]}"
 }
 

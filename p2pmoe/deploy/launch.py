@@ -406,6 +406,8 @@ def _fetch_all(hosts, args) -> int:
                  "--plan", str(args.plan), "--node", h.node_id,
                  "--out", f"{out}/{h.node_id}" if args.per_node_dir else out,
                  "--mode", args.mode]
+        if getattr(args, "replace", False):
+            parts.append("--replace")
         # 权重源三选一，与 fetch 的口径一致
         if args.src:
             parts += ["--src", args.src]
@@ -528,6 +530,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="改成 <out>/<节点id>。只在同机演练（多个 agent 在一台机器上）"
                          "时需要，真机上别开")
     ap.add_argument("--mode", choices=("slice", "shard"), default="slice")
+    ap.add_argument("--replace", action="store_true",
+                    help="fetch：各节点就地换方案 —— 已是本清单的权重就跳过，否则先删旧的再下")
     ap.add_argument("--dry-run", action="store_true",
                     help="只打印各节点上该跑的命令，不执行。"
                          "**没配 ssh 就用它**：把命令拷到各机自己跑，效果一样 —— "

@@ -55,7 +55,7 @@ from ..runtime.weights import KeyPlan, qwen_moe_keys
 log = logging.getLogger("p2pmoe.fetch")
 
 __all__ = ["Source", "TensorSpec", "FetchPlan", "plan_fetch", "fetch",
-           "RangeNotSupported"]
+           "RangeNotSupported", "local_checkpoint_keys", "clear_checkpoint"]
 
 
 class RangeNotSupported(RuntimeError):
@@ -758,6 +758,48 @@ def fetch(src: Source, keys: Iterable[str], out_dir: str | Path, *,
 
 
 # --------------------------------------------------------------------------- #
+def local_checkpoint_keys(out: str | Path) -> set[str] | None:
+    """out 里已有的单文件 checkpoint（fetch 的产物）装了哪些张量。
+
+    文件不在、头读不通、或者文件长度与头里写的对不上（没下完 / 被截断）都返回
+    None —— 只有「完整且读得通」才算有。只读文件头，21GB 的文件也是毫秒级。
+    """
+    f = Path(out) / "model.safetensors"
+    if not f.is_file():
+        return None
+    try:
+        with open(f, "rb") as fh:
+            n = int.from_bytes(fh.read(8), "little")
+            if n <= 0 or n > 512 * 1024 * 1024:
+                return None
+            hdr = json.loads(fh.read(n))
+        hdr.pop("__metadata__", None)
+        end = max((int(v["data_offsets"][1]) for v in hdr.values()), default=0)
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if f.stat().st_size != 8 + n + end:
+        return None
+    return set(hdr)
+
+
+def clear_checkpoint(out: str | Path) -> int:
+    """删掉 out 里的权重文件，返回释放的字节数。
+
+    只删权重：`*.safetensors`、下到一半的 `*.partial`、`model.safetensors.index.json`。
+    config.json 与 tokenizer 留着 —— 控制机（它也是节点）的 --model-dir 要读它们。
+    """
+    d = Path(out)
+    if not d.is_dir():
+        return 0
+    freed = 0
+    for f in [*d.glob("*.safetensors"), *d.glob("*.partial"),
+              d / "model.safetensors.index.json"]:
+        if f.is_file():
+            freed += f.stat().st_size
+            f.unlink()
+    return freed
+
+
 def keys_for_node(manifest: DeploymentManifest, node: str, *,
                   config: dict | None = None,
                   tie_word_embeddings: bool | None = None) -> set[str]:
@@ -855,6 +897,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--diagnose", action="store_true",
                     help="只做源站诊断：小文件与大文件是不是同一个域名、"
                          "CDN 那个域名通不通。企业白名单漏放 CDN 时用它定位")
+    ap.add_argument("--replace", action="store_true",
+                    help="就地换方案：--out 里已经是这份清单要的张量就跳过；不是就**先删掉"
+                         "旧权重**再下新的（磁盘放不下新旧两份时用）。config/tokenizer 保留")
     ap.add_argument("--dry-run", action="store_true", help="只算要下多少，不下")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
@@ -1021,6 +1066,18 @@ def main(argv: list[str] | None = None) -> int:
              args.node, p.role, p.layer_range[0], p.layer_range[1],
              sum(len(l.experts) for l in p.layers), arch, len(keys))
     log.info("来源 %s", src)
+
+    if args.replace and not args.dry_run:
+        # 先删后下：slice 模式边下边写 .partial、写完才替换，不删的话新旧两份要同时
+        # 落在盘上。代价是下载失败时这台暂时没有可用权重 —— 重跑同一条命令即可。
+        have = local_checkpoint_keys(args.out)
+        if have is not None and have == set(keys):
+            log.info("--replace：%s 已经是这份清单要的 %d 个张量，跳过下载", args.out, len(keys))
+            return 0
+        why = ("没有完整的旧权重" if have is None else
+               f"旧权重 {len(have)} 个张量，与本清单相同的 {len(have & set(keys))} 个")
+        freed = clear_checkpoint(args.out)
+        log.info("--replace：%s，先删旧权重（释放 %.1fGB），再下新的", why, freed / 1e9)
 
     try:
         args.out.mkdir(parents=True, exist_ok=True)

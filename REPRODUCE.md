@@ -257,6 +257,40 @@ bash ./deploy_15.sh verify
 bash ./deploy_15.sh start
 ```
 
+### 5.6 逐层计时：用实测的每层耗时规划
+
+拓扑文件里只有抽象的 `compute_capacity`，规划器按它缩放成「最快 0.35ms/层」的相对值，
+比实测（TPOT 130–145ms / 48 层 ≈ 2–3ms/层）低了 7 倍左右。`layerbench` 让每台用
+与服务完全相同的代码路径（同 dtype、同 miss 策略、同 decode 快路径）量 decode（逐 token）
+与 prefill 的每层耗时。
+
+**在控制机上一条命令，经 agent 量完全部节点并汇总**（不用 ssh 到各台、不用停 agent）：
+
+```bash
+bash ./deploy_15.sh status           # agent 都在线
+bash ./deploy_15.sh layerbench       # 各台并行；逐台 → results/layer_bench/<节点>.json
+                                     #          汇总 → results/layer_bench.json（逐节点 + 按 GPU 型号 mean ± std）
+```
+
+* agent **装着权重**（跑过 measure / continuous 之后）：直接量它在清单里分到的那几层、那些专家
+  —— 节点上的真实模型参数，不另占显存（只多计时用的激活与 KV）；
+* agent **没装**（刚 start）：按 `$WEIGHTS/config.json` 的形状建随机权重量，需要约 5GB 空闲显存；
+* `LB_MODE=loaded` / `LB_MODE=synthetic` 强制其一；有在途请求的节点会拒绝（等测试跑完再量）；
+* 可调：`LB_LAYERS=4 LB_CTX=128,1024,2048 LB_PREFILL=128,512,2048 LB_STEPS=32 LB_TIMEOUT=900 LB_KEY=decode@1024`；
+* `LB_VIA=ssh` 退回 ssh 到每台跑的老办法（agent 必须先停）。
+
+规划时用实测值（缺测的节点退到同型号均值，再退到按算力比例外推）：
+
+```bash
+python3 examples/task_deploy.py ...原参数... \
+    --layer-times results/layer_bench.json --layer-time-key decode@1024
+```
+
+* `--layer-time-key`：`decode@<上下文长度>` 是生成阶段每 token 每层的耗时（默认 1024），
+  `prefill@<token 数>` 是一次喂 T 个 token 时整层的耗时；
+* 规划日志开头会打印每台「拓扑推算值 → 实测值」和来源；
+* 不加 `--layer-times` 时规划结果与以前逐字节相同。
+
 ## 6. 参考数值（用来判断复现是否正常）
 
 | 实验 | 指标 | 历史值 |

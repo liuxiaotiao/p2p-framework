@@ -158,6 +158,11 @@ def main() -> int:
                          "smallest_sufficient = 现行默认（够装前段的最小 N 台）")
     ap.add_argument("--endpoint-w", type=float, default=None,
                     help="后段端点项权重（PlannerConfig.endpoint_w，默认 1.0）；0 = 文档原始目标函数")
+    ap.add_argument("--layer-times", type=Path, default=None,
+                    help="逐层实测（p2pmoe.deploy.layer_bench merge 的产物）：用实测的 ms/层 "
+                         "代替拓扑 compute_capacity 推出来的相对值")
+    ap.add_argument("--layer-time-key", default="decode@1024",
+                    help="取实测表里哪一列：decode@<上下文长度> 或 prefill@<token 数>")
     ap.add_argument("--fill-idle", action="store_true",
                     help="主流程之后补位：提拔备胎、用空闲节点加通道、剩下的分摊到显存最紧的段，"
                          "让每台节点都有活干。补位段不过公共带（见 planner/fill.py）")
@@ -198,6 +203,19 @@ def main() -> int:
         print(f"  {name:<8} {d['n_layers']} 层 × {d['n_experts']} 专家，{args.phase} 相{warn}")
     topo = load_topology(D / "topo_fabric_mbps.json", d_model=int(hf_cfg["hidden_size"]),
                          dtype_bytes=args.dtype_bytes, reserve_gb=args.reserve_gb)
+    if args.layer_times:
+        from p2pmoe.deploy.layer_bench import per_node_ms
+        from p2pmoe.planner.from_data import apply_layer_times
+
+        table = json.loads(args.layer_times.read_text(encoding="utf-8"))
+        meas = per_node_ms(table, args.layer_time_key)
+        if not meas:
+            raise SystemExit(f"{args.layer_times} 里没有 {args.layer_time_key} 这一列；"
+                             f"有的是 {table.get('keys')}")
+        topo, rows = apply_layer_times(topo, meas)
+        print(f"  计算项   用逐层实测 {args.layer_times}（{args.layer_time_key}，ms/层）：")
+        for nid, tier, old_v, new_v, src in rows:
+            print(f"           {nid:<5}{tier:<9} {old_v:>7.3f} → {new_v:>7.3f}  {src}")
     v = np.array(list(topo.p50_ms.values()))
     tiers = {}
     for n in topo.nodes:

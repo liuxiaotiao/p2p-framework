@@ -218,7 +218,7 @@ def _cuda_state() -> dict:
 
 
 _REPLIES = frozenset({"echo", "capabilities", "check_model", "configure",
-                      "probe", "profile", "usage"})
+                      "probe", "profile", "usage", "layer_bench"})
 
 
 class NodeServer:
@@ -491,6 +491,12 @@ class NodeServer:
             if conn is not None:
                 send_msg(conn, {"type": "usage_ack", **self.usage(
                     reset_peak=bool(h.get("reset_peak")))})
+            return
+        if t == "layer_bench":
+            # 逐层计时（runtime/layer_bench.py）。配置前后都能答：装着权重就量已加载的
+            # 那几层，没装就按控制器给的 config 建随机权重量。
+            if conn is not None:
+                send_msg(conn, {"type": "layer_bench_ack", **self.layer_bench(h)})
             return
         if t == "probe":
             res = self.probe_peer(tuple(h["addr"]), int(h.get("k", 8)),
@@ -844,6 +850,37 @@ class NodeServer:
             if self.model is not None and hasattr(self.model, "active_requests") else 0,
             "gpu": gpu,
         }
+
+    def layer_bench(self, h: dict) -> dict:
+        """控制器发来的逐层计时请求 → {"ok", "result" | "why"}。
+
+        mode：auto（默认，装着就量已加载的，没装就随机权重）/ loaded / synthetic。
+        计时在本连接的线程里同步做完再回包 —— 控制器那边按需要的时长给超时。
+        """
+        from .layer_bench import BenchError, bench_loaded, run_bench   # 执行层，torch 在里面
+
+        mode = str(h.get("mode", "auto"))
+        opts = {k: h[k] for k in ("ctx", "prefill", "decode_steps", "warmup", "repeats")
+                if k in h}
+        loaded = self.model is not None and hasattr(self.model, "blocks")
+        try:
+            if mode == "loaded" or (mode == "auto" and loaded):
+                if not loaded:
+                    raise BenchError("还没装权重（没收过 configure）—— 用 --mode synthetic，"
+                                     "或者先跑一次 measure/continuous 让它装上")
+                res = bench_loaded(self.model, node=self.me, **opts)
+                res["role"] = self.cfg.role if self.cfg else None
+                res["segment"] = self.cfg.segment if self.cfg else None
+            else:
+                cfg = h.get("hf_config")
+                if not cfg:
+                    raise BenchError("随机权重模式要控制器给 hf_config（模型形状）")
+                dev = str(h.get("device") or (self.cfg.device if self.cfg else "") or "cuda")
+                res = run_bench(cfg, device=dev, n_layers=int(h.get("n_layers", 4)),
+                                node=self.me, **opts)
+            return {"ok": True, "node": self.me, "result": res}
+        except BenchError as e:
+            return {"ok": False, "node": self.me, "why": str(e)}
 
     def capabilities(self) -> dict:
         """上报本机能力。规划器的 Node 表就是由这些回包拼出来的。"""

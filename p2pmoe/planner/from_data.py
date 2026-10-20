@@ -37,7 +37,7 @@ from .network import Probe
 from .types import Node
 
 __all__ = ["load_activation_csv", "load_topology", "FabricOracle", "TopoInfo",
-           "load_expert_sets"]
+           "load_expert_sets", "apply_layer_times"]
 
 
 # --------------------------------------------------------------------------- #
@@ -223,6 +223,45 @@ def load_topology(
             bw[(a, b)] = mbps
             pr[(a, b)] = prop
     return TopoInfo(nodes=nodes, p50_ms=p50, bandwidth_mbps=bw, prop_ms=pr, raw=raw)
+
+
+def apply_layer_times(
+    topo: TopoInfo, measured: Mapping[str, float],
+) -> tuple[TopoInfo, list[tuple[str, str, float, float, str]]]:
+    """用逐层实测（`deploy/layer_bench.py`，ms/层）替换拓扑推出来的 ms_per_layer。
+
+    缺测的节点按顺序退：同型号（拓扑 role）实测的均值 → 按 compute_capacity 反比，
+    比例系数 k = median(实测 × capacity) 由已测节点拟合。一台都没测就原样返回。
+
+    返回 (新的 TopoInfo, [(节点, 型号, 原值, 新值, 来源)])。
+    """
+    if not measured:
+        return topo, [(n.id, n.tier, n.ms_per_layer, n.ms_per_layer, "拓扑") for n in topo.nodes]
+    from dataclasses import replace as _replace
+    from statistics import mean as _mean, median as _median
+
+    caps = {n["id"]: float(n["compute_capacity"]) for n in topo.raw.get("nodes", [])}
+    by_tier: dict[str, list[float]] = {}
+    for n in topo.nodes:
+        if n.id in measured:
+            by_tier.setdefault(n.tier, []).append(float(measured[n.id]))
+    ks = [float(measured[n.id]) * caps[n.id] for n in topo.nodes
+          if n.id in measured and n.id in caps]
+    k = _median(ks) if ks else None
+    out, rows = [], []
+    for n in topo.nodes:
+        if n.id in measured:
+            v, src = float(measured[n.id]), "实测"
+        elif by_tier.get(n.tier):
+            v, src = _mean(by_tier[n.tier]), f"同型号均值（{len(by_tier[n.tier])} 台）"
+        elif k is not None and n.id in caps:
+            v, src = k / caps[n.id], "按算力比例外推"
+        else:
+            v, src = n.ms_per_layer, "拓扑（无可参照）"
+        rows.append((n.id, n.tier, n.ms_per_layer, round(v, 4), src))
+        out.append(_replace(n, ms_per_layer=round(v, 4)))
+    return TopoInfo(nodes=out, p50_ms=topo.p50_ms, bandwidth_mbps=topo.bandwidth_mbps,
+                    prop_ms=topo.prop_ms, raw=topo.raw), rows
 
 
 # --------------------------------------------------------------------------- #

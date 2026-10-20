@@ -13,6 +13,7 @@
 #   ./deploy_15.sh verify     # 逐台核对权重齐不齐（只读文件头，几秒）
 #   ./deploy_15.sh refetch <节点>  # 清掉旧产物再单独重拉一台
 #   REPLACE=1 ./deploy_15.sh fetch   # 换方案：与新清单一致的节点跳过，其余先删旧权重再下
+#   ./deploy_15.sh layerbench # 经 agent 逐台量每层耗时（不用 ssh/不停 agent）→ results/layer_bench.json
 #   ./deploy_15.sh identity   # 15 个 id 是不是落在 15 台不同机器/目录上
 #   ./deploy_15.sh whereis    # 权重在哪、内存被谁占着（目录空了但内存满时用）
 #   ./deploy_15.sh disk       # 逐台磁盘：份额 vs 实占 vs 幽灵，一张表
@@ -1265,6 +1266,48 @@ PYEOF
 # 以别的 --node 跑的、或者中途失败留下了半成品，目录里就可能坐着一份
 # 不属于这台的权重 —— 而重跑 fetch 只要有一步先失败，那份就一直留着。
 # 所以这里显式删掉再拉，让「重来一次」真的是从零开始。
+# 逐层计时：每台跑一层 Qwen3-MoE 要多久（p2pmoe/deploy/layer_bench.py）。
+# 默认走 agent：控制机一条命令，各 agent 在自己的 GPU 上量完回传，不用 ssh、不用停 agent。
+#   agent 装着权重（跑过 measure/continuous）→ 量它在清单里分到的那几层（真实权重）；
+#   没装 → 按 config 建同形状随机权重量。LB_MODE=loaded|synthetic 可强制。
+# LB_VIA=ssh 退回老办法（ssh 到每台跑，agent 必须先停）。
+# 结果给规划器：task_deploy.py --layer-times results/layer_bench.json
+cmd_layerbench() {
+  need "$HOSTS"
+  local d=results/layer_bench; mkdir -p "$d"
+  if [ "${LB_VIA:-agent}" = agent ]; then
+    say "L. 逐层计时（经 agent，各台并行）"
+    _require_agents || return 1
+    $PY -m p2pmoe.deploy.layer_bench remote --agents "$(AGENTS)" \
+        --mode "${LB_MODE:-auto}" --model-dir "$WEIGHTS" --config qwen3-30b-a3b \
+        --layers "${LB_LAYERS:-4}" --ctx "${LB_CTX:-128,1024,2048}" \
+        --prefill "${LB_PREFILL:-128,512,2048}" --steps "${LB_STEPS:-32}" \
+        --timeout "${LB_TIMEOUT:-900}" --out-dir "$d" --out results/layer_bench.json \
+        --key "${LB_KEY:-decode@1024}"
+    return
+  fi
+  say "L. 逐层计时（经 ssh，各台并行，各用自己的 GPU）"
+  echo "  ⚠ agent 必须先停：它占着显存，也会和计时抢 GPU —— bash ./deploy_15.sh stop"
+  read -rp "  agent 已经停了？[y/N] " a; [ "$a" = y ] || return 0
+  local args="--model-dir $(printf %q "$WEIGHTS") --config qwen3-30b-a3b --layers ${LB_LAYERS:-4} \
+--ctx ${LB_CTX:-128,1024,2048} --prefill ${LB_PREFILL:-128,512,2048} --steps ${LB_STEPS:-32}"
+  while read -r id ip; do
+    ( out=$(ssh -o BatchMode=yes -o ConnectTimeout=15 ${SSH_OPTS:-} \
+          "${SSH_USER:+$SSH_USER@}$ip" \
+          "mkdir -p /tmp/p2pmoe && cd $(printf %q "$WORKDIR") && \
+$(printf %q "$NODE_PY") -m p2pmoe.deploy.layer_bench run $args --node $id \
+--out /tmp/p2pmoe/layer_bench-$id.json > /tmp/p2pmoe/layer_bench-$id.log 2>&1 \
+&& cat /tmp/p2pmoe/layer_bench-$id.json || { tail -5 /tmp/p2pmoe/layer_bench-$id.log; exit 1; }" \
+          </dev/null 2>&1) \
+        && { printf '%s\n' "$out" > "$d/$id.json"; echo "  ✓ $id"; } \
+        || echo "  ✗ $id：$(echo "$out" | tail -3 | tr '\n' ' ')" ) &
+  done < <(awk '{sub(/#.*/,"")} NF>=2 {split($2,a,":"); print $1, a[1]}' "$HOSTS")
+  wait
+  ls "$d"/*.json >/dev/null 2>&1 || { echo "  一台都没量成"; return 1; }
+  $PY -m p2pmoe.deploy.layer_bench merge "$d"/*.json --out results/layer_bench.json \
+      --key "${LB_KEY:-decode@1024}"
+}
+
 cmd_refetch() {
   local id=${1:-}
   [ -n "$id" ] || { echo "用法: $0 refetch <节点id>"; exit 1; }
@@ -1404,6 +1447,7 @@ case "$action" in
   diag)    cmd_diag ;;
   verify)  cmd_verify "${1:-}" ;;
   refetch) cmd_refetch "${1:-}" ;;
+  layerbench) cmd_layerbench ;;
   identity) cmd_identity ;;
   whereis) cmd_whereis "${1:-}" ;;
   disk)    cmd_disk ;;
@@ -1418,6 +1462,6 @@ case "$action" in
   status)  cmd_status ;;
   continuous) cmd_continuous "$@" ;;
   all)     cmd_sync && cmd_check && cmd_fetch && cmd_start && cmd_serve "$@" ;;
-  *) echo "用法: $0 {sync|bootstrap|cmds|check|fetch|meta|diag|serve-weights|verify|refetch|identity|whereis|disk|start|status|serve|measure|continuous|report|logs|doctor|stop|all}
+  *) echo "用法: $0 {sync|bootstrap|cmds|check|fetch|meta|diag|serve-weights|verify|refetch|layerbench|identity|whereis|disk|start|status|serve|measure|continuous|report|logs|doctor|stop|all}
        serve/measure 后面的参数原样透传给 control.py"; exit 1 ;;
 esac

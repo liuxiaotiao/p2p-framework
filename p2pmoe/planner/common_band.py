@@ -120,8 +120,11 @@ def common_band(
 
     best = BandResult(exits=[], w_lo=0.0, w_hi=0.0, W=W)
     for w_lo in sorted({lo for lo, _ in ivs.values()}):
-        w_hi = w_lo + W
-        if w_hi > w_cap + 1e-9:
+        # 带的右端同时受两条约束：带宽 W 与绝对上限 w_cap（II.3.1）。取两者中较紧的。
+        # 以前写成「w_lo + W > w_cap 就停」—— W 比 w_cap 大时（计算项按实测放大后，
+        # W 上限 η·median T 随之变大，而 w_cap 只看网络一跳）一个窗都不试，人口恒为 0。
+        w_hi = min(w_lo + W, w_cap)
+        if w_hi < w_lo - 1e-9:
             break
         S = sorted(t for t, (lo, hi) in ivs.items() if lo >= w_lo - 1e-9 and hi <= w_hi + 1e-9)
         if len(S) > best.population:

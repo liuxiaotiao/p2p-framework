@@ -280,3 +280,14 @@ def test_solver_respects_the_tail_extra(exhaustive):
     assert one is not None and one.hops == 0
     assert two is not None and two.hops == 1
     assert two.splits[-1][1] - two.splits[-1][0] + 1 <= 3      # tail 那台最多 3 层 + 输出头
+
+
+def test_length_ranges():
+    assert LB._ints("128:1024:128") == [128, 256, 384, 512, 640, 768, 896, 1024]
+    assert LB._ints("128:1024:128,2048") == [128, 256, 384, 512, 640, 768, 896, 1024, 2048]
+    assert LB._ints("128:512") == [128, 256, 384, 512]          # 步长省略 = 起点
+    assert LB._ints("1024,128,1024") == [128, 1024]             # 去重、排序
+    for bad in ("128:64:8", "0:128:8", "128:1024:0", "1:2:3:4"):
+        with pytest.raises(ValueError):
+            LB._ints(bad)
+    assert RB.DEFAULT_CTX[:8] == tuple(range(128, 1025, 128)) and RB.DEFAULT_CTX[-1] == 2048

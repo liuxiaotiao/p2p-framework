@@ -276,7 +276,9 @@ bash ./deploy_15.sh layerbench       # 各台并行；逐台 → results/layer_b
   —— 节点上的真实模型参数，不另占显存（只多计时用的激活与 KV）；
 * agent **没装**（刚 start）：按 `$WEIGHTS/config.json` 的形状建随机权重量，需要约 5GB 空闲显存；
 * `LB_MODE=loaded` / `LB_MODE=synthetic` 强制其一；有在途请求的节点会拒绝（等测试跑完再量）；
-* 可调：`LB_LAYERS=4 LB_CTX=128,1024,2048 LB_PREFILL=128,512,2048 LB_STEPS=32 LB_TIMEOUT=900 LB_KEY=decode@1024`；
+* 默认把 prompt / 上下文长度从 128 扫到 1024（步长 128），再加 2048（规划按 ctx_max=2048 留显存，要它的激活峰值）；
+  长度写法：逗号分隔，区间写 `起:止:步长`，如 `LB_PREFILL=128:1024:64` 或 `LB_CTX=256,512,1024`；
+* 其他可调：`LB_LAYERS=4 LB_STEPS=32 LB_TIMEOUT=900 LB_KEY=decode@1024`；
 * `LB_VIA=ssh` 退回 ssh 到每台跑的老办法（agent 必须先停）。
 
 规划时用实测值（缺测的节点退到同型号均值，再退到按算力比例外推）：

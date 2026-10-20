@@ -15,8 +15,8 @@ from typing import Mapping, Sequence
 __all__ = ["synth_weights", "run_bench", "bench_loaded", "BenchError",
            "DEFAULT_CTX", "DEFAULT_PREFILL"]
 
-DEFAULT_CTX = (128, 1024, 2048)
-DEFAULT_PREFILL = (128, 512, 2048)
+DEFAULT_CTX = (*range(128, 1025, 128), 2048)      # 128, 256, …, 1024，外加 2048
+DEFAULT_PREFILL = (*range(128, 1025, 128), 2048)
 
 
 # --------------------------------------------------------------------------- #

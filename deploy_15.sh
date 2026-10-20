@@ -1280,8 +1280,8 @@ cmd_layerbench() {
     _require_agents || return 1
     $PY -m p2pmoe.deploy.layer_bench remote --agents "$(AGENTS)" \
         --mode "${LB_MODE:-auto}" --model-dir "$WEIGHTS" --config qwen3-30b-a3b \
-        --layers "${LB_LAYERS:-4}" --ctx "${LB_CTX:-128,1024,2048}" \
-        --prefill "${LB_PREFILL:-128,512,2048}" --steps "${LB_STEPS:-32}" \
+        --layers "${LB_LAYERS:-4}" --ctx "${LB_CTX:-128:1024:128,2048}" \
+        --prefill "${LB_PREFILL:-128:1024:128,2048}" --steps "${LB_STEPS:-32}" \
         --timeout "${LB_TIMEOUT:-900}" --out-dir "$d" --out results/layer_bench.json \
         --key "${LB_KEY:-decode@1024}"
     return
@@ -1290,7 +1290,7 @@ cmd_layerbench() {
   echo "  ⚠ agent 必须先停：它占着显存，也会和计时抢 GPU —— bash ./deploy_15.sh stop"
   read -rp "  agent 已经停了？[y/N] " a; [ "$a" = y ] || return 0
   local args="--model-dir $(printf %q "$WEIGHTS") --config qwen3-30b-a3b --layers ${LB_LAYERS:-4} \
---ctx ${LB_CTX:-128,1024,2048} --prefill ${LB_PREFILL:-128,512,2048} --steps ${LB_STEPS:-32}"
+--ctx ${LB_CTX:-128:1024:128,2048} --prefill ${LB_PREFILL:-128:1024:128,2048} --steps ${LB_STEPS:-32}"
   while read -r id ip; do
     ( out=$(ssh -o BatchMode=yes -o ConnectTimeout=15 ${SSH_OPTS:-} \
           "${SSH_USER:+$SSH_USER@}$ip" \

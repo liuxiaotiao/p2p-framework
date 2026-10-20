@@ -51,8 +51,8 @@ __all__ = ["merge", "per_node_ms", "per_node_memory", "run_remote", "main"]
 
 DEFAULT_KEY = "decode@1024"
 # 与执行层（p2pmoe/runtime/layer_bench.py）一致；那边才 import torch
-DEFAULT_CTX = (128, 1024, 2048)
-DEFAULT_PREFILL = (128, 512, 2048)
+DEFAULT_CTX = (*range(128, 1025, 128), 2048)      # 128, 256, …, 1024，外加 2048
+DEFAULT_PREFILL = (*range(128, 1025, 128), 2048)
 
 
 # --------------------------------------------------------------------------- #
@@ -142,13 +142,22 @@ def per_node_ms(table: Mapping, key: str = DEFAULT_KEY) -> dict[str, float]:
 
 def _print_table(m: dict) -> None:
     keys = m["keys"]
-    head = f"  {'节点':<6}{'GPU':<28}{'权重':<8}" + "".join(f"{k:>15}" for k in keys)
-    print("\n每层耗时（ms，中位数；prefill 为一次喂 T 个 token 的整层时长）")
-    print(head)
-    for n, v in m["per_node"].items():
-        src = {"loaded": "已加载", "synthetic": "随机"}.get(v.get("source"), "?")
-        print(f"  {n:<6}{str(v['gpu'])[:27]:<28}{src:<8}"
-              + "".join(f"{v[k]:>15.3f}" if v.get(k) is not None else f"{'—':>15}" for k in keys))
+    f3 = lambda x: f"{x:>8.3f}" if x is not None else f"{'—':>8}"
+    for kind, title in (("decode", "decode：每 token 每层耗时（ms，中位数），列为上下文长度"),
+                        ("prefill", "prefill：一次喂 T 个 token 时整层耗时（ms，中位数），列为 T")):
+        ks = [k for k in keys if k.startswith(kind + "@")]
+        if not ks:
+            continue
+        print(f"\n{title}")
+        print(f"  {'节点':<6}{'GPU':<22}{'权重':<7}" + "".join(f"{k.split('@')[1]:>8}" for k in ks))
+        for n, v in m["per_node"].items():
+            src = {"loaded": "已加载", "synthetic": "随机"}.get(v.get("source"), "?")
+            print(f"  {n:<6}{str(v['gpu'])[:21]:<22}{src:<7}" + "".join(f3(v.get(k)) for k in ks))
+        for g, gv in m["per_gpu"].items():
+            print(f"  {'均值':<6}{g[:21]:<22}{'':<7}"
+                  + "".join(f3(gv[k]["mean"]) if k in gv else f"{'—':>8}" for k in ks))
+            print(f"  {'std':<6}{'':<22}{'':<7}"
+                  + "".join(f3(gv[k]["std"]) if k in gv else f"{'—':>8}" for k in ks))
     print("\n显存（GB = 1e9 字节）：整卡容量 / CUDA context / 分配器开销比 / 每 token 每层 KV / "
           "prefill 激活峰值 / 每层权重")
     print(f"  {'节点':<6}{'容量':>8}{'context':>9}{'开销比':>8}{'KV B/tok·层':>13}"
@@ -161,11 +170,7 @@ def _print_table(m: dict) -> None:
               f"{f(mm.get('overhead_ratio')):>8}{f(mm.get('kv_bytes_per_token_layer'), 0):>13}"
               f"{f(act):>10}{f(mm.get('weights_per_layer_gb')):>10}"
               + (f"  （T={mm.get('prefill_extra_at')}）" if act is not None else ""))
-    print("\n按 GPU 型号（mean ± std，跨节点）")
-    for g, v in m["per_gpu"].items():
-        print(f"  {g[:30]:<30} {len(v['nodes'])} 台 {v['nodes']}")
-        print("    " + "  ".join(f"{k} {v[k]['mean']:.3f}±{v[k]['std']:.3f}"
-                                 for k in keys if k in v))
+    print("\nGPU 型号 → 节点：" + "；".join(f"{g} {v['nodes']}" for g, v in m["per_gpu"].items()))
 
 
 # --------------------------------------------------------------------------- #
@@ -229,7 +234,33 @@ def _hf_config(model_dir: str | None, preset: str | None) -> dict:
 
 
 def _ints(s: str) -> list[int]:
-    return [int(x) for x in s.split(",") if x.strip()]
+    """逗号分隔；每项可以是单个数，也可以是区间 起:止:步长（含两端），步长省略时等于起点。
+
+        "128,1024,2048"        → 128, 1024, 2048
+        "128:1024:128"         → 128, 256, …, 1024
+        "128:1024:128,2048"    → 同上再加 2048
+    """
+    out: set[int] = set()
+    for item in s.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" in item:
+            parts = [int(x) for x in item.split(":")]
+            if len(parts) not in (2, 3):
+                raise ValueError(f"区间写成 起:止:步长，收到 {item!r}")
+            lo, hi = parts[0], parts[1]
+            step = parts[2] if len(parts) == 3 else lo
+            if step <= 0 or lo <= 0 or hi < lo:
+                raise ValueError(f"区间 {item!r} 不合法（要 0 < 起 ≤ 止、步长 > 0）")
+            out.update(range(lo, hi + 1, step))
+        else:
+            out.add(int(item))
+    return sorted(out)
+
+
+def _fmt(xs: Sequence[int]) -> str:
+    return ",".join(map(str, xs))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -244,8 +275,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--layers", type=int, default=4, help="一次建几层（结果按层平均）")
     r.add_argument("--resident", default="all",
                    help="驻留专家数，逗号分隔，all = 全部；如 all,80")
-    r.add_argument("--ctx", default=",".join(map(str, DEFAULT_CTX)), help="decode 的上下文长度")
-    r.add_argument("--prefill", default=",".join(map(str, DEFAULT_PREFILL)),
+    r.add_argument("--ctx", default=_fmt(DEFAULT_CTX), help="decode 的上下文长度")
+    r.add_argument("--prefill", default=_fmt(DEFAULT_PREFILL),
                    help="prefill 一次喂的 token 数")
     r.add_argument("--steps", type=int, default=32, help="每个上下文长度量多少个 decode 步")
     r.add_argument("--repeats", type=int, default=5, help="每个 prefill 长度量几次")
@@ -259,8 +290,8 @@ def main(argv: list[str] | None = None) -> int:
     rm.add_argument("--model-dir", default=None, help="控制机上读 config.json（给随机权重模式定形状）")
     rm.add_argument("--config", default=None, help="没有 config.json 时用预置名，如 qwen3-30b-a3b")
     rm.add_argument("--layers", type=int, default=4, help="随机权重模式一次建几层")
-    rm.add_argument("--ctx", default=",".join(map(str, DEFAULT_CTX)))
-    rm.add_argument("--prefill", default=",".join(map(str, DEFAULT_PREFILL)))
+    rm.add_argument("--ctx", default=_fmt(DEFAULT_CTX))
+    rm.add_argument("--prefill", default=_fmt(DEFAULT_PREFILL))
     rm.add_argument("--steps", type=int, default=32)
     rm.add_argument("--repeats", type=int, default=5)
     rm.add_argument("--warmup", type=int, default=3)

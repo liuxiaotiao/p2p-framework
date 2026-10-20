@@ -37,7 +37,7 @@ from .network import Probe
 from .types import Node
 
 __all__ = ["load_activation_csv", "load_topology", "FabricOracle", "TopoInfo",
-           "load_expert_sets", "apply_layer_times"]
+           "load_expert_sets", "apply_layer_times", "apply_layer_memory"]
 
 
 # --------------------------------------------------------------------------- #
@@ -260,6 +260,57 @@ def apply_layer_times(
             v, src = n.ms_per_layer, "拓扑（无可参照）"
         rows.append((n.id, n.tier, n.ms_per_layer, round(v, 4), src))
         out.append(_replace(n, ms_per_layer=round(v, 4)))
+    return TopoInfo(nodes=out, p50_ms=topo.p50_ms, bandwidth_mbps=topo.bandwidth_mbps,
+                    prop_ms=topo.prop_ms, raw=topo.raw), rows
+
+
+def apply_layer_memory(
+    topo: TopoInfo, measured: Mapping[str, Mapping], *, margin_gb: float = 0.5,
+) -> tuple[TopoInfo, list[tuple[str, str, float, float, str]]]:
+    """用实测显存（`deploy/layer_bench.py` 的 memory 表）代替「标称容量 − 固定预留」。
+
+    每台的可用量 = (实测容量 − CUDA context − prefill 激活峰值 − margin) ÷ 分配器开销比。
+    除以开销比，等价于把每层权重按实测的碎片/取整放大。缺测的量依次退到同型号实测均值、
+    全部实测的中位数；容量也缺就保留拓扑的标称值。
+
+    返回 (新的 TopoInfo, [(节点, 型号, 原可用 GB, 新可用 GB, 来源说明)])。
+    """
+    if not measured:
+        return topo, [(n.id, n.tier, n.usable_gb, n.usable_gb, "拓扑") for n in topo.nodes]
+    from dataclasses import replace as _replace
+    from statistics import mean as _mean, median as _median
+
+    tier_of = {n.id: n.tier for n in topo.nodes}
+
+    def pick(nid: str, f: str, default=None, *, global_ok: bool = True):
+        x = (measured.get(nid) or {}).get(f)
+        if x is not None:
+            return float(x), "实测"
+        same = [float(m[f]) for k, m in measured.items()
+                if m.get(f) is not None and tier_of.get(k) == tier_of.get(nid)]
+        if same:
+            return _mean(same), "同型号"
+        if not global_ok:            # 容量是卡的属性，别的型号的值不能借
+            return default, "无"
+        allv = [float(m[f]) for m in measured.values() if m.get(f) is not None]
+        if allv:
+            return _median(allv), "全体中位"
+        return default, "无"
+
+    out, rows = [], []
+    for n in topo.nodes:
+        total, s_total = pick(n.id, "total_gb", None, global_ok=False)
+        if total is None:
+            total, s_total = n.mem_gb, "标称"
+        ctx_gb, s_ctx = pick(n.id, "context_gb", 0.5)
+        act, s_act = pick(n.id, "prefill_extra_gb", 0.0)
+        ratio, s_r = pick(n.id, "overhead_ratio", 1.0)
+        ratio = max(1.0, ratio)
+        usable = max(0.0, (total - ctx_gb - act - margin_gb) / ratio)
+        src = (f"容量 {total:.2f}({s_total}) − context {ctx_gb:.2f}({s_ctx}) − 激活 {act:.2f}({s_act})"
+               f" − 余量 {margin_gb:.2f}，÷ 开销比 {ratio:.3f}({s_r})")
+        rows.append((n.id, n.tier, round(n.usable_gb, 3), round(usable, 3), src))
+        out.append(_replace(n, mem_gb=round(total, 4), reserve_gb=round(total - usable, 4)))
     return TopoInfo(nodes=out, p50_ms=topo.p50_ms, bandwidth_mbps=topo.bandwidth_mbps,
                     prop_ms=topo.prop_ms, raw=topo.raw), rows
 

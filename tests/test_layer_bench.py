@@ -200,3 +200,83 @@ def test_cli_remote(agents, tmp_path, capsys):
     assert (tmp_path / "d" / "a.json").exists()
     assert json.loads(out.read_text())["per_node"]["a"]["decode@8"] > 0
     assert "已加载权重" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- #
+# 显存：实测 → 规划器
+# --------------------------------------------------------------------------- #
+def test_bench_reports_kv_and_weight_bytes():
+    r = _run()
+    m = r["variants"]["all"]["memory"]
+    c = TINY_QWEN3_MOE
+    assert m["kv_bytes_per_token_layer"] == 2 * c["num_key_value_heads"] * c["head_dim"] * 4
+    d, mi = c["hidden_size"], c["moe_intermediate_size"]
+    assert m["expert_gb"] == pytest.approx(3 * d * mi * 4 / 1e9, rel=1e-6)
+    assert m["weights_per_layer_gb"] == pytest.approx(
+        m["base_per_layer_gb"] + c["num_experts"] * m["expert_gb"], rel=1e-6)
+
+
+def test_loaded_bench_reports_per_layer_weights(agents):
+    res = agents["a"].layer_bench({"mode": "loaded", **OPTS})["result"]
+    m = res["variants"]["all"]["memory"]
+    assert set(m["weights_by_layer_gb"]) == {"3", "4", "5"}
+    assert m["weights_total_gb"] == pytest.approx(sum(m["weights_by_layer_gb"].values()), rel=1e-3)
+
+
+def test_merge_carries_memory():
+    a = _run("N01")
+    a["device_memory"] = {"total_gb": 25.3, "context_gb": 0.4}
+    a["variants"]["all"]["memory"].update(overhead_ratio=1.02, prefill_extra_gb={"128": 0.1, "2048": 0.7})
+    m = LB.merge([a])
+    mem = LB.per_node_memory(m)["N01"]
+    assert mem["total_gb"] == 25.3 and mem["prefill_extra_gb"] == 0.7 and mem["prefill_extra_at"] == 2048
+    assert m["per_gpu"]["cpu"]["memory"]["total_gb"]["mean"] == 25.3
+
+
+def test_apply_layer_memory(tmp_path):
+    from p2pmoe.planner.from_data import apply_layer_memory
+
+    topo = _topo(tmp_path)          # A1/A2 A30、T1 T4、R1 RTX6000，标称 24/24/16/24
+    meas = {"A1": {"total_gb": 25.3, "context_gb": 0.4, "prefill_extra_gb": 0.6, "overhead_ratio": 1.0},
+            "R1": {"total_gb": 23.59, "context_gb": 0.5, "prefill_extra_gb": 0.8, "overhead_ratio": 1.1}}
+    new, rows = apply_layer_memory(topo, meas, margin_gb=0.5)
+    u = {n.id: n.usable_gb for n in new.nodes}
+    assert u["A1"] == pytest.approx(25.3 - 0.4 - 0.6 - 0.5, abs=1e-3)
+    assert u["R1"] == pytest.approx((23.59 - 0.5 - 0.8 - 0.5) / 1.1, abs=1e-3)
+    assert u["A2"] == pytest.approx(u["A1"], abs=1e-3)                 # 同型号均值
+    t1 = next(n for n in new.nodes if n.id == "T1")
+    assert t1.mem_gb == 16.0                                            # 容量没测：保留标称
+    assert "标称" in next(r[4] for r in rows if r[0] == "T1")
+
+
+def test_head_and_tail_extras_count_only_at_the_ends():
+    from p2pmoe.planner.types import SegmentSpec
+
+    s = SegmentSpec(kind="back", task="t", layer_lo=9, layer_hi=12, gb_per_layer=lambda l: 1.0,
+                    kv_gb_per_layer=0.0, head_extra_gb=0.3, tail_extra_gb=0.7)
+    assert s.resident_gb(9, 12) == pytest.approx(5.0)
+    assert s.resident_gb(10, 11) == pytest.approx(2.0)
+    assert s.resident_gb(9, 10) == pytest.approx(2.3)
+    assert s.resident_gb(11, 12) == pytest.approx(2.7)
+
+
+@pytest.mark.parametrize("exhaustive", [False, True])
+def test_solver_respects_the_tail_extra(exhaustive):
+    """一台正好装下 4 层权重：不计输出头时一台成段；计上就必须两台。"""
+    from p2pmoe.planner.network import MeasurementCache
+    from p2pmoe.planner.solver import deploy_path
+    from p2pmoe.planner.types import Node, Objective, SegmentSpec
+    from p2pmoe.sim.network import SimNetwork
+
+    nm = {f"n{i}": Node(id=f"n{i}", tier="x", mem_gb=4.0, ms_per_layer=1.0, reserve_gb=0.0)
+          for i in range(3)}
+    net = MeasurementCache(SimNetwork(sorted(nm), seed=0), k=8, j_cap_ms=1e9)
+    base = dict(kind="back", task="t", layer_lo=9, layer_hi=12, gb_per_layer=lambda l: 1.0,
+                kv_gb_per_layer=0.0)
+    one = deploy_path(SegmentSpec(**base), sorted(nm), nm, net, Objective(),
+                      exhaustive_short=exhaustive)
+    two = deploy_path(SegmentSpec(**base, tail_extra_gb=0.6), sorted(nm), nm, net, Objective(),
+                      exhaustive_short=exhaustive)
+    assert one is not None and one.hops == 0
+    assert two is not None and two.hops == 1
+    assert two.splits[-1][1] - two.splits[-1][0] + 1 <= 3      # tail 那台最多 3 层 + 输出头

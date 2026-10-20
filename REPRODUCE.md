@@ -291,6 +291,25 @@ python3 examples/task_deploy.py ...原参数... \
 * 规划日志开头会打印每台「拓扑推算值 → 实测值」和来源；
 * 不加 `--layer-times` 时规划结果与以前逐字节相同。
 
+**显存也用实测**（同一份 `layer_bench.json`，`layerbench` 同时量了显存）：
+
+```bash
+python3 examples/task_deploy.py ...原参数... \
+    --layer-times results/layer_bench.json --measured-mem --mem-margin-gb 0.5
+```
+
+| 量 | 怎么量 | 规划怎么用 |
+|---|---|---|
+| 整卡容量 | `torch.cuda.mem_get_info` | 代替拓扑里的标称值（N13 这类卡标 24GB，实际 23.59GB） |
+| CUDA context | 整卡已用 − PyTorch 占用 | 从容量里扣掉 |
+| prefill 激活峰值 | 一次 prefill 时分配器峰值 − 权重 − 这条请求的 KV（取量过的最长 T） | 从容量里扣掉 |
+| 分配器开销比 | 权重占用（含碎片、取整）÷ 张量本身大小 | 可用量 ÷ 它，相当于把每层权重按实测放大 |
+| 每层权重、每 token 每层 KV | 张量字节数（已加载模式逐层给出） | 与规划器公式对账（日志里打印） |
+| 词嵌入 / 输出头 | vocab × d_model × dtype | 计入前段第一台 / 后段最后一台（以前漏算的 0.62GB） |
+
+每台可用量 = (容量 − context − 激活峰值 − 余量) ÷ 开销比；`--reserve-gb` 此时不用。缺测的量退到同型号均值、
+再退到全体中位数；容量没测且没有同型号可借时保留标称值。
+
 ## 6. 参考数值（用来判断复现是否正常）
 
 | 实验 | 指标 | 历史值 |

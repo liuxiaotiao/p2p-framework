@@ -1,0 +1,407 @@
+
+[1m══ 5''. 连续性测试（闭环，共享请求池）[0m
+  样本 TestSamples/cases.jsonl（150 条），最大生成 2048 token，结果 → results/run.json
+
+[1m══ 5. 建链 + 服务（动态：盲绑 → 识别 → 派发）[0m
+  agent 15/15 在线 ✓
+2026-10-13 03:11:12,585 INFO [0/5] 模型与驻留专家集（task {'gsm8k': 0.33, 'mbpp': 0.33, 'no_robots': 0.33}）
+2026-10-13 03:11:12,585 INFO       weights-q3-30b: 48 层 × 128 专家 top-8，d_model 2048，专家中间维 768，GQA 32/4 头 × 128
+2026-10-13 03:11:12,586 INFO       ✓ 细粒度比 16（单 token 只碰 6.2%），适合本方案 —— 驻留集通常能压到全集的 10–20%。
+2026-10-13 03:11:12,590 INFO       后段驻留集来自 qwen3-30b/profile_es90.json，层均 {'gsm8k': 79.1, 'mbpp': 80.5, 'no_robots': 62.9}
+2026-10-13 03:11:12,590 INFO [1/5] 采集节点能力（15 台）
+2026-10-13 03:11:12,605 INFO   N01      内存    30083MB  基准 1.278ms
+2026-10-13 03:11:12,618 INFO   N02      内存    28829MB  基准 1.158ms
+2026-10-13 03:11:12,632 INFO   N03      内存    30690MB  基准 0.697ms
+2026-10-13 03:11:12,646 INFO   N04      内存    30695MB  基准 0.356ms
+2026-10-13 03:11:12,659 INFO   N05      内存    30693MB  基准 0.651ms
+2026-10-13 03:11:12,673 INFO   N06      内存    30692MB  基准 1.147ms
+2026-10-13 03:11:12,687 INFO   N07      内存    30697MB  基准 0.381ms
+2026-10-13 03:11:12,701 INFO   N08      内存    30674MB  基准 0.739ms
+2026-10-13 03:11:12,702 INFO   N09      内存    29963MB  基准 16.267ms
+2026-10-13 03:11:12,703 INFO   N10      内存    30743MB  基准 0.765ms
+2026-10-13 03:11:12,704 INFO   N11      内存    30748MB  基准 0.314ms
+2026-10-13 03:11:12,705 INFO   N12      内存    29422MB  基准 1.209ms
+2026-10-13 03:11:12,761 INFO   N13      内存    30736MB  基准 1.206ms
+2026-10-13 03:11:12,815 INFO   N14      内存    29479MB  基准 0.935ms
+2026-10-13 03:11:12,871 INFO   N15      内存    29844MB  基准 0.865ms
+2026-10-13 03:11:12,871 INFO       可用内存/台 ['26.7GB', '27.3GB', '27.7GB', '27.8GB', '27.9GB', '28.5GB']（已扣预留）
+2026-10-13 03:11:12,871 INFO       预检：15 台节点能不能读到 /home/ubuntu/p2p-framework/weights-q3-30b
+2026-10-13 03:11:13,149 INFO       全部就绪
+2026-10-13 03:11:13,153 INFO [2/5] 跳过探测（--load-plan）
+2026-10-13 03:11:13,153 INFO [3/5] 载入清单 qwen3-30b/plan_es90_fill.json：L₀=8，15 个节点，10 条段
+2026-10-13 03:11:13,156 INFO       识别器：LR 5 类 ['gsm8k', 'math', 'mbpp', 'humaneval', 'no_robots']，1024 维（层 0–7，0-based × 128 专家 × count，归一 per_layer，只数 body token） + 仿射预处理，概率 softmax，τ_hi=0.9
+2026-10-13 03:11:13,156 INFO       置信三区 τ_hi=0.90 τ_lo=0.40
+2026-10-13 03:11:13,156 INFO       LR 还认识 ['humaneval', 'math']（没部署）—— 判成它们的请求在已部署的 task 间重归一
+2026-10-13 03:11:13,156 INFO       通道二基线（按 1−覆盖率 估计，偏低，仅供参考）: {'gsm8k': '30.0%', 'mbpp': '30.0%', 'no_robots': '30.0%'}
+2026-10-13 03:11:13,156 INFO       估计值不做告警线 —— 先在线自校准（拿没换过绑的请求实测），攒够 6 条再启用换绑
+2026-10-13 03:11:13,543 INFO       tokenizer: vocab 151669，停止 token [151643, 151645]，套对话模板
+2026-10-13 03:11:13,543 INFO       对话模板 enable_thinking=False（选择器训练时就是非思考模式）
+2026-10-13 03:11:13,545 INFO       逐层统计只数 body token：prompt 按选择器训练时的方式构造，body 区间随 prefill 下发给前段
+2026-10-13 03:11:13,545 INFO [4/5] 下发清单（协调器 192.168.3.4:39045）
+2026-10-13 03:11:16,231 INFO   N01      front/F0     层 1–8     1024 个专家  驻留  9969.9MB（全装  9969.9MB）  加载 2647ms  从 checkpoint 读了 100.0%（1/1 个分片）
+2026-10-13 03:11:19,014 INFO   N10      front/F1     层 1–8     1024 个专家  驻留  9969.9MB（全装  9969.9MB）  加载 2774ms  从 checkpoint 读了 100.0%（1/1 个分片）
+2026-10-13 03:11:21,638 INFO   N11      front/F2     层 1–8     1024 个专家  驻留  9969.9MB（全装  9969.9MB）  加载 2615ms  从 checkpoint 读了 100.0%（1/1 个分片）
+2026-10-13 03:11:24,347 INFO   N12      front/F3     层 1–8     1024 个专家  驻留  9969.9MB（全装  9969.9MB）  加载 2699ms  从 checkpoint 读了 100.0%（1/1 个分片）
+2026-10-13 03:11:28,329 INFO   N15      front/F4     层 1–8     1024 个专家  驻留  9969.9MB（全装  9969.9MB）  加载 3836ms  从 checkpoint 读了 100.0%（1/1 个分片）
+2026-10-13 03:11:30,636 INFO   N03      back:gsm8k/Bgsm8k0 层 9–21    1026 个专家  驻留 10180.2MB（全装 16201.1MB）  加载 2292ms  从 checkpoint 读了 100.0%（1/1 个分片）
+2026-10-13 03:11:35,109 INFO   N05      back:gsm8k/Bgsm8k0 层 22–48   2102 个专家  驻留 20870.6MB（全装 33648.5MB）  加载 4458ms  从 checkpoint 读了 100.0%（1/1 个分片）
+2026-10-13 03:11:37,890 INFO   N04      back:gsm8k/Bgsm8k1 层 9–24    1277 个专家  驻留 12663.8MB（全装 19939.9MB）  加载 2766ms  从 checkpoint 读了 100.0%（1/1 个分片）
+2026-10-13 03:11:42,736 INFO   N02      back:gsm8k/Bgsm8k1 层 25–48   1851 个专家  驻留 18387.0MB（全装 29909.8MB）  加载 4830ms  从 checkpoint 读了 100.0%（1/1 个分片）
+2026-10-13 03:11:44,399 INFO   N06      back:mbpp/Bmbpp0 层 9–22    1111 个专家  驻留 11020.7MB（全装 17447.4MB）  加载 1648ms  从 checkpoint 读了 100.0%（1/1 个分片）
+2026-10-13 03:11:47,861 INFO   N07      back:mbpp/Bmbpp0 层 23–48   2086 个专家  驻留 20681.3MB（全装 32402.3MB）  加载 3444ms  从 checkpoint 读了 100.0%（1/1 个分片）
+2026-10-13 03:11:52,592 INFO   N13      back:mbpp/Bmbpp1 层 9–35    2124 个专家  驻留 21078.2MB（全装 33648.5MB）  加载 4674ms  从 checkpoint 读了 100.0%（1/1 个分片）
+2026-10-13 03:11:55,507 INFO   N14      back:mbpp/Bmbpp1 层 36–48   1073 个专家  驻留 10623.8MB（全装 16201.1MB）  加载 2858ms  从 checkpoint 读了 100.0%（1/1 个分片）
+2026-10-13 03:11:56,431 INFO   N09      back:no_robots/Bno_robots0 层 9–14     395 个专家  驻留  3957.4MB（全装  7477.4MB）  加载 922ms  从 checkpoint 读了 100.0%（1/1 个分片）
+2026-10-13 03:12:00,762 INFO   N08      back:no_robots/Bno_robots0 层 15–48   2069 个专家  驻留 20827.1MB（全装 42372.2MB）  加载 4315ms  从 checkpoint 读了 100.0%（1/1 个分片）
+2026-10-13 03:12:00,767 INFO   通道二：只报警、不换绑（--no-rebind）
+2026-10-13 03:12:00,901 INFO [5/5] 在线服务：0 条请求 × 2048 token，并发 3（池子 5 前段 / {'gsm8k': 2, 'mbpp': 2, 'no_robots': 1} 后段）
+2026-10-13 03:12:00,902 INFO 测试集 TestSamples/cases.jsonl：150 条，其中 150 条带 task 标注
+2026-10-13 03:12:00,902 INFO   --requests 0 < 150 条 —— 只跑前 0 条
+2026-10-13 03:12:00,902 INFO   预热 5 条（不计入结果，每条通道至少一条：{'gsm8k': 2, 'mbpp': 2, 'no_robots': 1}）—— torch 首次前向含 kernel 选择、显存池分配，只发生一次
+2026-10-13 03:12:09,444 INFO   预热完成，开始正式测量
+2026-10-13 03:12:09,447 INFO [连续测试] 150 条请求（池 150 条，顺序 interleave），同时在途 5，最大生成 2048 token，单条超时 3600s
+2026-10-13 03:12:09,447 INFO   请求 task 分布 {'gsm8k': 50, 'mbpp': 50, 'no_robots': 50}；后段通道 {'gsm8k': 2, 'mbpp': 2, 'no_robots': 1}
+2026-10-13 03:12:09,448 INFO   ⚠ 每条通道分到的请求数不均：{'gsm8k': 25.0, 'mbpp': 25.0, 'no_robots': 50.0} —— no_robots 会是瓶颈，它的请求在后段排队
+2026-10-13 03:12:15,644 INFO   req4    F3×Bmbpp1  停于 eos  16 token  首token 3255ms  «```python⏎def remove_even(s):⏎    return s[::2]⏎```»
+2026-10-13 03:12:24,082 INFO   req1    F2×Bmbpp0  停于 eos  99 token  首token 1537ms  «def find_last_occurrence(arr, target):⏎    left, right = 0, len(arr) - 1⏎    res»
+2026-10-13 03:12:46,723 INFO   req2    F1×Bno_robots0  停于 eos  257 token  首token 1390ms  «Absolutely! It's completely normal to feel unsure when starting out, but with pr»
+2026-10-13 03:12:47,267 INFO   req3    F4×Bgsm8k1  停于 eos  224 token  首token 1922ms  «We are given the number of racquets and the time it takes to string each type. W»
+2026-10-13 03:12:56,442 INFO   req7    F1×Bmbpp1  停于 eos  37 token  首token 3387ms  «def dict_depth(d):⏎    if isinstance(d, dict):⏎        return 1 + max((dict_dept»
+2026-10-13 03:12:56,442 INFO   [5/150] 池深 {'waiting_front': 0, 'waiting_back': {'no_robots': 1}, 'free_fronts': 1, 'free_backs': {'gsm8k': 0, 'mbpp': 2, 'no_robots': 0}}
+2026-10-13 03:12:58,528 INFO   req0    F0×Bgsm8k0  停于 eos  368 token  首token 1072ms  «We are given that Elvis has a **monthly saving target of $1125**. He wants to **»
+2026-10-13 03:13:01,940 INFO   req10   F0×Bmbpp0  停于 eos  18 token  首token 1112ms  «def sort_tuple(lst):⏎    return sorted(lst, key=lambda x: x[-1])»
+2026-10-13 03:13:23,598 INFO   req5    F3×Bno_robots0  停于 eos  259 token  首token 31900ms  «1. **"The Notebook" (2009** – A bittersweet love story that follows a man's jour»
+2026-10-13 03:13:24,561 INFO   req6    F2×Bgsm8k1  停于 eos  257 token  首token 24041ms  «We are given the following information:⏎⏎- Each **pole** has **4 street lights**»
+2026-10-13 03:13:31,730 INFO   req13   F2×Bmbpp1  停于 eos  23 token  首token 3220ms  «```python⏎def upper_ctr(s):⏎    return sum(1 for c in s if c.isupper())⏎```»
+2026-10-13 03:13:31,730 INFO   [10/150] 池深 {'waiting_front': 0, 'waiting_back': {'no_robots': 1}, 'free_fronts': 1, 'free_backs': {'gsm8k': 0, 'mbpp': 2, 'no_robots': 0}}
+2026-10-13 03:13:36,247 INFO   req9    F1×Bgsm8k0  停于 eos  265 token  首token 2970ms  «Let's solve the problem step by step.⏎⏎1. **Number of cats**:  ⏎   Larry has 3 c»
+2026-10-13 03:13:44,903 INFO   req8    F4×Bno_robots0  停于 eos  127 token  首token 37041ms  «Beyond the reeds where waters gleam,  ⏎A flock of ducks in morning's beam.  ⏎The»
+2026-10-13 03:13:52,614 INFO   req12   F3×Bgsm8k1  停于 eos  192 token  首token 1843ms  «Let's solve the problem step by step.⏎⏎1. **First bag**:  ⏎   The first bag has »
+2026-10-13 03:13:52,892 INFO   req16   F4×Bmbpp0  停于 eos  40 token  首token 1935ms  «def maximize_elements(t1, t2):⏎    return tuple(tuple(max(a, b) for a, b in zip(»
+2026-10-13 03:14:12,188 INFO   req15   F1×Bgsm8k0  停于 eos  247 token  首token 1512ms  «We are given the following information:⏎⏎- The total goal is **$6300**.⏎- After »
+2026-10-13 03:14:12,188 INFO   [15/150] 池深 {'waiting_front': 0, 'waiting_back': {'no_robots': 2}, 'free_fronts': 1, 'free_backs': {'gsm8k': 1, 'mbpp': 2, 'no_robots': 0}}
+2026-10-13 03:14:19,579 INFO   req19   F1×Bmbpp1  停于 eos  24 token  首token 3351ms  «```python⏎def neg_nos(lst):⏎    return tuple(num for num in lst if num < 0)⏎```»
+2026-10-13 03:14:28,559 INFO   req11   F0×Bno_robots0  停于 eos  311 token  首token 43825ms  «Dear Esteemed Minions of Darkness,⏎⏎I hope this missive finds you in a state of »
+2026-10-13 03:14:39,002 INFO   req18   F4×Bgsm8k1  停于 eos  279 token  首token 1666ms  «Let's solve the problem step by step.⏎⏎### Step 1: Determine the number of days »
+2026-10-13 03:14:43,962 INFO   req22   F4×Bmbpp0  停于 eos  18 token  首token 2149ms  «def check_element(lst, s):⏎    return all(item == s for item in lst)»
+2026-10-13 03:14:57,814 INFO   req21   F0×Bgsm8k0  停于 eos  217 token  首token 1052ms  «Let's solve the problem step by step.⏎⏎1. **Calculate the total earnings from co»
+2026-10-13 03:14:57,814 INFO   [20/150] 池深 {'waiting_front': 0, 'waiting_back': {'no_robots': 3}, 'free_fronts': 1, 'free_backs': {'gsm8k': 2, 'mbpp': 2, 'no_robots': 0}}
+2026-10-13 03:15:31,747 INFO   req14   F2×Bno_robots0  停于 eos  455 token  首token 57534ms  «**International Atomic Time (TAI)** is a time standard based on atomic time, spe»
+2026-10-13 03:15:38,893 INFO   req24   F0×Bgsm8k1  停于 eos  300 token  首token 1135ms  «We are given the following information:⏎⏎- Each **pepper** costs **$15**.⏎- A **»
+2026-10-13 03:15:51,866 INFO   req25   F2×Bmbpp1  停于 eos  98 token  首token 3453ms  «def first_Missing_Positive(nums, n):⏎    for i in range(n):⏎        while 1 <= n»
+2026-10-13 03:16:31,570 INFO   req27   F2×Bgsm8k0  停于 eos  275 token  首token 1600ms  «Let's break down the problem step by step.⏎⏎### Step 1: Determine the amount of »
+2026-10-13 03:16:37,331 INFO   req28   F2×Bmbpp0  停于 eos  26 token  首token 1714ms  «import re⏎⏎def find_char(s):⏎    return re.findall(r'\b\w{3,5}\b', s)»
+2026-10-13 03:16:37,331 INFO   [25/150] 池深 {'waiting_front': 0, 'waiting_back': {'no_robots': 3}, 'free_fronts': 1, 'free_backs': {'gsm8k': 2, 'mbpp': 2, 'no_robots': 0}}
+2026-10-13 03:20:16,868 INFO   req17   F3×Bno_robots0  停于 max_tokens  2048 token  首token 99763ms  «In 1890, the English monarch was **Queen Victoria**.⏎⏎She reigned from 18 May 18»
+2026-10-13 03:20:42,534 INFO   req30   F3×Bgsm8k1  停于 eos  168 token  首token 1709ms  «We are given the following information:⏎⏎- Stanley was at an elevation of **10,0»
+2026-10-13 03:20:51,029 INFO   req31   F3×Bmbpp1  停于 eos  28 token  首token 3706ms  «def substract_elements(t1, t2):⏎    return tuple(a - b for a, b in zip(t1, t2))»
+2026-10-13 03:21:06,280 INFO   req20   F1×Bno_robots0  停于 eos  354 token  首token 357915ms  «A **haiku** is a traditional form of **Japanese poetry** that is known for its b»
+2026-10-13 03:21:44,680 INFO   req23   F4×Bno_robots0  停于 eos  233 token  首token 383083ms  «The very first State of the Union address was given on **January 10, 1797**, by »
+2026-10-13 03:21:44,680 INFO   [30/150] 池深 {'waiting_front': 0, 'waiting_back': {'no_robots': 2}, 'free_fronts': 1, 'free_backs': {'gsm8k': 1, 'mbpp': 2, 'no_robots': 0}}
+2026-10-13 03:21:49,638 INFO   req34   F4×Bmbpp0  停于 eos  21 token  首token 1774ms  «```python⏎def Find_Min_Length(lst):⏎    return min(len(sub) for sub in lst)⏎```»
+2026-10-13 03:21:50,902 INFO   req33   F1×Bgsm8k0  停于 eos  313 token  首token 1430ms  «We are given that:⏎⏎- Vince can staple **30 reports every 15 minutes**.⏎- He wor»
+2026-10-13 03:22:20,020 INFO   req36   F1×Bgsm8k1  停于 eos  194 token  首token 1433ms  «We are given the number of blue birds in different trees and need to find the to»
+2026-10-13 03:22:20,643 INFO   req26   F0×Bno_robots0  停于 eos  252 token  首token 366791ms  «This coat has been a true disappointment, and I'm really struggling to find anyt»
+2026-10-13 03:22:26,992 INFO   req37   F1×Bmbpp1  停于 eos  22 token  首token 3241ms  «```python⏎def perimeter(radius, height):⏎    return 2 * (2 * radius + height)⏎``»
+2026-10-13 03:22:26,992 INFO   [35/150] 池深 {'waiting_front': 0, 'waiting_back': {'no_robots': 3}, 'free_fronts': 1, 'free_backs': {'gsm8k': 2, 'mbpp': 2, 'no_robots': 0}}
+2026-10-13 03:22:39,627 INFO   req29   F2×Bno_robots0  停于 eos  133 token  首token 343963ms  «A scallop has **many eyes**—typically around **100**. These eyes are located alo»
+2026-10-13 03:22:44,208 INFO   req40   F2×Bmbpp0  停于 eos  23 token  首token 1515ms  «def filter_oddnumbers(numbers):⏎    return list(filter(lambda x: x % 2 != 0, num»
+2026-10-13 03:22:59,821 INFO   req32   F3×Bno_robots0  停于 eos  138 token  首token 109459ms  «Creating compelling character backstories for roleplaying games doesn’t have to »
+2026-10-13 03:23:24,868 INFO   req39   F1×Bgsm8k0  停于 eos  404 token  首token 1445ms  «We are given that Marissa is hiking a 12-mile trail. She has already walked:⏎⏎- »
+2026-10-13 03:23:32,960 INFO   req43   F1×Bmbpp1  停于 eos  25 token  首token 3829ms  «def add_K_element(lst, k):⏎    return [tuple(x + k for x in t) for t in lst]»
+2026-10-13 03:23:32,960 INFO   [40/150] 池深 {'waiting_front': 0, 'waiting_back': {'no_robots': 2}, 'free_fronts': 1, 'free_backs': {'gsm8k': 1, 'mbpp': 2, 'no_robots': 0}}
+2026-10-13 03:23:44,327 INFO   req42   F3×Bgsm8k1  停于 eos  304 token  首token 1628ms  «Let's break the problem down step by step.⏎⏎### Step 1: Calculate the total numb»
+2026-10-13 03:23:55,832 INFO   req35   F4×Bno_robots0  停于 eos  343 token  首token 71072ms  «**Dialogue Between a Man and His Thoughts**⏎⏎**D:** (sitting on a park bench, st»
+2026-10-13 03:24:04,365 INFO   req46   F4×Bmbpp0  停于 eos  45 token  首token 1686ms  «```python⏎def count_unset_bits(n):⏎    count = 0⏎    while n:⏎        if not (n »
+2026-10-13 03:24:27,958 INFO   req45   F3×Bgsm8k0  停于 eos  302 token  首token 1574ms  «We are given the following information:⏎⏎- The bamboo grows **30 inches per day*»
+2026-10-13 03:24:38,518 INFO   req38   F0×Bno_robots0  停于 eos  305 token  首token 95806ms  «The **Ombalantu Baobab** is a famous and ancient baobab tree located in **Zambia»
+2026-10-13 03:24:38,518 INFO   [45/150] 池深 {'waiting_front': 0, 'waiting_back': {'no_robots': 2}, 'free_fronts': 1, 'free_backs': {'gsm8k': 1, 'mbpp': 2, 'no_robots': 0}}
+2026-10-13 03:24:46,006 INFO   req49   F0×Bmbpp1  停于 eos  26 token  首token 3114ms  «def multiples_of_num(m, n):⏎    return [n * i for i in range(1, m + 1)]»
+2026-10-13 03:24:54,787 INFO   req48   F3×Bgsm8k1  停于 eos  179 token  首token 1586ms  «We are given the following information:⏎⏎- Each flagstone weighs **75 pounds**.⏎»
+2026-10-13 03:25:32,259 INFO   req51   F3×Bgsm8k0  停于 eos  259 token  首token 1615ms  «Let's break down the problem step by step.⏎⏎### Step 1: Understand the pricing s»
+2026-10-13 03:26:00,280 INFO   req52   F3×Bmbpp0  停于 eos  197 token  首token 1623ms  «```python⏎def count_Intgral_Points(x1, y1, x2, y2):⏎    # Calculate the number o»
+2026-10-13 03:29:18,934 INFO   req41   F2×Bno_robots0  停于 max_tokens  2048 token  首token 115225ms  «The capital of Tasmania is **Hobart**.⏎⏎As of December 2021, the population of T»
+2026-10-13 03:29:18,934 INFO   [50/150] 池深 {'waiting_front': 0, 'waiting_back': {'no_robots': 3}, 'free_fronts': 1, 'free_backs': {'gsm8k': 2, 'mbpp': 2, 'no_robots': 0}}
+2026-10-13 03:29:39,145 INFO   req44   F1×Bno_robots0  停于 eos  139 token  首token 347009ms  «After World War II, state governments managed daylight saving time (DST), causin»
+2026-10-13 03:29:50,111 INFO   req55   F1×Bmbpp1  停于 eos  45 token  首token 3268ms  «```python⏎def even_bit_toggle_number(n):⏎    mask = 0xAAAAAAAA  # Mask with 1s i»
+2026-10-13 03:30:13,509 INFO   req47   F4×Bno_robots0  停于 eos  209 token  首token 335491ms  «Japan is comprised of **over 1,000 islands**, with the **main islands** being th»
+2026-10-13 03:30:28,653 INFO   req54   F2×Bgsm8k1  停于 eos  486 token  首token 1471ms  «We are given:⏎⏎- 10 liters of orange drink that is **two-thirds water**.⏎- 15 li»
+2026-10-13 03:30:38,529 INFO   req58   F2×Bmbpp0  停于 eos  63 token  首token 1492ms  «```python⏎def find_Min(arr, low, high):⏎    while low < high:⏎        mid = (low»
+2026-10-13 03:30:38,529 INFO   [55/150] 池深 {'waiting_front': 0, 'waiting_back': {'no_robots': 2}, 'free_fronts': 1, 'free_backs': {'gsm8k': 1, 'mbpp': 2, 'no_robots': 0}}
+2026-10-13 03:30:58,049 INFO   req57   F4×Bgsm8k0  停于 eos  271 token  首token 1677ms  «Let's solve the problem step by step.⏎⏎---⏎⏎### Step 1: Find the total number of»
+2026-10-13 03:31:30,106 INFO   req60   F4×Bgsm8k1  停于 eos  191 token  首token 1743ms  «Let's solve the problem step by step.⏎⏎### Step 1: Calculate how much Jairus ear»
+2026-10-13 03:31:37,014 INFO   req61   F4×Bmbpp1  停于 eos  24 token  首token 3435ms  «def sub_list(a, b):⏎    return list(map(lambda x, y: x - y, a, b))»
+2026-10-13 03:32:27,988 INFO   req50   F0×Bno_robots0  停于 eos  976 token  首token 328883ms  «**Study Notes: Biblical Depiction of Angels**⏎⏎---⏎⏎### **1. Common Depiction of»
+2026-10-13 03:33:20,770 INFO   req63   F0×Bgsm8k0  停于 eos  389 token  首token 1113ms  «We are given the following:⏎⏎- **Super ticket**: $20 (includes any movie, and on»
+2026-10-13 03:33:20,770 INFO   [60/150] 池深 {'waiting_front': 0, 'waiting_back': {'no_robots': 3}, 'free_fronts': 1, 'free_backs': {'gsm8k': 2, 'mbpp': 2, 'no_robots': 0}}
+2026-10-13 03:33:32,537 INFO   req64   F0×Bmbpp0  停于 eos  83 token  首token 1131ms  «```python⏎def max_Abs_Diff(arr, n):⏎    min_val = arr[0]⏎    max_diff = 0⏎    fo»
+2026-10-13 03:34:28,989 INFO   req53   F3×Bno_robots0  停于 eos  870 token  首token 388553ms  «Ah, a question that touches on the very heart of aviation design — the eternal d»
+2026-10-13 03:34:50,677 INFO   req56   F1×Bno_robots0  停于 eos  152 token  首token 279650ms  «Dear Lucy,⏎⏎I hope this message finds you in peace. I just wanted to take a mome»
+2026-10-13 03:34:52,986 INFO   req66   F3×Bgsm8k1  停于 eos  158 token  首token 1573ms  «Let's break down the problem step by step.⏎⏎1. **Tuesday's practice**:  ⏎   Hall»
+2026-10-13 03:34:59,229 INFO   req67   F1×Bmbpp1  停于 eos  29 token  首token 3630ms  «def extract_min_max(t, k):⏎    sorted_t = sorted(t)⏎    return tuple(sorted_t[:k»
+2026-10-13 03:34:59,229 INFO   [65/150] 池深 {'waiting_front': 0, 'waiting_back': {'no_robots': 3}, 'free_fronts': 1, 'free_backs': {'gsm8k': 2, 'mbpp': 2, 'no_robots': 0}}
+2026-10-13 03:35:47,509 INFO   req69   F1×Bgsm8k0  停于 eos  334 token  首token 1457ms  «We are given the following information:⏎⏎- Each person consumes **0.2 kg of rice»
+2026-10-13 03:35:48,432 INFO   req59   F2×Bno_robots0  停于 eos  417 token  首token 252934ms  «Ah, the sweet nectar of the flowers, the golden treasure of the hive! As a bear,»
+2026-10-13 03:35:57,690 INFO   req70   F1×Bmbpp0  停于 eos  64 token  首token 1615ms  «def tuple_intersection(list1, list2):⏎    set1 = {frozenset(t) for t in list1}⏎ »
+2026-10-13 03:35:59,777 INFO   req62   F4×Bno_robots0  停于 eos  64 token  首token 252515ms  «Former Florida Democratic gubernatorial candidate Andrew Gillum was acquitted of»
+2026-10-13 03:36:06,824 INFO   req73   F4×Bmbpp1  停于 eos  24 token  首token 3612ms  «def sort_sublists(lst):⏎    return [sorted(sublist, key=lambda x: x) for sublist»
+2026-10-13 03:36:06,824 INFO   [70/150] 池深 {'waiting_front': 0, 'waiting_back': {'no_robots': 2}, 'free_fronts': 1, 'free_backs': {'gsm8k': 1, 'mbpp': 2, 'no_robots': 0}}
+2026-10-13 03:36:27,869 INFO   req65   F0×Bno_robots0  停于 eos  197 token  首token 148266ms  «An electric locomotive draws power from overhead electrical equipment (OHE) usin»
+2026-10-13 03:36:57,865 INFO   req75   F0×Bgsm8k0  停于 eos  217 token  首token 1062ms  «Let's solve the problem step by step.⏎⏎### Step 1: Find the total cost⏎The fruit»
+2026-10-13 03:36:59,069 INFO   req68   F3×Bno_robots0  停于 eos  218 token  首token 95665ms  «The **Mohawk River** and the **Hudson River** come together at **Waterloo, New Y»
+2026-10-13 03:37:01,677 INFO   req76   F0×Bmbpp0  停于 eos  22 token  首token 1079ms  «```python⏎def check_equilateral(a, b, c):⏎    return a == b == c⏎```»
+2026-10-13 03:37:04,972 INFO   req72   F1×Bgsm8k1  停于 eos  468 token  首token 1471ms  «We are given the following information:⏎⏎- Both pools have leaks that empty them»
+2026-10-13 03:37:04,973 INFO   [75/150] 池深 {'waiting_front': 0, 'waiting_back': {'no_robots': 2}, 'free_fronts': 1, 'free_backs': {'gsm8k': 1, 'mbpp': 2, 'no_robots': 0}}
+2026-10-13 03:37:15,477 INFO   req79   F1×Bmbpp1  停于 eos  39 token  首token 3852ms  «def add_nested_tuples(t1, t2):⏎    return tuple(tuple(a + b for a, b in zip(t1[i»
+2026-10-13 03:37:35,942 INFO   req78   F0×Bgsm8k0  停于 eos  249 token  首token 1058ms  «Let's solve the problem step by step.⏎⏎### Step 1: Identify the speeds of the tw»
+2026-10-13 03:38:14,615 INFO   req71   F2×Bno_robots0  停于 eos  550 token  首token 71412ms  «Atlanta is a great city for families, offering a mix of fun, educational, and ex»
+2026-10-13 03:38:19,574 INFO   req82   F2×Bmbpp0  停于 eos  25 token  首token 1608ms  «def remove_column(lst, col):⏎    return [row[:col] + row[col+1:] for row in lst]»
+2026-10-13 03:38:39,715 INFO   req81   F0×Bgsm8k1  停于 eos  469 token  首token 1115ms  «We are given the following information:⏎⏎- Aaron and Vanessa are relay race part»
+2026-10-13 03:38:39,715 INFO   [80/150] 池深 {'waiting_front': 0, 'waiting_back': {'no_robots': 3}, 'free_fronts': 1, 'free_backs': {'gsm8k': 2, 'mbpp': 2, 'no_robots': 0}}
+2026-10-13 03:39:23,596 INFO   req84   F0×Bgsm8k0  停于 eos  324 token  首token 1100ms  «Let's break the problem into parts and solve it step by step.⏎⏎---⏎⏎### **Part 1»
+2026-10-13 03:39:42,025 INFO   req85   F0×Bmbpp1  停于 eos  92 token  首token 3231ms  «def shell_sort(arr):⏎    n = len(arr)⏎    gap = n // 2⏎    while gap > 0:⏎      »
+2026-10-13 03:41:32,728 INFO   req74   F4×Bno_robots0  停于 eos  1223 token  首token 128761ms  «That's a great goal! Making small, consistent changes can add up to a significan»
+2026-10-13 03:42:05,146 INFO   req77   F3×Bno_robots0  停于 eos  229 token  首token 274333ms  «The land animal that can hold its breath underwater the longest is the **African»
+2026-10-13 03:42:09,507 INFO   req88   F3×Bmbpp0  停于 eos  20 token  首token 1700ms  «def intersection_array(a, b):⏎    return list(filter(lambda x: x in b, a))»
+2026-10-13 03:42:09,508 INFO   [85/150] 池深 {'waiting_front': 0, 'waiting_back': {'no_robots': 2}, 'free_fronts': 1, 'free_backs': {'gsm8k': 1, 'mbpp': 2, 'no_robots': 0}}
+2026-10-13 03:42:27,705 INFO   req87   F4×Bgsm8k1  停于 eos  335 token  首token 1701ms  «We are given the following:⏎⏎- Chips cost **40 cents** each.⏎- Candy bars cost *»
+2026-10-13 03:42:36,262 INFO   req80   F1×Bno_robots0  停于 eos  221 token  首token 290528ms  «This was it. The apple trembled as it tumbled from the branch, the world spinnin»
+2026-10-13 03:42:49,452 INFO   req91   F1×Bmbpp1  停于 eos  58 token  首token 3302ms  «```python⏎def next_smallest_palindrome(n):⏎    def is_palindrome(x):⏎        ret»
+2026-10-13 03:43:12,643 INFO   req83   F2×Bno_robots0  停于 eos  259 token  首token 257496ms  «Twelve-year-old Milo had a problem. He’d accidentally knocked over a jar of his »
+2026-10-13 03:43:16,256 INFO   req90   F4×Bgsm8k0  停于 eos  297 token  首token 1811ms  «We are given a description of how a **32-page tabloid** is printed using a **sim»
+2026-10-13 03:43:16,257 INFO   [90/150] 池深 {'waiting_front': 0, 'waiting_back': {'no_robots': 2}, 'free_fronts': 1, 'free_backs': {'gsm8k': 1, 'mbpp': 2, 'no_robots': 0}}
+2026-10-13 03:43:32,199 INFO   req94   F4×Bmbpp0  停于 eos  94 token  首token 1710ms  «```python⏎def max_volume(s):⏎    if s < 3:⏎        return 0⏎    max_vol = 0⏎    »
+2026-10-13 03:44:12,120 INFO   req93   F2×Bgsm8k1  停于 eos  403 token  首token 1492ms  «Let's break down the problem step by step.⏎⏎---⏎⏎### Step 1: Initial situation⏎-»
+2026-10-13 03:45:03,489 INFO   req96   F2×Bgsm8k0  停于 eos  363 token  首token 1456ms  «Let's break down the problem step by step.⏎⏎---⏎⏎### Step 1: Understand the init»
+2026-10-13 03:45:31,643 INFO   req97   F2×Bmbpp1  停于 eos  144 token  首token 3639ms  «def pancake_sort(arr):⏎    def flip(arr, i):⏎        left, right = 0, i⏎        »
+2026-10-13 03:47:52,818 INFO   req86   F0×Bno_robots0  停于 max_tokens  2048 token  首token 211490ms  «**Logbook Entry: 01-17-2017**  ⏎**Location: 1771 Ave. (Sector 12)**  ⏎**Observer»
+2026-10-13 03:47:52,819 INFO   [95/150] 池深 {'waiting_front': 0, 'waiting_back': {'no_robots': 3}, 'free_fronts': 1, 'free_backs': {'gsm8k': 2, 'mbpp': 2, 'no_robots': 0}}
+2026-10-13 03:48:13,830 INFO   req89   F3×Bno_robots0  停于 eos  145 token  首token 344054ms  «Of golden hues and autumn's grace,  ⏎Crimple petals in a vibrant embrace.  ⏎Radi»
+2026-10-13 03:48:17,888 INFO   req100  F3×Bmbpp0  停于 eos  17 token  首token 1761ms  «def Sort(lst):⏎    return sorted(lst, key=lambda x: x[1])»
+2026-10-13 03:48:27,349 INFO   req92   F1×Bno_robots0  停于 eos  92 token  首token 325217ms  «Indulge in the ultimate sweet sensation with **Caramel Coco Delight**—a velvety »
+2026-10-13 03:48:54,241 INFO   req99   F0×Bgsm8k1  停于 eos  453 token  首token 1120ms  «Let's solve the problem step by step.⏎⏎---⏎⏎### **Step 1: Calculate the total nu»
+2026-10-13 03:49:00,791 INFO   req103  F0×Bmbpp1  停于 eos  22 token  首token 2926ms  «def round_num(num, multiple):⏎    return (num + (multiple // 2)) // multiple * m»
+2026-10-13 03:49:00,791 INFO   [100/150] 池深 {'waiting_front': 0, 'waiting_back': {'no_robots': 2}, 'free_fronts': 1, 'free_backs': {'gsm8k': 1, 'mbpp': 2, 'no_robots': 0}}
+2026-10-13 03:49:07,323 INFO   req102  F1×Bgsm8k0  停于 eos  275 token  首token 1523ms  «Let's break down the problem step by step to find the total cost.⏎⏎### Step 1: C»
+2026-10-13 03:49:36,728 INFO   req105  F1×Bgsm8k1  停于 eos  197 token  首token 1526ms  «Let's solve the problem step by step.⏎⏎### Step 1: Determine the number of plant»
+2026-10-13 03:49:39,781 INFO   req106  F1×Bmbpp0  停于 eos  12 token  首token 1439ms  «def swap_numbers(a, b):⏎    return b, a»
+2026-10-13 03:50:30,598 INFO   req95   F4×Bno_robots0  停于 eos  762 token  首token 295870ms  «Whether you should purchase dental insurance depends on your individual needs, f»
+2026-10-13 03:50:57,693 INFO   req108  F4×Bgsm8k0  停于 eos  162 token  首token 1690ms  «We are given the number of puppies and the number of spotted puppies for two dog»
+2026-10-13 03:50:57,693 INFO   [105/150] 池深 {'waiting_front': 0, 'waiting_back': {'no_robots': 3}, 'free_fronts': 1, 'free_backs': {'gsm8k': 2, 'mbpp': 2, 'no_robots': 0}}
+2026-10-13 03:51:10,928 INFO   req109  F4×Bmbpp1  停于 eos  67 token  首token 3594ms  «def check_triplet(arr, a, b, c):⏎    seen = set()⏎    for i in range(len(arr)):⏎»
+2026-10-13 03:51:15,509 INFO   req98   F2×Bno_robots0  停于 eos  320 token  首token 299742ms  «Yes, your friend is **right** — the Eiffel Tower **does** get taller in the summ»
+2026-10-13 03:51:58,258 INFO   req101  F3×Bno_robots0  停于 eos  306 token  首token 178437ms  «Here is a classification of the books you listed as **fiction** or **non-fiction»
+2026-10-13 03:52:02,457 INFO   req112  F3×Bmbpp0  停于 eos  20 token  首token 1513ms  «def remove_lowercase(s):⏎    return ''.join(c for c in s if not c.islower())»
+2026-10-13 03:52:03,044 INFO   req111  F2×Bgsm8k1  停于 eos  328 token  首token 1451ms  «We are given the following information:⏎⏎- The custodian has **80 classrooms** t»
+2026-10-13 03:52:03,044 INFO   [110/150] 池深 {'waiting_front': 0, 'waiting_back': {'no_robots': 2}, 'free_fronts': 1, 'free_backs': {'gsm8k': 2, 'mbpp': 2, 'no_robots': 0}}
+2026-10-13 03:52:32,867 INFO   req104  F0×Bno_robots0  停于 eos  249 token  首token 178132ms  «In 2020, the top-selling manga in Japan was **"Demon Slayer" (Kakosuke no Oni)"*»
+2026-10-13 03:52:40,662 INFO   req115  F0×Bmbpp1  停于 eos  27 token  首token 3383ms  «def trim_tuple(tuples, k):⏎    return str([tuple(t[k:-k] if k else t for t in tu»
+2026-10-13 03:52:44,785 INFO   req107  F1×Bno_robots0  停于 eos  80 token  首token 173932ms  «Did you know that cats are basically professional nappers? They spend about 70% »
+2026-10-13 03:53:03,067 INFO   req114  F2×Bgsm8k0  停于 eos  423 token  首token 1491ms  «We are given the following information:⏎⏎- The **pyramids** are at an angle of *»
+2026-10-13 03:53:05,095 INFO   req117  F1×Bgsm8k1  停于 eos  135 token  首token 1439ms  «Shiela is required to submit a 15-page research paper. She has already finished »
+2026-10-13 03:53:05,095 INFO   [115/150] 池深 {'waiting_front': 0, 'waiting_back': {'no_robots': 2}, 'free_fronts': 1, 'free_backs': {'gsm8k': 2, 'mbpp': 1, 'no_robots': 0}}
+2026-10-13 03:53:15,597 INFO   req118  F2×Bmbpp0  停于 eos  83 token  首token 1432ms  «```python⏎def swap_count(s):⏎    swap = 0⏎    open_count = 0⏎    close_count = 0»
+2026-10-13 03:54:10,310 INFO   req110  F4×Bno_robots0  停于 eos  521 token  首token 94853ms  «**Book Review: *Soggy Yellow Spuds* by Eleanor M. Whitlow**⏎⏎As a middle-aged wo»
+2026-10-13 03:54:11,293 INFO   req120  F2×Bgsm8k0  停于 eos  389 token  首token 1533ms  «Let's solve the problem step by step.⏎⏎---⏎⏎### **Step 1: Calculate the cost of »
+2026-10-13 03:54:20,812 INFO   req121  F4×Bmbpp1  停于 eos  50 token  首token 3332ms  «def same_order(list1, list2):⏎    set1 = set(list1)⏎    common = [x for x in lis»
+2026-10-13 03:54:43,764 INFO   req113  F3×Bno_robots0  停于 eos  235 token  首token 128674ms  «Absolutely! Here's a fun and enthusiastic Facebook post you can use:⏎⏎---⏎⏎🌸🌸🌸⏎⏎»
+2026-10-13 03:54:43,764 INFO   [120/150] 池深 {'waiting_front': 0, 'waiting_back': {'no_robots': 2}, 'free_fronts': 1, 'free_backs': {'gsm8k': 1, 'mbpp': 2, 'no_robots': 0}}
+2026-10-13 03:54:45,976 INFO   req123  F4×Bgsm8k1  停于 eos  146 token  首token 1716ms  «We are given that:⏎⏎- Ashley's pizza delivery costs **$15**.⏎- She wants to give»
+2026-10-13 03:54:56,927 INFO   req124  F3×Bmbpp0  停于 eos  85 token  首token 1727ms  «```python⏎def longest_subseq_with_diff_one(arr, n):⏎    if n == 0:⏎        retur»
+2026-10-13 03:54:58,636 INFO   req116  F0×Bno_robots0  停于 eos  98 token  首token 124266ms  «In 1928, Anna May Wong moved to Europe, where she acted in films and plays in th»
+2026-10-13 03:55:07,895 INFO   req127  F0×Bmbpp1  停于 eos  38 token  首token 2982ms  «```python⏎def highest_Power_of_2(n):⏎    power = 1⏎    while power * 2 <= n:⏎   »
+2026-10-13 03:55:17,960 INFO   req119  F1×Bno_robots0  停于 eos  134 token  首token 114353ms  «Certainly. Here's a brief and professional resignation letter that you can use:⏎»
+2026-10-13 03:55:17,960 INFO   [125/150] 池深 {'waiting_front': 0, 'waiting_back': {'no_robots': 2}, 'free_fronts': 1, 'free_backs': {'gsm8k': 1, 'mbpp': 2, 'no_robots': 0}}
+2026-10-13 03:55:28,325 INFO   req122  F2×Bno_robots0  停于 eos  69 token  首token 67463ms  «A statistical learning model is created by first gathering a large amount of dat»
+2026-10-13 03:55:36,218 INFO   req130  F2×Bmbpp0  停于 eos  49 token  首token 1405ms  «```python⏎import re⏎⏎def text_lowercase_underscore(text):⏎    if re.fullmatch(r'»
+2026-10-13 03:55:39,079 INFO   req126  F3×Bgsm8k0  停于 eos  289 token  首token 1592ms  «Let's solve the problem step by step.⏎⏎### Step 1: Initial Investment⏎Maria buys»
+2026-10-13 03:55:48,990 INFO   req125  F4×Bno_robots0  停于 eos  120 token  首token 43186ms  «**Verse:**  ⏎I was walking down the hallway, lost in my own thoughts,  ⏎A little»
+2026-10-13 03:56:00,931 INFO   req133  F4×Bmbpp1  停于 eos  59 token  首token 3359ms  «```python⏎def count_With_Odd_SetBits(n):⏎    count = 0⏎    for i in range(1, n +»
+2026-10-13 03:56:00,931 INFO   [130/150] 池深 {'waiting_front': 0, 'waiting_back': {'no_robots': 1}, 'free_fronts': 1, 'free_backs': {'gsm8k': 0, 'mbpp': 2, 'no_robots': 0}}
+2026-10-13 03:56:10,149 INFO   req128  F0×Bno_robots0  停于 eos  146 token  首token 42006ms  «Zine Magazine here, and I’m here to talk about a debut that’s got the world buzz»
+2026-10-13 03:56:15,311 INFO   req129  F1×Bgsm8k1  停于 eos  395 token  首token 1525ms  «We are given the following information:⏎⏎- Soledad wants to hike **9,300 miles**»
+2026-10-13 03:56:21,454 INFO   req136  F1×Bmbpp0  停于 eos  35 token  首token 1469ms  «```python⏎def count_Odd_Squares(start, end):⏎    return int(end**0.5) - int((sta»
+2026-10-13 03:56:30,992 INFO   req132  F3×Bgsm8k0  停于 eos  356 token  首token 1647ms  «Let's solve the problem step by step.⏎⏎---⏎⏎### Step 1: Determine the number of »
+2026-10-13 03:56:49,807 INFO   req135  F0×Bgsm8k1  停于 eos  253 token  首token 6009ms  «Let's solve the problem step by step.⏎⏎### Step 1: Determine the cost of 4 packs»
+2026-10-13 03:56:49,807 INFO   [135/150] 池深 {'waiting_front': 0, 'waiting_back': {'no_robots': 2}, 'free_fronts': 1, 'free_backs': {'gsm8k': 1, 'mbpp': 2, 'no_robots': 0}}
+2026-10-13 03:56:59,393 INFO   req139  F0×Bmbpp1  停于 eos  39 token  首token 3142ms  «```python⏎def char_frequency(s):⏎    frequency = {}⏎    for char in s:⏎        f»
+2026-10-13 03:57:02,344 INFO   req131  F2×Bno_robots0  停于 eos  372 token  首token 34686ms  «That sounds like a great way to spend quality time with your family! Here are fi»
+2026-10-13 03:57:04,431 INFO   req138  F3×Bgsm8k0  停于 eos  226 token  首token 1540ms  «We are given the following information:⏎⏎- Jordan plays video games for **2 hour»
+2026-10-13 03:57:29,051 INFO   req142  F3×Bmbpp0  停于 eos  163 token  首token 1878ms  «def rearrange_bigger(n):⏎    digits = list(str(n))⏎    length = len(digits)⏎    »
+2026-10-13 03:58:08,049 INFO   req141  F2×Bgsm8k1  停于 eos  450 token  首token 1434ms  «We are given the following:⏎⏎- Principal (P) = $3,650  ⏎- Time (T) = 5 months  ⏎»
+2026-10-13 03:58:08,049 INFO   [140/150] 池深 {'waiting_front': 0, 'waiting_back': {'no_robots': 3}, 'free_fronts': 1, 'free_backs': {'gsm8k': 2, 'mbpp': 2, 'no_robots': 0}}
+2026-10-13 03:58:21,123 INFO   req134  F4×Bno_robots0  停于 eos  473 token  首token 62349ms  «That's a great goal! Here are **three apps** that can help you **increase your p»
+2026-10-13 03:58:29,275 INFO   req145  F4×Bmbpp1  停于 eos  33 token  首token 3391ms  «```python⏎def find_missing(arr, n):⏎    total = n * (n + 1) // 2⏎    return tota»
+2026-10-13 03:58:50,178 INFO   req144  F2×Bgsm8k0  停于 eos  289 token  首token 1543ms  «We are given the following information:⏎⏎- The dragon, Perg, can breathe fire up»
+2026-10-13 03:59:30,597 INFO   req147  F2×Bgsm8k1  停于 eos  279 token  首token 1449ms  «We are given the following information:⏎⏎- John buys **3 large bags** of M&Ms.⏎-»
+2026-10-13 03:59:34,169 INFO   req137  F1×Bno_robots0  停于 eos  526 token  首token 120403ms  «**The Daily Chronicle**  ⏎*April 1st, 1899*  ⏎**Local News**⏎⏎**Humpty Dumpty Fa»
+2026-10-13 03:59:34,170 INFO   [145/150] 池深 {'waiting_front': 0, 'waiting_back': {'no_robots': 2}, 'free_fronts': 1, 'free_backs': {'gsm8k': 2, 'mbpp': 1, 'no_robots': 0}}
+2026-10-13 03:59:35,660 INFO   req148  F2×Bmbpp0  停于 eos  27 token  首token 1465ms  «```python⏎def find_star_num(n):⏎    return 6 * n * (n - 1) + 1⏎```»
+2026-10-13 04:01:00,960 INFO   req140  F0×Bno_robots0  停于 eos  627 token  首token 155544ms  «**Local News 7: "The Fight Scene"**  ⏎*Anchor: Rose Nylund*  ⏎*Location: St. Ola»
+2026-10-13 04:02:12,712 INFO   req143  F3×Bno_robots0  停于 eos  506 token  首token 212731ms  «The man sat at his desk, staring at the screen as if it might offer him some for»
+2026-10-13 04:02:25,428 INFO   req146  F4×Bno_robots0  停于 eos  71 token  首token 224625ms  «The Fox tricks the Stork by serving soup in a shallow dish, preventing the Stork»
+2026-10-13 04:07:09,564 INFO   req149  F1×Bno_robots0  停于 max_tokens  2048 token  首token 171986ms  «Sure! Here's a simple application using **Vue 3** that displays a number and all»
+2026-10-13 04:07:09,564 INFO   [150/150] 池深 {'waiting_front': 0, 'waiting_back': {}, 'free_fronts': 5, 'free_backs': {'gsm8k': 2, 'mbpp': 2, 'no_robots': 1}}
+2026-10-13 04:07:09,899 INFO 汇总[weights-q3-30b/torch]：识别 150/150，逐 token p50 139ms，换绑 0 次
+2026-10-13 04:07:09,900 INFO       其中 LR 自己判的类（含没部署的类）147/150 = 98% —— 上面的「识别」是路由对不对，没部署的类永远算错
+2026-10-13 04:07:09,900 INFO 配对历史（每条请求用了哪对段）：
+2026-10-13 04:07:09,900 INFO     req0    F0 × Bgsm8k0  (gsm8k)
+2026-10-13 04:07:09,900 INFO     req2    F1 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,900 INFO     req1    F2 × Bmbpp0  (mbpp)
+2026-10-13 04:07:09,900 INFO     req4    F3 × Bmbpp1  (mbpp)
+2026-10-13 04:07:09,900 INFO     req3    F4 × Bgsm8k1  (gsm8k)
+2026-10-13 04:07:09,900 INFO     req5    F3 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,900 INFO     req6    F2 × Bgsm8k1  (gsm8k)
+2026-10-13 04:07:09,900 INFO     req7    F1 × Bmbpp1  (mbpp)
+2026-10-13 04:07:09,900 INFO     req9    F1 × Bgsm8k0  (gsm8k)
+2026-10-13 04:07:09,900 INFO     req10   F0 × Bmbpp0  (mbpp)
+2026-10-13 04:07:09,900 INFO     req8    F4 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,900 INFO     req12   F3 × Bgsm8k1  (gsm8k)
+2026-10-13 04:07:09,900 INFO     req13   F2 × Bmbpp1  (mbpp)
+2026-10-13 04:07:09,900 INFO     req15   F1 × Bgsm8k0  (gsm8k)
+2026-10-13 04:07:09,900 INFO     req11   F0 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,900 INFO     req16   F4 × Bmbpp0  (mbpp)
+2026-10-13 04:07:09,900 INFO     req18   F4 × Bgsm8k1  (gsm8k)
+2026-10-13 04:07:09,900 INFO     req19   F1 × Bmbpp1  (mbpp)
+2026-10-13 04:07:09,901 INFO     req14   F2 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,901 INFO     req21   F0 × Bgsm8k0  (gsm8k)
+2026-10-13 04:07:09,901 INFO     req22   F4 × Bmbpp0  (mbpp)
+2026-10-13 04:07:09,901 INFO     req24   F0 × Bgsm8k1  (gsm8k)
+2026-10-13 04:07:09,901 INFO     req17   F3 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,901 INFO     req25   F2 × Bmbpp1  (mbpp)
+2026-10-13 04:07:09,901 INFO     req27   F2 × Bgsm8k0  (gsm8k)
+2026-10-13 04:07:09,901 INFO     req28   F2 × Bmbpp0  (mbpp)
+2026-10-13 04:07:09,901 INFO     req20   F1 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,901 INFO     req30   F3 × Bgsm8k1  (gsm8k)
+2026-10-13 04:07:09,901 INFO     req31   F3 × Bmbpp1  (mbpp)
+2026-10-13 04:07:09,901 INFO     req23   F4 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,901 INFO     req33   F1 × Bgsm8k0  (gsm8k)
+2026-10-13 04:07:09,901 INFO     req26   F0 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,901 INFO     req34   F4 × Bmbpp0  (mbpp)
+2026-10-13 04:07:09,901 INFO     req36   F1 × Bgsm8k1  (gsm8k)
+2026-10-13 04:07:09,901 INFO     req29   F2 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,901 INFO     req37   F1 × Bmbpp1  (mbpp)
+2026-10-13 04:07:09,901 INFO     req39   F1 × Bgsm8k0  (gsm8k)
+2026-10-13 04:07:09,901 INFO     req32   F3 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,901 INFO     req40   F2 × Bmbpp0  (mbpp)
+2026-10-13 04:07:09,901 INFO     req35   F4 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,901 INFO     req42   F3 × Bgsm8k1  (gsm8k)
+2026-10-13 04:07:09,901 INFO     req43   F1 × Bmbpp1  (mbpp)
+2026-10-13 04:07:09,901 INFO     req45   F3 × Bgsm8k0  (gsm8k)
+2026-10-13 04:07:09,902 INFO     req38   F0 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,902 INFO     req46   F4 × Bmbpp0  (mbpp)
+2026-10-13 04:07:09,902 INFO     req48   F3 × Bgsm8k1  (gsm8k)
+2026-10-13 04:07:09,902 INFO     req41   F2 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,902 INFO     req49   F0 × Bmbpp1  (mbpp)
+2026-10-13 04:07:09,902 INFO     req51   F3 × Bgsm8k0  (gsm8k)
+2026-10-13 04:07:09,902 INFO     req52   F3 × Bmbpp0  (mbpp)
+2026-10-13 04:07:09,902 INFO     req44   F1 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,902 INFO     req54   F2 × Bgsm8k1  (gsm8k)
+2026-10-13 04:07:09,902 INFO     req47   F4 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,902 INFO     req55   F1 × Bmbpp1  (mbpp)
+2026-10-13 04:07:09,902 INFO     req50   F0 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,902 INFO     req57   F4 × Bgsm8k0  (gsm8k)
+2026-10-13 04:07:09,902 INFO     req58   F2 × Bmbpp0  (mbpp)
+2026-10-13 04:07:09,902 INFO     req60   F4 × Bgsm8k1  (gsm8k)
+2026-10-13 04:07:09,902 INFO     req61   F4 × Bmbpp1  (mbpp)
+2026-10-13 04:07:09,902 INFO     req53   F3 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,902 INFO     req63   F0 × Bgsm8k0  (gsm8k)
+2026-10-13 04:07:09,902 INFO     req64   F0 × Bmbpp0  (mbpp)
+2026-10-13 04:07:09,902 INFO     req56   F1 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,902 INFO     req66   F3 × Bgsm8k1  (gsm8k)
+2026-10-13 04:07:09,902 INFO     req59   F2 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,902 INFO     req67   F1 × Bmbpp1  (mbpp)
+2026-10-13 04:07:09,902 INFO     req69   F1 × Bgsm8k0  (gsm8k)
+2026-10-13 04:07:09,902 INFO     req70   F1 × Bmbpp0  (mbpp)
+2026-10-13 04:07:09,903 INFO     req62   F4 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,903 INFO     req72   F1 × Bgsm8k1  (gsm8k)
+2026-10-13 04:07:09,903 INFO     req65   F0 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,903 INFO     req73   F4 × Bmbpp1  (mbpp)
+2026-10-13 04:07:09,903 INFO     req68   F3 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,903 INFO     req75   F0 × Bgsm8k0  (gsm8k)
+2026-10-13 04:07:09,903 INFO     req76   F0 × Bmbpp0  (mbpp)
+2026-10-13 04:07:09,903 INFO     req71   F2 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,903 INFO     req78   F0 × Bgsm8k0  (gsm8k)
+2026-10-13 04:07:09,903 INFO     req79   F1 × Bmbpp1  (mbpp)
+2026-10-13 04:07:09,903 INFO     req81   F0 × Bgsm8k1  (gsm8k)
+2026-10-13 04:07:09,903 INFO     req74   F4 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,903 INFO     req82   F2 × Bmbpp0  (mbpp)
+2026-10-13 04:07:09,903 INFO     req84   F0 × Bgsm8k0  (gsm8k)
+2026-10-13 04:07:09,903 INFO     req85   F0 × Bmbpp1  (mbpp)
+2026-10-13 04:07:09,903 INFO     req77   F3 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,903 INFO     req87   F4 × Bgsm8k1  (gsm8k)
+2026-10-13 04:07:09,903 INFO     req80   F1 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,903 INFO     req88   F3 × Bmbpp0  (mbpp)
+2026-10-13 04:07:09,903 INFO     req90   F4 × Bgsm8k0  (gsm8k)
+2026-10-13 04:07:09,903 INFO     req83   F2 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,903 INFO     req91   F1 × Bmbpp1  (mbpp)
+2026-10-13 04:07:09,903 INFO     req86   F0 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,903 INFO     req93   F2 × Bgsm8k1  (gsm8k)
+2026-10-13 04:07:09,904 INFO     req94   F4 × Bmbpp0  (mbpp)
+2026-10-13 04:07:09,904 INFO     req96   F2 × Bgsm8k0  (gsm8k)
+2026-10-13 04:07:09,904 INFO     req97   F2 × Bmbpp1  (mbpp)
+2026-10-13 04:07:09,904 INFO     req89   F3 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,904 INFO     req99   F0 × Bgsm8k1  (gsm8k)
+2026-10-13 04:07:09,904 INFO     req92   F1 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,904 INFO     req100  F3 × Bmbpp0  (mbpp)
+2026-10-13 04:07:09,904 INFO     req95   F4 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,904 INFO     req102  F1 × Bgsm8k0  (gsm8k)
+2026-10-13 04:07:09,904 INFO     req103  F0 × Bmbpp1  (mbpp)
+2026-10-13 04:07:09,904 INFO     req105  F1 × Bgsm8k1  (gsm8k)
+2026-10-13 04:07:09,904 INFO     req106  F1 × Bmbpp0  (mbpp)
+2026-10-13 04:07:09,904 INFO     req98   F2 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,904 INFO     req108  F4 × Bgsm8k0  (gsm8k)
+2026-10-13 04:07:09,904 INFO     req109  F4 × Bmbpp1  (mbpp)
+2026-10-13 04:07:09,904 INFO     req101  F3 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,904 INFO     req111  F2 × Bgsm8k1  (gsm8k)
+2026-10-13 04:07:09,904 INFO     req104  F0 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,904 INFO     req112  F3 × Bmbpp0  (mbpp)
+2026-10-13 04:07:09,904 INFO     req114  F2 × Bgsm8k0  (gsm8k)
+2026-10-13 04:07:09,904 INFO     req107  F1 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,904 INFO     req115  F0 × Bmbpp1  (mbpp)
+2026-10-13 04:07:09,904 INFO     req110  F4 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,904 INFO     req117  F1 × Bgsm8k1  (gsm8k)
+2026-10-13 04:07:09,904 INFO     req118  F2 × Bmbpp0  (mbpp)
+2026-10-13 04:07:09,905 INFO     req120  F2 × Bgsm8k0  (gsm8k)
+2026-10-13 04:07:09,905 INFO     req113  F3 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,905 INFO     req121  F4 × Bmbpp1  (mbpp)
+2026-10-13 04:07:09,905 INFO     req123  F4 × Bgsm8k1  (gsm8k)
+2026-10-13 04:07:09,905 INFO     req116  F0 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,905 INFO     req124  F3 × Bmbpp0  (mbpp)
+2026-10-13 04:07:09,905 INFO     req126  F3 × Bgsm8k0  (gsm8k)
+2026-10-13 04:07:09,905 INFO     req119  F1 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,905 INFO     req127  F0 × Bmbpp1  (mbpp)
+2026-10-13 04:07:09,905 INFO     req122  F2 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,905 INFO     req129  F1 × Bgsm8k1  (gsm8k)
+2026-10-13 04:07:09,905 INFO     req125  F4 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,905 INFO     req130  F2 × Bmbpp0  (mbpp)
+2026-10-13 04:07:09,905 INFO     req132  F3 × Bgsm8k0  (gsm8k)
+2026-10-13 04:07:09,905 INFO     req128  F0 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,905 INFO     req133  F4 × Bmbpp1  (mbpp)
+2026-10-13 04:07:09,905 INFO     req131  F2 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,905 INFO     req135  F0 × Bgsm8k1  (gsm8k)
+2026-10-13 04:07:09,905 INFO     req136  F1 × Bmbpp0  (mbpp)
+2026-10-13 04:07:09,905 INFO     req138  F3 × Bgsm8k0  (gsm8k)
+2026-10-13 04:07:09,905 INFO     req139  F0 × Bmbpp1  (mbpp)
+2026-10-13 04:07:09,905 INFO     req134  F4 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,905 INFO     req141  F2 × Bgsm8k1  (gsm8k)
+2026-10-13 04:07:09,905 INFO     req142  F3 × Bmbpp0  (mbpp)
+2026-10-13 04:07:09,906 INFO     req144  F2 × Bgsm8k0  (gsm8k)
+2026-10-13 04:07:09,906 INFO     req137  F1 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,906 INFO     req145  F4 × Bmbpp1  (mbpp)
+2026-10-13 04:07:09,906 INFO     req147  F2 × Bgsm8k1  (gsm8k)
+2026-10-13 04:07:09,906 INFO     req148  F2 × Bmbpp0  (mbpp)
+2026-10-13 04:07:09,906 INFO     req140  F0 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,906 INFO     req143  F3 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,906 INFO     req146  F4 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,906 INFO     req149  F1 × Bno_robots0  (no_robots)
+2026-10-13 04:07:09,952 INFO ══ 连续测试汇总：150 条（超时 0），墙钟 3300.1s，在途 5
+2026-10-13 04:07:09,952 INFO   生成时延  均值 100591ms  p50 42090  p90 338447  p99 476623
+2026-10-13 04:07:09,952 INFO   TTFT      均值 62648ms  p50 2976  p99 375100
+2026-10-13 04:07:09,952 INFO   TTFT(去排队) 均值 1774ms  p50 1517  p99 3769
+2026-10-13 04:07:09,952 INFO   TPOT      均值 146.5ms  p50 140.3  p99 176.5
+2026-10-13 04:07:09,952 INFO   吞吐      12.16 输出 token/s，2.73 请求/分钟（输出共 40119 token）
+2026-10-13 04:07:09,952 INFO   识别      147/150 = 98.0%（选择器自己判的类）；通道二报警 1279 次，换绑 0 次
+2026-10-13 04:07:09,952 INFO   资源      计算占用均值 11.1%，GPU 利用率均值 5.4%，显存峰值合计 230553.2 / 334848.0 MB
+2026-10-13 04:07:10,009 INFO 结果已写入 results/run.json（150 条）—— 算力使用率均值 70.1%，总时延 p50 42090ms
+2026-10-13 04:07:10,057 INFO 逐层统计已落盘 results/cont_front.jsonl（150 条）—— 离线复核：python3 -m p2pmoe.deploy.lr_tool check --model <模型> --dump results/cont_front.jsonl

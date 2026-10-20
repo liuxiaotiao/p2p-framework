@@ -83,6 +83,7 @@ def make_front_spec(
         gb_per_layer=front_gb_per_layer(model, union_experts),
         kv_gb_per_layer=model.kv_gb_per_layer,
         tail_allowed=tail_allowed,
+        head_extra_gb=getattr(model, "embed_gb", 0.0),
     )
 
 
@@ -95,6 +96,7 @@ def make_back_spec(model: ModelSpec, task: TaskProfile, l0: int) -> SegmentSpec:
         gb_per_layer=back_gb_per_layer(model, task),
         kv_gb_per_layer=model.kv_gb_per_layer,
         tail_allowed=None,  # 分散环境主线：后段端点无约束（I.2.2）
+        tail_extra_gb=getattr(model, "lm_head_gb", 0.0),
     )
 
 

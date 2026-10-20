@@ -1,0 +1,94 @@
+{
+ "node": "N15",
+ "host": "star3",
+ "gpu": {
+  "device": "cuda",
+  "torch": "2.9.0+cu128",
+  "alloc_conf": "expandable_segments:True",
+  "name": "Tesla T4",
+  "capability": "7.5",
+  "total_gib": 14.58,
+  "free_gib": 14.46,
+  "sm_count": 40
+ },
+ "model": {
+  "d_model": 2048,
+  "n_experts": 128,
+  "top_k": 8,
+  "moe_intermediate": 768,
+  "n_heads": 32,
+  "n_kv_heads": 4,
+  "head_dim": 128,
+  "dtype": "bfloat16"
+ },
+ "setup": {
+  "source": "synthetic",
+  "n_layers": 4,
+  "decode_steps": 32,
+  "warmup": 3,
+  "repeats": 5,
+  "miss_policy": "local_topk",
+  "fast_decode": true
+ },
+ "variants": {
+  "all": {
+   "decode": {
+    "128": {
+     "median": 2.5739,
+     "mean": 2.5762,
+     "std": 0.0187,
+     "p90": 2.602,
+     "min": 2.5396,
+     "n": 32
+    },
+    "1024": {
+     "median": 2.5391,
+     "mean": 2.5419,
+     "std": 0.0193,
+     "p90": 2.5596,
+     "min": 2.5125,
+     "n": 32
+    },
+    "2048": {
+     "median": 2.6176,
+     "mean": 2.6206,
+     "std": 0.0178,
+     "p90": 2.6502,
+     "min": 2.5931,
+     "n": 32
+    }
+   },
+   "prefill": {
+    "128": {
+     "median": 94.2234,
+     "mean": 93.3212,
+     "std": 1.7666,
+     "p90": 94.7773,
+     "min": 90.6662,
+     "n": 5,
+     "per_token_median": 0.73612
+    },
+    "512": {
+     "median": 117.708,
+     "mean": 117.8657,
+     "std": 0.5745,
+     "p90": 118.6224,
+     "min": 117.1291,
+     "n": 5,
+     "per_token_median": 0.2299
+    },
+    "2048": {
+     "median": 194.3345,
+     "mean": 194.162,
+     "std": 0.8118,
+     "p90": 195.2527,
+     "min": 193.1769,
+     "n": 5,
+     "per_token_median": 0.09489
+    }
+   },
+   "peak_mem_gib": 5.99,
+   "resident": 128
+  }
+ }
+}

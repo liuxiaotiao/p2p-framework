@@ -1,0 +1,94 @@
+{
+ "node": "N09",
+ "host": "wash1",
+ "gpu": {
+  "device": "cuda",
+  "torch": "2.9.0+cu128",
+  "alloc_conf": "expandable_segments:True",
+  "name": "Quadro RTX 6000",
+  "capability": "7.5",
+  "total_gib": 21.97,
+  "free_gib": 21.79,
+  "sm_count": 72
+ },
+ "model": {
+  "d_model": 2048,
+  "n_experts": 128,
+  "top_k": 8,
+  "moe_intermediate": 768,
+  "n_heads": 32,
+  "n_kv_heads": 4,
+  "head_dim": 128,
+  "dtype": "bfloat16"
+ },
+ "setup": {
+  "source": "synthetic",
+  "n_layers": 4,
+  "decode_steps": 32,
+  "warmup": 3,
+  "repeats": 5,
+  "miss_policy": "local_topk",
+  "fast_decode": true
+ },
+ "variants": {
+  "all": {
+   "decode": {
+    "128": {
+     "median": 2.7704,
+     "mean": 2.782,
+     "std": 0.0276,
+     "p90": 2.8245,
+     "min": 2.7537,
+     "n": 32
+    },
+    "1024": {
+     "median": 2.7932,
+     "mean": 2.7991,
+     "std": 0.0184,
+     "p90": 2.8196,
+     "min": 2.7732,
+     "n": 32
+    },
+    "2048": {
+     "median": 2.7859,
+     "mean": 2.7893,
+     "std": 0.0253,
+     "p90": 2.824,
+     "min": 2.7541,
+     "n": 32
+    }
+   },
+   "prefill": {
+    "128": {
+     "median": 91.0677,
+     "mean": 90.3951,
+     "std": 1.5642,
+     "p90": 91.8159,
+     "min": 87.9755,
+     "n": 5,
+     "per_token_median": 0.71147
+    },
+    "512": {
+     "median": 112.4227,
+     "mean": 112.1553,
+     "std": 0.4515,
+     "p90": 112.487,
+     "min": 111.4548,
+     "n": 5,
+     "per_token_median": 0.21958
+    },
+    "2048": {
+     "median": 142.3267,
+     "mean": 142.3999,
+     "std": 0.2169,
+     "p90": 142.7718,
+     "min": 142.2045,
+     "n": 5,
+     "per_token_median": 0.0695
+    }
+   },
+   "peak_mem_gib": 5.99,
+   "resident": 128
+  }
+ }
+}

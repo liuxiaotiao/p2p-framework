@@ -163,6 +163,12 @@ def main() -> int:
                          "代替拓扑 compute_capacity 推出来的相对值")
     ap.add_argument("--layer-time-key", default="decode@1024",
                     help="取实测表里哪一列：decode@<上下文长度> 或 prefill@<token 数>")
+    ap.add_argument("--measured-mem", action="store_true",
+                    help="用 --layer-times 文件里的实测显存（整卡容量、CUDA context、激活峰值、"
+                         "分配器开销比）定每台可用量，并把前段词嵌入、后段输出头算进首尾那台；"
+                         "此时 --reserve-gb 不再使用")
+    ap.add_argument("--mem-margin-gb", type=float, default=0.5,
+                    help="--measured-mem 时每台再额外留的余量（GB）")
     ap.add_argument("--fill-idle", action="store_true",
                     help="主流程之后补位：提拔备胎、用空闲节点加通道、剩下的分摊到显存最紧的段，"
                          "让每台节点都有活干。补位段不过公共带（见 planner/fill.py）")
@@ -216,6 +222,19 @@ def main() -> int:
         print(f"  计算项   用逐层实测 {args.layer_times}（{args.layer_time_key}，ms/层）：")
         for nid, tier, old_v, new_v, src in rows:
             print(f"           {nid:<5}{tier:<9} {old_v:>7.3f} → {new_v:>7.3f}  {src}")
+        if args.measured_mem:
+            from p2pmoe.deploy.layer_bench import per_node_memory
+            from p2pmoe.planner.from_data import apply_layer_memory
+
+            mem = {k: v for k, v in per_node_memory(table).items() if v.get("total_gb")}
+            if not mem:
+                raise SystemExit(f"{args.layer_times} 里没有显存实测（旧版 layerbench 的结果？重跑一次）")
+            topo, mrows = apply_layer_memory(topo, mem, margin_gb=args.mem_margin_gb)
+            print(f"  显存     用实测（GB=1e9），每台可用量（原「标称 − {args.reserve_gb}」→ 实测）：")
+            for nid, tier, old_v, new_v, src in mrows:
+                print(f"           {nid:<5}{tier:<9} {old_v:>7.2f} → {new_v:>7.2f}  {src}")
+    elif args.measured_mem:
+        raise SystemExit("--measured-mem 要配 --layer-times <layerbench 的结果>")
     v = np.array(list(topo.p50_ms.values()))
     tiers = {}
     for n in topo.nodes:
@@ -232,6 +251,14 @@ def main() -> int:
     rule("2. 模型")
     spec, info = model_spec_from_hf(hf_cfg, name=model_name,
                                     ctx_max=args.ctx, dtype_bytes=args.dtype_bytes)
+    if args.measured_mem:
+        # 首尾两台各多装一张 vocab × d_model 的表：前段 head 的词嵌入、后段 tail 的输出头（+ norm）
+        import dataclasses
+
+        emb = int(hf_cfg["vocab_size"]) * int(hf_cfg["hidden_size"]) * args.dtype_bytes / 1e9
+        spec = dataclasses.replace(spec, embed_gb=emb,
+                                   lm_head_gb=emb + int(hf_cfg["hidden_size"]) * args.dtype_bytes / 1e9)
+        print(f"  首尾额外 前段 head 词嵌入 {spec.embed_gb:.3f}GB，后段 tail 输出头 {spec.lm_head_gb:.3f}GB（已计入）")
     bad = [u for u, p in profiles.items()
            if (p.n_layers, p.n_experts) != (info.n_layers, info.n_experts)]
     if bad:

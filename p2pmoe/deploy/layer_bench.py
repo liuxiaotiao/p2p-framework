@@ -47,7 +47,7 @@ from typing import Mapping, Sequence
 
 log = logging.getLogger("p2pmoe.layer_bench")
 
-__all__ = ["merge", "per_node_ms", "run_remote", "main"]
+__all__ = ["merge", "per_node_ms", "per_node_memory", "run_remote", "main"]
 
 DEFAULT_KEY = "decode@1024"
 # 与执行层（p2pmoe/runtime/layer_bench.py）一致；那边才 import torch
@@ -64,6 +64,30 @@ def _value(r: dict, key: str, variant: str = "all") -> float | None:
         return None
     s = v.get(kind, {}).get(at)
     return None if s is None or "median" not in s else float(s["median"])
+
+
+MEM_FIELDS = ("total_gb", "context_gb", "overhead_ratio", "kv_bytes_per_token_layer",
+              "prefill_extra_gb", "decode_extra_gb", "weights_per_layer_gb",
+              "embed_gb", "lm_head_gb")
+
+
+def _memory(r: dict) -> dict:
+    """单台结果 → 显存的几个关键量（GB，1e9）。取「全部专家」那一组；没有就取第一组。
+
+    prefill_extra_gb / decode_extra_gb 取量过的各长度里最大的那个 —— 规划要的是上限。
+    """
+    v = (r.get("variants") or {}).get("all") or next(iter((r.get("variants") or {}).values()), {})
+    m = dict(v.get("memory") or {})
+    dm = r.get("device_memory") or {}
+    out = {"total_gb": dm.get("total_gb"), "context_gb": dm.get("context_gb"),
+           "overhead_ratio": m.get("overhead_ratio"),
+           "kv_bytes_per_token_layer": m.get("kv_bytes_per_token_layer"),
+           "prefill_extra_gb": max(m.get("prefill_extra_gb", {}).values(), default=None),
+           "prefill_extra_at": max((int(k) for k in m.get("prefill_extra_gb", {})), default=None),
+           "decode_extra_gb": max(m.get("decode_extra_gb", {}).values(), default=None),
+           "weights_per_layer_gb": m.get("weights_per_layer_gb"),
+           "embed_gb": m.get("embed_gb"), "lm_head_gb": m.get("lm_head_gb")}
+    return out
 
 
 def merge(results: Sequence[dict], *, key: str = DEFAULT_KEY) -> dict:
@@ -90,9 +114,24 @@ def merge(results: Sequence[dict], *, key: str = DEFAULT_KEY) -> dict:
     per_node = {nid: {"gpu": r["gpu"].get("name"),
                       "source": (r.get("setup") or {}).get("source", "synthetic"),
                       "segment": r.get("segment"),
-                      **{k: _value(r, k) for k in keys}} for nid, r in sorted(nodes.items())}
+                      **{k: _value(r, k) for k in keys},
+                      "memory": _memory(r)} for nid, r in sorted(nodes.items())}
+    for g, ids in by_gpu.items():
+        mem = {}
+        for f in MEM_FIELDS:
+            xs = [per_node[i]["memory"].get(f) for i in ids]
+            xs = [float(x) for x in xs if x is not None]
+            if xs:
+                mem[f] = {"mean": round(st.mean(xs), 4),
+                          "std": round(st.stdev(xs), 4) if len(xs) > 1 else 0.0, "n": len(xs)}
+        gpus[g]["memory"] = mem
     return {"default_key": key, "keys": keys, "per_node": per_node, "per_gpu": gpus,
             "raw": nodes}
+
+
+def per_node_memory(table: Mapping) -> dict[str, dict]:
+    """merge 的产物 → {节点: 显存量表}（见 _memory）。"""
+    return {n: dict(v.get("memory") or {}) for n, v in table.get("per_node", {}).items()}
 
 
 def per_node_ms(table: Mapping, key: str = DEFAULT_KEY) -> dict[str, float]:
@@ -110,6 +149,18 @@ def _print_table(m: dict) -> None:
         src = {"loaded": "已加载", "synthetic": "随机"}.get(v.get("source"), "?")
         print(f"  {n:<6}{str(v['gpu'])[:27]:<28}{src:<8}"
               + "".join(f"{v[k]:>15.3f}" if v.get(k) is not None else f"{'—':>15}" for k in keys))
+    print("\n显存（GB = 1e9 字节）：整卡容量 / CUDA context / 分配器开销比 / 每 token 每层 KV / "
+          "prefill 激活峰值 / 每层权重")
+    print(f"  {'节点':<6}{'容量':>8}{'context':>9}{'开销比':>8}{'KV B/tok·层':>13}"
+          f"{'激活峰值':>10}{'每层权重':>10}")
+    f = lambda x, d=3: "—" if x is None else f"{x:.{d}f}"
+    for n, v in m["per_node"].items():
+        mm = v.get("memory") or {}
+        act = mm.get("prefill_extra_gb")
+        print(f"  {n:<6}{f(mm.get('total_gb'), 2):>8}{f(mm.get('context_gb')):>9}"
+              f"{f(mm.get('overhead_ratio')):>8}{f(mm.get('kv_bytes_per_token_layer'), 0):>13}"
+              f"{f(act):>10}{f(mm.get('weights_per_layer_gb')):>10}"
+              + (f"  （T={mm.get('prefill_extra_at')}）" if act is not None else ""))
     print("\n按 GPU 型号（mean ± std，跨节点）")
     for g, v in m["per_gpu"].items():
         print(f"  {g[:30]:<30} {len(v['nodes'])} 台 {v['nodes']}")

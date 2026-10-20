@@ -199,7 +199,8 @@ def deploy_path(
         cum.append(cum[-1] + spec.gb_per_layer(l) + spec.kv_gb_per_layer)
 
     def gb(a: int, b: int) -> float:  # 段内第 a..b 层（1-based，含两端）
-        return cum[b] - cum[a - 1]
+        return (cum[b] - cum[a - 1] + (spec.head_extra_gb if a == 1 else 0.0)
+                + (spec.tail_extra_gb if b == n_layers else 0.0))
 
     scale = spec.ms_per_layer_scale
 

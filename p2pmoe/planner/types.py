@@ -82,6 +82,12 @@ class ModelSpec:
     按 d_model 算会把 KV 高估 4 倍，直接影响可行性判断与跳数下界。
     """
 
+    embed_gb: float = 0.0
+    """词嵌入表的大小，前段 head 那台要多装它。默认 0 = 旧口径（不计）；
+    `task_deploy --measured-mem` 时按 vocab × d_model × dtype 填上。"""
+    lm_head_gb: float = 0.0
+    """输出头 + 最终 norm，后段 tail 那台要多装它。默认 0 = 旧口径（不计）。"""
+
     @property
     def kv_gb_per_layer(self) -> float:
         """kv(S, ctx) / |S| —— 每层的 KV 上限占用（I.2.2，按 GQA 修正）。"""
@@ -161,6 +167,10 @@ class SegmentSpec:
     """Q_F^out。None 表示不设资格约束（后段主线，Step 3 自由构造）。"""
     head_allowed: frozenset[str] | None = None
     """Q_F^in 主线不设约束，改由回环裁剪择优（II.4 Step 6）。"""
+    head_extra_gb: float = 0.0
+    """承载本段第一层的那台额外要装的（前段：词嵌入）。"""
+    tail_extra_gb: float = 0.0
+    """承载本段最后一层的那台额外要装的（后段：输出头 + 最终 norm）。"""
 
     @property
     def n_layers(self) -> int:
@@ -173,6 +183,10 @@ class SegmentSpec:
         判断系统性偏乐观（I.2.2）。
         """
         w = sum(self.gb_per_layer(l) for l in range(lo, hi + 1))
+        if lo == self.layer_lo:
+            w += self.head_extra_gb
+        if hi == self.layer_hi:
+            w += self.tail_extra_gb
         return w + (hi - lo + 1) * self.kv_gb_per_layer
 
     def total_gb(self) -> float:

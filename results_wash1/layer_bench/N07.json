@@ -1,0 +1,94 @@
+{
+ "node": "N07",
+ "host": "prin2",
+ "gpu": {
+  "device": "cuda",
+  "torch": "2.9.0+cu128",
+  "alloc_conf": "expandable_segments:True",
+  "name": "NVIDIA A30",
+  "capability": "8.0",
+  "total_gib": 23.6,
+  "free_gib": 23.33,
+  "sm_count": 56
+ },
+ "model": {
+  "d_model": 2048,
+  "n_experts": 128,
+  "top_k": 8,
+  "moe_intermediate": 768,
+  "n_heads": 32,
+  "n_kv_heads": 4,
+  "head_dim": 128,
+  "dtype": "bfloat16"
+ },
+ "setup": {
+  "source": "synthetic",
+  "n_layers": 4,
+  "decode_steps": 32,
+  "warmup": 3,
+  "repeats": 5,
+  "miss_policy": "local_topk",
+  "fast_decode": true
+ },
+ "variants": {
+  "all": {
+   "decode": {
+    "128": {
+     "median": 2.3832,
+     "mean": 2.398,
+     "std": 0.085,
+     "p90": 2.4061,
+     "min": 2.3474,
+     "n": 32
+    },
+    "1024": {
+     "median": 2.3653,
+     "mean": 2.3613,
+     "std": 0.0168,
+     "p90": 2.3801,
+     "min": 2.3224,
+     "n": 32
+    },
+    "2048": {
+     "median": 2.3552,
+     "mean": 2.3571,
+     "std": 0.0185,
+     "p90": 2.3793,
+     "min": 2.3144,
+     "n": 32
+    }
+   },
+   "prefill": {
+    "128": {
+     "median": 31.2339,
+     "mean": 31.2952,
+     "std": 0.4579,
+     "p90": 31.773,
+     "min": 30.6389,
+     "n": 5,
+     "per_token_median": 0.24401
+    },
+    "512": {
+     "median": 32.2043,
+     "mean": 32.5074,
+     "std": 0.5469,
+     "p90": 33.3778,
+     "min": 32.0742,
+     "n": 5,
+     "per_token_median": 0.0629
+    },
+    "2048": {
+     "median": 41.4854,
+     "mean": 41.1971,
+     "std": 0.6331,
+     "p90": 41.558,
+     "min": 40.0746,
+     "n": 5,
+     "per_token_median": 0.02026
+    }
+   },
+   "peak_mem_gib": 5.99,
+   "resident": 128
+  }
+ }
+}

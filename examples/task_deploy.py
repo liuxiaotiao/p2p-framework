@@ -140,6 +140,9 @@ def main() -> int:
                     help="前段每层装**全部**专家，不按并集裁。前段出口接 task 选择器时要它："
                          "选择器是按完整模型的路由训练的（SELECTOR_USAGE.md：前 8 层不屏蔽），"
                          "前段缺专家会让后面几层的路由、也就是特征整体偏掉")
+    ap.add_argument("--back-full", action="store_true",
+                    help="后段每层也装**全部**专家（不裁剪，完整模型）。做「不裁专家」的对照组用；"
+                         "后段驻留量变成 40 层 × 全部专家，每条后段要多占节点")
     ap.add_argument("--config", default=None,
                     help="模型：config.json 的路径，或预置名（qwen3-30b-a3b 等，见 "
                          "planner/hf_config.PRESETS）。默认 Qwen3-Next-80B-A3B")
@@ -335,6 +338,10 @@ def main() -> int:
                      if m.get("source") else ""))
     else:
         plc = {u: build_placement(p, args.coverage) for u, p in profiles.items()}
+    if args.back_full:
+        from p2pmoe.planner.experts import full_placement
+        plc = {u: full_placement(L, info.n_experts, name=u) for u in plc}
+        print(f"  后段装全部 {info.n_experts} 个专家/层（--back-full）：不裁剪，各 task 的后段内容相同")
     uni_sz = np.array([len(union_placement(list(plc.values())).at(l + 1)) for l in range(L)])
     k_acc = knee(np.arange(1, L + 1, dtype=float), acc) + 1
     print(f"  {'L₀':>3} {'p(L₀)≥':>8} {'边际增益':>9} {'本层前段并集':>12} {'累积':>8}")

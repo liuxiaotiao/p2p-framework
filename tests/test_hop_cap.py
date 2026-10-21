@@ -212,3 +212,31 @@ def test_vllm_plan_file_is_reproducible(tmp_path, monkeypatch, capsys):
         "--theta", "0.8", "--eta", "0.4", "--save-plan", str(out)])
     assert td.main() == 0
     assert out.read_bytes() == want.read_bytes()
+
+
+def test_full_model_plan_file_is_reproducible(tmp_path, monkeypatch, capsys):
+    """qwen3-30b/plan_full.json：前后段都装全部专家（不裁剪）的对照方案（REPRODUCE 5.10）。"""
+    want = ROOT / "qwen3-30b" / "plan_full.json"
+    lb = ROOT / "qwen3-30b" / "layer_bench_wash1.json"
+    es = ROOT / "qwen3-30b" / "expert_sets_90" / "expert_sets_90_union.json"
+    if not (want.exists() and lb.exists() and es.exists() and (ROOT / "task3").exists()):
+        pytest.skip("缺 qwen3-30b/ 或 task3/ 数据")
+    sys.path.insert(0, str(ROOT))
+    import examples.task_deploy as td
+
+    out = tmp_path / "p.json"
+    monkeypatch.setattr(sys, "argv", [
+        "task_deploy", "--data", str(ROOT / "task3"), "--config", "qwen3-30b-a3b",
+        "--phase", "prefill", "--tasks", "gsm8k=1,mbpp=1,no_robots=1", "--expert-sets", str(es),
+        "--l0", "8", "--front-full", "--back-full", "--layer-times", str(lb), "--measured-mem",
+        "--mem-margin-gb", "0", "--kv-reserve-gb", "2", "--mem-prefill-tokens", "512",
+        "--endpoint-w", "0", "--hop-slack", "0", "--save-plan", str(out)])
+    assert td.main() == 0
+    assert out.read_bytes() == want.read_bytes()
+    plan = json.loads(out.read_text())
+    backs = [n for n in plan["nodes"] if n["role"].startswith("back:")]
+    assert backs and all(len(l["experts"]) == 128 for n in backs for l in n["layers"])
+    covered = {u: set() for u in ("gsm8k", "mbpp", "no_robots")}
+    for n in backs:
+        covered[n["role"].split(":")[1]] |= {l["layer"] for l in n["layers"]}
+    assert all(c == set(range(9, 49)) for c in covered.values())

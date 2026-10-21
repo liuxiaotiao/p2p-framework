@@ -52,7 +52,7 @@ from ..runtime.corpus import (
     profile_from_corpus,
     sample_prompt,
 )
-from ..runtime.coordinator import Coordinator
+from ..runtime.coordinator import SHARED_POOL, Coordinator
 from ..runtime.identify import HistogramClassifier
 from ..runtime.lr_classifier import LRClassifier, verdict_label
 from ..runtime.model import ToyMoEConfig
@@ -371,6 +371,8 @@ def _closed_loop(args, coord, cases, names, textio, addrs, log_done, stuck) -> d
         cap = {u: len(q) for u, q in coord.front_pools.items()}
     else:
         cap = {u: int(coord.back_capacity.get(u, 0)) for u in names}
+        if coord.back_capacity.get(SHARED_POOL, 0):
+            cap[SHARED_POOL] = int(coord.back_capacity[SHARED_POOL])
     inflight = args.inflight or sum(cap.values())
     share = defaultdict(int)
     for i in range(n):
@@ -1555,6 +1557,10 @@ def main(argv: list[str] | None = None) -> int:
         # 都会排进一个永远不会有人归还的队列，300 秒后报「超时」，而日志只说
         # 「池无空闲后段」，看起来像拥塞。
         empty = [u for u in names if coord.back_capacity.get(u, 0) == 0]
+        if empty and coord.back_capacity.get(SHARED_POOL, 0):
+            log.info("      %s 没有专属后段 → 都走共享池 %s（%d 条）",
+                     "/".join(empty), SHARED_POOL, coord.back_capacity[SHARED_POOL])
+            empty = []
         if empty:
             have = {u: n for u, n in coord.back_capacity.items() if n}
             log.error("规划给这些 task 分到了 0 条后段：%s", empty)

@@ -163,6 +163,8 @@ bash ./deploy_15.sh status                                                # 不�
 | 按文件顺序而不是 task 轮转 | `continuous` 后面加 `--order file` |
 | 原样重出现在用的方案 | 规划命令加 `--beam-legacy --avail 0.95 --theta 0.8 --rent-policy smallest_sufficient`（自 2026-10-20 起可用率 r_v 默认 1.0、不计稳定性罚，θ 默认 1.0、不打折，影子租金默认不预留（前段压到每台都放得下）；之前的方案都按 r_v=0.95、θ=0.8、租金「够装前段的最小 N 台」规划；2026-10-14 修了 beam 之后，默认参数重出的方案在 gsm8k-0、mbpp-0 的切层点上会不同；`qwen3-30b/plan_es90_fill.json` 本身没变，直接用它就不受影响） |
 | 每台固定留显存给 KV | 规划命令加 `--measured-mem --kv-reserve-gb 2`：每台整块留 2GB 给 KV cache，剩下全给权重，KV 不再按 `--ctx` 逐层计入 |
+| 不裁剪专家（完整模型） | 规划命令加 `--back-full`（配 `--front-full`）：后段每层也装全部专家，例见 5.10 |
+| 手写分配（不经过规划器） | 写布局 JSON → `python3 examples/manual_plan.py 布局.json --out 清单.json`，例见 5.11 |
 | 放宽公共带 | 规划命令加 `--w-cap <ms>`（直接给上沿）或 `--rho-w <倍数>`（上沿 = 倍数 × 典型跳 p50，默认 1.5）；配合 `--eta` 放宽终审均匀性，例见 5.8 |
 | 调链长上限 | 规划命令加 `--hop-slack N`：每条段的跳数 ≤ 整数下界 hops_min（按段驻留量 ÷ 最大单机可用算）+ N，默认 1；`--hop-slack -1` 不限。求解器搜索时就剪掉超长前缀，防止 beam 交出吃光节点的长链（`--beam-legacy` 下不生效）。用现在的部署参数重出方案，开不开它结果逐字节相同 |
 | 给 no_robots 两条通道 | 重新规划（`examples/task_deploy.py … --tasks gsm8k=1,mbpp=1,no_robots=2`），换 `PLAN` 后从第 3 步的 `fetch`/`verify` 重来 |
@@ -509,6 +511,124 @@ decode 平均取上下文 512→1023 的插值；逐节点按 `ms_per_layer_node
 
 用 vLLM 起这份方案时，`gpu_memory_utilization` 至少要到（权重 + 首尾表 + 固定开销 + 2GB KV）÷ 整卡：
 N01 0.92、N12 0.91、N05/N07 0.89、N08 0.79，其余 ≤ 0.66；统一设 0.93 即可（默认 0.9 时 N01、N12 的 KV 不到 2GB）。
+
+### 5.10 不裁剪专家的对照组：完整模型（`qwen3-30b/plan_full.json`）
+
+前段、后段每层都装全部 128 个专家（`--front-full --back-full`），其余与 5.7 相同；后段不再按 task 裁剪，
+三个 task 的后段内容一模一样，用来和裁剪方案对比（缺专家的影响、显存/节点的代价）。
+规划命令（`tests/test_hop_cap.py::test_full_model_plan_file_is_reproducible` 校验逐字节重出）：
+
+```bash
+python3 examples/task_deploy.py --data task3 --config qwen3-30b-a3b --phase prefill \
+  --tasks gsm8k=1,mbpp=1,no_robots=1 \
+  --expert-sets qwen3-30b/expert_sets_90/expert_sets_90_union.json \
+  --l0 8 --front-full --back-full \
+  --layer-times qwen3-30b/layer_bench_wash1.json --measured-mem \
+  --mem-prefill-tokens 512 --mem-margin-gb 0 --kv-reserve-gb 2 --endpoint-w 0 \
+  --hop-slack 0 \
+  --save-plan qwen3-30b/plan_full.json
+```
+
+* 超参全取默认（w_cap ≈ 4.6ms、η = 15%）；
+* 一条完整后段 40 层 × 1.246GB + 输出头 ≈ 50.5GB，单台最多 22.93GB → 至少 3 台；`--hop-slack 0` 让每条后段
+  正好 3 台（默认 1 时 beam 会多拉一台只放 1 层，白多一跳）；
+* 每条通道 = 1 台前段 + 3 台后段，15 台最多 3 条 → 三个 task 各 1 条；
+* 规划日志：`qwen3-30b/plan_full.log`。
+
+| 角色 | 节点 |
+|---|---|
+| 前段（层 1–8） | N09、N10（RTX6000）、N12（T4） |
+| gsm8k | N07(9–26)→N06(27–31)→N08(32–48) |
+| mbpp | N04(9–25)→N02(26–31)→N01(32–48) |
+| no_robots | N03(9–23)→N05(24–34)→N11(35–48) |
+| 不用 | N13、N14、N15 |
+
+3 条通道，静态组合 p50 118.7 / 123.0 / 129.3ms，终审最坏相对极差 1.5%（η = 15% 通过）。
+权重共 179GB：从 `plan_doc_l8.json` 换过来只有 N12 跳过（约 169GB），从 `plan_doc_v2.json` 只有 N09、N10 跳过（约 160GB）。
+
+部署与实验同 5.7（hosts 也是去掉 N13–N15 的 12 台），只换清单和结果文件名：
+
+```bash
+HOSTS=task/hosts.txt bash ./deploy_15.sh stop
+export PLAN=qwen3-30b/plan_full.json
+awk '$1!="N13" && $1!="N14" && $1!="N15"' task/hosts.txt > task/hosts_v2.txt
+export HOSTS=task/hosts_v2.txt
+bash ./deploy_15.sh sync
+REPLACE=1 bash ./deploy_15.sh fetch
+bash ./deploy_15.sh verify            # 12 台都 ✓
+bash ./deploy_15.sh start && bash ./deploy_15.sh status
+
+export DUMP_FRONT=results/cont_front_full.jsonl
+RESULTS=results/run_full.json bash ./deploy_15.sh continuous 2>&1 | tee results/continuous_full.log
+bash ./deploy_15.sh report results/run_full.json | sed -n '/连续性测试/,$p'
+python3 examples/analyze_run.py results/run_full.json --csv results/run_full_latency.csv
+```
+
+* 同时在途 = 3（每个 task 1 条通道），150 条请求预计比 4 条通道的方案更久；
+* 后段不缺专家，`MISS_POLICY` 不起作用；选择器照常识别并按 task 派发（三条后段内容相同，识别错了也不影响输出）；
+* `PROFILE` 不用换（只给前段的识别器用）。
+
+### 5.11 手写分配：完整模型两条链（`qwen3-30b/plan_full_2ch.json`）
+
+不经过规划器，按给定的分配直接出清单。分配（原表层号是 0-based 切片，`0:8` = 第 1–8 层）：
+
+| 层 | 链 A | 链 B |
+|---|---|---|
+| 1–8（前段） | N01 | N11 |
+| 9–16 | N05 | N08 |
+| 17–24 | N03 | N09 |
+| 25–32 | N07 | N13 |
+| 33–40 | N02 | N04 |
+| 41–48 | N06 | N10 |
+
+每台 8 层、全部 128 个专家（完整模型）。布局写在 `qwen3-30b/layout_full_2ch.json`，转成清单：
+
+```bash
+python3 examples/manual_plan.py qwen3-30b/layout_full_2ch.json --out qwen3-30b/plan_full_2ch.json \
+  --layer-times qwen3-30b/layer_bench_wash1.json --kv-reserve-gb 2 --topo task3/topo_fabric_mbps.json
+```
+
+* 前段 = 第 1–8 层那台（L₀ = 8，选择器照常在前段尾识别），后段 = 第 9–48 层那 5 台；
+* 两条后段都标成 `back:any`（**共享后段池**）：三个 task 都没有专属后段，识别完一律派到这个池，
+  哪条空闲用哪条（`p2pmoe/runtime/coordinator.py` 的 `SHARED_POOL`）。结果里每条请求的 `task` 记为
+  `any`，选择器准确率仍按它自己判的类统计；
+* 每台需要 ≤ 10.6GB（8 层 9.97GB + 首尾表 0.62GB），留 2GB KV 后可用 21.3–22.9GB，都装得下；
+* 按实测每层耗时与拓扑估的每 token 时延（盲绑下前段与后段任意组合）：
+
+| 前段 × 后段 | 正向 | 回环 | 合计 |
+|---|---|---|---|
+| N01 × 链 A 后段 | 0.04 | 1.21 | 118.7ms |
+| N01 × 链 B 后段 | 1.21 | 3.10 | 158.5ms |
+| N11 × 链 A 后段 | 3.08 | 3.25 | 126.6ms |
+| N11 × 链 B 后段 | 3.24 | 0.04 | 160.3ms |
+
+  链 B 后段的段内跳合计 31.3ms：N09→N13（13.5ms）和 N13→N04（11.5ms）两跳跨到 4.x 子网；
+* 权重共 120GB：从 `plan_doc_l8.json` 换过来只有 N01 跳过（约 110GB）。
+
+```bash
+cd /home/ubuntu/p2p-framework && conda activate moe && source qwen3-30b/env.sh
+export ADVERTISE=192.168.3.4 && mkdir -p results
+
+HOSTS=task/hosts.txt bash ./deploy_15.sh stop
+export PLAN=qwen3-30b/plan_full_2ch.json
+awk '$1!="N12" && $1!="N14" && $1!="N15"' task/hosts.txt > task/hosts_full2.txt   # 用到的 12 台
+export HOSTS=task/hosts_full2.txt
+
+bash ./deploy_15.sh sync
+REPLACE=1 bash ./deploy_15.sh fetch
+bash ./deploy_15.sh verify            # 12 台都 ✓
+bash ./deploy_15.sh start && bash ./deploy_15.sh status
+
+export DUMP_FRONT=results/cont_front_full2.jsonl
+RESULTS=results/run_full2.json bash ./deploy_15.sh continuous 2>&1 | tee results/continuous_full2.log
+bash ./deploy_15.sh report results/run_full2.json | sed -n '/连续性测试/,$p'
+python3 examples/analyze_run.py results/run_full2.json --csv results/run_full2_latency.csv
+```
+
+* 同时在途 = 2（两条后段）；开头日志应有「gsm8k/mbpp/no_robots 没有专属后段 → 都走共享池 any（2 条）」；
+* 控制器仍在 wash1（N09，链 B 的第 17–24 层）上跑；原分配里 client 在 N01，要一致就在 N01 上执行上面的
+  命令并把 `ADVERTISE` 换成 N01 的地址（192.168.1.2）；
+* 别的手写分配照这个格式写一个布局 JSON，`task` 写某个 task 名就是那个 task 的专属后段，写 `any` 进共享池。
 
 ## 6. 参考数值（用来判断复现是否正常）
 

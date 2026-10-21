@@ -37,7 +37,12 @@ from .model import ToyMoEConfig
 from .node import NodeConfig, run_agent
 from .wire import Addr, LinkTable, PeerPool, RelayListener, recv_msg, rpc
 
-__all__ = ["RequestRecord", "Coordinator", "LocalCluster"]
+__all__ = ["RequestRecord", "Coordinator", "LocalCluster", "SHARED_POOL"]
+
+# 共享后段池：清单里角色为 `back:any` 的后段不属于任何一个 task。识别出来的 task
+# 自己一条后段都没有时，请求就派到这个池 —— 给「后段装完整模型、谁都能服务」的
+# 部署用（例如不裁专家的对照组）。有专属后段的 task 照旧走自己的池。
+SHARED_POOL = "any"
 
 
 # --------------------------------------------------------------------------- #
@@ -569,6 +574,11 @@ class Coordinator:
         self._bind(rec, target, rebind=False)
 
     def _bind(self, rec: RequestRecord, task: str, *, rebind: bool) -> None:
+        if (task != SHARED_POOL and self.back_capacity.get(task, 0) == 0
+                and self.back_capacity.get(SHARED_POOL, 0) > 0):
+            rec.log(f"{task} 没有专属后段 → 走共享池 {SHARED_POOL}"
+                    f"（{self.back_capacity[SHARED_POOL]} 条，完整模型）")
+            task = SHARED_POOL
         # 容量为 0 = 规划阶段就没给这个 task 建后段。排队没有意义 ——
         # 队列里没有任何东西会被归还，等的是一个永远不会到的事件。
         # 立刻失败，并把原因说清楚，比让它在 300 秒后报「超时」诚实得多。

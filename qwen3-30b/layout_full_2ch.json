@@ -1,0 +1,20 @@
+{
+  "_note": "完整模型（不裁专家）的手动分配：两条链，每台 8 层。原表层号是 0-based 切片（0:8 = 第 1–8 层）。task=any → 共享后段池。",
+  "l0": 8,
+  "channels": [
+    {"task": "any",
+     "front": [{"node": "N01", "layers": [1, 8]}],
+     "back":  [{"node": "N05", "layers": [9, 16]},
+               {"node": "N03", "layers": [17, 24]},
+               {"node": "N07", "layers": [25, 32]},
+               {"node": "N02", "layers": [33, 40]},
+               {"node": "N06", "layers": [41, 48]}]},
+    {"task": "any",
+     "front": [{"node": "N11", "layers": [1, 8]}],
+     "back":  [{"node": "N08", "layers": [9, 16]},
+               {"node": "N09", "layers": [17, 24]},
+               {"node": "N13", "layers": [25, 32]},
+               {"node": "N04", "layers": [33, 40]},
+               {"node": "N10", "layers": [41, 48]}]}
+  ]
+}

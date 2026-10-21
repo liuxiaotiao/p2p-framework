@@ -163,6 +163,7 @@ bash ./deploy_15.sh status                                                # 不�
 | 按文件顺序而不是 task 轮转 | `continuous` 后面加 `--order file` |
 | 原样重出现在用的方案 | 规划命令加 `--beam-legacy --avail 0.95 --theta 0.8 --rent-policy smallest_sufficient`（自 2026-10-20 起可用率 r_v 默认 1.0、不计稳定性罚，θ 默认 1.0、不打折，影子租金默认不预留（前段压到每台都放得下）；之前的方案都按 r_v=0.95、θ=0.8、租金「够装前段的最小 N 台」规划；2026-10-14 修了 beam 之后，默认参数重出的方案在 gsm8k-0、mbpp-0 的切层点上会不同；`qwen3-30b/plan_es90_fill.json` 本身没变，直接用它就不受影响） |
 | 每台固定留显存给 KV | 规划命令加 `--measured-mem --kv-reserve-gb 2`：每台整块留 2GB 给 KV cache，剩下全给权重，KV 不再按 `--ctx` 逐层计入 |
+| 放宽公共带 | 规划命令加 `--w-cap <ms>`（直接给上沿）或 `--rho-w <倍数>`（上沿 = 倍数 × 典型跳 p50，默认 1.5）；配合 `--eta` 放宽终审均匀性，例见 5.8 |
 | 调链长上限 | 规划命令加 `--hop-slack N`：每条段的跳数 ≤ 整数下界 hops_min（按段驻留量 ÷ 最大单机可用算）+ N，默认 1；`--hop-slack -1` 不限。求解器搜索时就剪掉超长前缀，防止 beam 交出吃光节点的长链（`--beam-legacy` 下不生效）。用现在的部署参数重出方案，开不开它结果逐字节相同 |
 | 给 no_robots 两条通道 | 重新规划（`examples/task_deploy.py … --tasks gsm8k=1,mbpp=1,no_robots=2`），换 `PLAN` 后从第 3 步的 `fetch`/`verify` 重来 |
 
@@ -392,6 +393,122 @@ bash ./deploy_15.sh status            # 不应有残留 KV
   请求数不均」—— 是方案的容量结构，不是故障；
 * 每台权重之外留着 2GB 给 KV（N12 是 13.15GB 权重 / 15.66GB 整卡）；仍有节点 OOM 就把 `--kv-reserve-gb` 或 `--mem-margin-gb` 调大重出，再从第 4 步来；
 * 切回其他方案：stop → 换 `PLAN`/`HOSTS` → `REPLACE=1 bash ./deploy_15.sh fetch` → verify → start。
+
+### 5.8 五条通道的方案（`qwen3-30b/plan_doc_v2_5ch.json`）
+
+5.7 的参数，只放宽两个阈值，让五条后段都能留住（`tests/test_hop_cap.py::test_doc_v2_5ch_plan_file_is_reproducible` 校验逐字节重出）：
+
+```bash
+python3 examples/task_deploy.py --data task3 --config qwen3-30b-a3b --phase prefill \
+  --tasks gsm8k=1,mbpp=1,no_robots=1 \
+  --expert-sets qwen3-30b/expert_sets_90/expert_sets_90_union.json \
+  --l0 8 --front-full \
+  --layer-times qwen3-30b/layer_bench_wash1.json --measured-mem \
+  --mem-prefill-tokens 512 --mem-margin-gb 0 --kv-reserve-gb 2 --endpoint-w 0 \
+  --w-cap 14 --eta 0.21 \
+  --save-plan qwen3-30b/plan_doc_v2_5ch.json
+```
+
+| 参数 | 5.7 | 5.8 | 为什么 |
+|---|---|---|---|
+| w_cap（公共带上沿） | 1.5 × 典型跳 ≈ 4.6ms | **14ms**（≈ 4.5 × 典型跳） | C 组（N13–N15）到后段入口要 11.5–13.5ms，最远 N15→N12 13.52ms；上沿 ≥ 13.55 才能进带 |
+| η（均匀性阈值） | 15% | **21%** | 带进 C 组前段后，终审最坏相对极差 20.0%（no_robots：128.0–154.8ms ÷ 网格中位 134.3ms） |
+
+只调 η 没用：上沿被 w_cap 卡着，η 再大公共带也只有 [0, 4.6]。规划日志：`qwen3-30b/plan_doc_v2_5ch.log`。
+
+| 角色 | 节点 |
+|---|---|
+| 前段（层 1–8，全专家） | N09、N10、N13、N14、N15 |
+| gsm8k | N07(9–37)→N08(38–48)、N04(9–36)→N01(37–48) |
+| mbpp | N02(9–37)→N03(38–48)、N05(9–36)→N06(37–48) |
+| no_robots | N12(9–29)→N11(30–48) |
+
+5 条通道、15 台全上岗；静态配对：
+
+| 通道 | 前段 → 后段 | 组合 p50 |
+|---|---|---|
+| gsm8k-0 | N10 → N07+N08 | 117.7ms |
+| gsm8k-1 | N09 → N04+N01 | 123.0ms |
+| mbpp-0 | N15 → N02+N03 | 139.8ms |
+| mbpp-1 | N14 → N05+N06 | 142.9ms |
+| no_robots-0 | N13 → N12+N11 | 155.1ms |
+
+代价：C 组前段到任何后段入口、以及回环都要 ≈ 11.5–13.5ms，挂在它们后面的通道每 token 多 ≈ 23ms；
+N14、N15 是 T4，prefill 比 A30 慢（TTFT 更长）。
+
+权重就地替换：从 5.7 的 `plan_doc_v2.json` 换过来只动 N07、N08（前段 → gsm8k 后段）和 N13–N15（→ 前段），约 61GB；
+从 `plan_es90_fill.json` 约 180GB（N10、N15 跳过）；从 `plan_doc_l8.json` 15 台全换，约 200GB。
+
+部署与实验同 5.7，只改清单、hosts 用完整的 15 台、结果文件换名：
+
+```bash
+HOSTS=task/hosts.txt bash ./deploy_15.sh stop
+export PLAN=qwen3-30b/plan_doc_v2_5ch.json
+export HOSTS=task/hosts.txt
+bash ./deploy_15.sh sync
+REPLACE=1 bash ./deploy_15.sh fetch
+bash ./deploy_15.sh verify            # 15 台都 ✓
+bash ./deploy_15.sh start && bash ./deploy_15.sh status   # 15/15
+
+export DUMP_FRONT=results/cont_front_v2_5ch.jsonl
+RESULTS=results/run_v2_5ch.json bash ./deploy_15.sh continuous 2>&1 | tee results/continuous_v2_5ch.log
+bash ./deploy_15.sh report results/run_v2_5ch.json | sed -n '/连续性测试/,$p'
+python3 examples/analyze_run.py results/run_v2_5ch.json --csv results/run_v2_5ch_latency.csv
+```
+
+同时在途 = 5；gsm8k、mbpp 各 2 条通道，no_robots 1 条（仍会提示请求数不均）。
+
+### 5.9 按 vLLM 实测规划的方案（`qwen3-30b/plan_vllm.json`）
+
+输入是 `vllm/summary_by_gpu.json`（按 GPU 型号汇总的 vLLM 逐层实测）。只取 batch 1、全部 128 个专家，
+按 512 prompt + 512 生成换算成规划器认的表，再规划：
+
+```bash
+# 1) vLLM 汇总 → layer_bench 格式（逐节点；结果已在仓库里）
+python3 -m p2pmoe.deploy.vllm_summary vllm/summary_by_gpu.json \
+  --prompt 512 --gen 512 --batch 1 --out qwen3-30b/layer_bench_vllm.json
+
+# 2) 规划（tests/test_hop_cap.py::test_vllm_plan_file_is_reproducible 校验逐字节重出）
+python3 examples/task_deploy.py --data task3 --config qwen3-30b-a3b --phase prefill \
+  --tasks gsm8k=1,mbpp=1,no_robots=1 \
+  --expert-sets qwen3-30b/expert_sets_90/expert_sets_90_union.json \
+  --l0 8 --front-full \
+  --layer-times qwen3-30b/layer_bench_vllm.json --layer-time-key req@p512g512 \
+  --measured-mem --mem-margin-gb 0 --kv-reserve-gb 2 --endpoint-w 0 \
+  --theta 0.8 --eta 0.4 \
+  --save-plan qwen3-30b/plan_vllm.json
+```
+
+**每层耗时**（`req@p512g512` = (prefill 512 + 512 × decode 平均) ÷ 512，一条请求摊到每个生成 token；
+decode 平均取上下文 512→1023 的插值；逐节点按 `ms_per_layer_nodes` 与型号均值之比换算）：
+
+| GPU | decode（ms/层） | prefill 512（ms/层） | req（ms/层） | 每步固定开销（ms/token，未进规划） |
+|---|---|---|---|---|
+| A30 | 0.19–0.22 | 2.6–3.0 | 0.19–0.22 | 1.40 |
+| RTX6000 | 1.69–1.71 | 56.9–57.6 | 1.80–1.82 | 1.95 |
+| T4 | 3.01–3.06 | 95.9–97.3 | 3.20–3.25 | 3.43 |
+
+**显存**：整卡 − vLLM 非权重固定开销（非 KV 固定部分减去词嵌入与输出头：A30 1.69、RTX 1.56、T4 1.49GB）
+− 2GB KV，÷ 每层实占/权重比（1.004–1.015）→ 权重可用 A30 21.53、RTX6000 19.96、T4 11.99GB。
+
+**为什么 θ=0.8、η=0.4**：vLLM 下 A30 比 Turing 卡快约 10 倍，A30 上整段后段只要 8–9ms，
+网络一跳（A30 组 ↔ RTX 组 3.1ms）与前段落在哪种卡上（A30 1.7 / RTX 14.5 / T4 26ms）成了延迟的主体；
+默认的 η=15%（≈ 2.4ms）在这份拓扑上凑不出公共带，规划失败。θ=0.8 建 4 条后段（全放 A30），
+前段落到 B 组，终审最坏相对极差 38.4%，η 放到 40% 通过。
+
+| 角色 | 节点 |
+|---|---|
+| 前段（层 1–8，全专家） | N09、N10、N11（RTX6000）、N12（T4） |
+| gsm8k | N07(9–32)→N06(33–48)、N05(9–32)→N03(33–48) |
+| mbpp | N01(9–33)→N04(34–48) |
+| no_robots | N08(9–34)→N02(35–48) |
+| 不用 | N13、N14、N15 |
+
+每 token 组合 p50：前段是 RTX 时约 28.5–29.3ms，是 T4（N12）时约 42ms（盲绑下任何前段都可能接任何后段）。
+以上不含 vLLM 每步的固定开销（每台约 1.4–3.4ms/token，一条通道 3 台约 +5–7ms）。
+
+用 vLLM 起这份方案时，`gpu_memory_utilization` 至少要到（权重 + 首尾表 + 固定开销 + 2GB KV）÷ 整卡：
+N01 0.92、N12 0.91、N05/N07 0.89、N08 0.79，其余 ≤ 0.66；统一设 0.93 即可（默认 0.9 时 N01、N12 的 KV 不到 2GB）。
 
 ## 6. 参考数值（用来判断复现是否正常）
 

@@ -148,6 +148,11 @@ def main() -> int:
                          "拓扑本身没有抖动维度 —— 默认 0，见 from_data.FabricOracle")
     ap.add_argument("--eta", type=float, default=0.15)
     ap.add_argument("--j-cap", type=float, default=30.0)
+    ap.add_argument("--w-cap", type=float, default=None,
+                    help="公共带上沿 w_cap（ms，前段出口 → 后段入口的 p50 上限）。默认按比例锚 "
+                         "ρ_w × 典型跳 p50 算；给了它就直接用这个值，--rho-w 不再起作用")
+    ap.add_argument("--rho-w", type=float, default=None,
+                    help="w_cap 的比例锚 ρ_w（PlannerConfig.rho_w，默认 1.5）：w_cap = ρ_w × 典型跳 p50")
     ap.add_argument("--seed", type=int, default=3)
     ap.add_argument("--hop-slack", type=int, default=1,
                     help="链长上限：段的跳数 ≤ 整数下界 hops_min（按段大小算）+ 此值；"
@@ -362,6 +367,10 @@ def main() -> int:
                         max_hops_slack=None if args.hop_slack < 0 else args.hop_slack)
     if args.endpoint_w is not None:
         cfg.endpoint_w = args.endpoint_w
+    if args.rho_w is not None:
+        cfg.rho_w = args.rho_w
+    if args.w_cap is not None:
+        cfg.w_cap_ms = args.w_cap
     oracle = FabricOracle(topo, jitter_frac=args.jitter_frac)
     net = MeasurementCache(oracle, k=cfg.k_probe, j_cap_ms=cfg.j_cap_ms,
                            k_gate=cfg.k_gate)

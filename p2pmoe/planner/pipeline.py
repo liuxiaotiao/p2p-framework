@@ -505,10 +505,16 @@ def plan(
     typical = net.typical_hop_p50([n.id for n in nodes])
     w_cap = cfg.w_cap_ms if cfg.w_cap_ms is not None else cfg.rho_w * typical
     w_cap95 = cfg.w_cap95_ms if cfg.w_cap95_ms is not None else w_cap + cfg.j_cap_ms
-    log.append(
-        f"[w_cap] 典型跳 p50 = {typical:.1f}ms → w_cap = ρ_w×典型跳 = "
-        f"{cfg.rho_w}×{typical:.1f} = {w_cap:.1f}ms，w_cap95 = {w_cap95:.1f}ms"
-    )
+    if cfg.w_cap_ms is not None:
+        log.append(
+            f"[w_cap] 直接给定 w_cap = {w_cap:.1f}ms（典型跳 p50 = {typical:.1f}ms，"
+            f"相当于 ρ_w = {w_cap / typical if typical else float('inf'):.2f}），w_cap95 = {w_cap95:.1f}ms"
+        )
+    else:
+        log.append(
+            f"[w_cap] 典型跳 p50 = {typical:.1f}ms → w_cap = ρ_w×典型跳 = "
+            f"{cfg.rho_w}×{typical:.1f} = {w_cap:.1f}ms，w_cap95 = {w_cap95:.1f}ms"
+        )
 
     # ---------------- Step 4：公共中值域（含反馈口） ------------------------
     band_res: BandResult | None = None

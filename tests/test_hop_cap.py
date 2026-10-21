@@ -10,6 +10,7 @@ N09+…+N04 共 9 台 8 跳的链，把剩余节点吃光，前段无处可放�
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -161,5 +162,53 @@ def test_doc_v2_plan_file_is_reproducible(tmp_path, monkeypatch, capsys):
         "--l0", "8", "--front-full", "--layer-times", str(lb), "--measured-mem",
         "--mem-margin-gb", "0", "--kv-reserve-gb", "2", "--mem-prefill-tokens", "512", "--endpoint-w", "0",
         "--save-plan", str(out)])
+    assert td.main() == 0
+    assert out.read_bytes() == want.read_bytes()
+
+
+def test_doc_v2_5ch_plan_file_is_reproducible(tmp_path, monkeypatch, capsys):
+    """qwen3-30b/plan_doc_v2_5ch.json：plan_doc_v2 的参数 + 放宽公共带上沿与均匀性阈值
+    （--w-cap 14 --eta 0.21），让 C 组也能进带、五条后段全保留（REPRODUCE 5.8）。"""
+    want = ROOT / "qwen3-30b" / "plan_doc_v2_5ch.json"
+    lb = ROOT / "qwen3-30b" / "layer_bench_wash1.json"
+    es = ROOT / "qwen3-30b" / "expert_sets_90" / "expert_sets_90_union.json"
+    if not (want.exists() and lb.exists() and es.exists() and (ROOT / "task3").exists()):
+        pytest.skip("缺 qwen3-30b/ 或 task3/ 数据")
+    sys.path.insert(0, str(ROOT))
+    import examples.task_deploy as td
+
+    out = tmp_path / "p.json"
+    monkeypatch.setattr(sys, "argv", [
+        "task_deploy", "--data", str(ROOT / "task3"), "--config", "qwen3-30b-a3b",
+        "--phase", "prefill", "--tasks", "gsm8k=1,mbpp=1,no_robots=1", "--expert-sets", str(es),
+        "--l0", "8", "--front-full", "--layer-times", str(lb), "--measured-mem",
+        "--mem-margin-gb", "0", "--kv-reserve-gb", "2", "--mem-prefill-tokens", "512", "--endpoint-w", "0",
+        "--w-cap", "14", "--eta", "0.21", "--save-plan", str(out)])
+    assert td.main() == 0
+    log = capsys.readouterr().out
+    assert "直接给定 w_cap = 14.0ms" in log
+    assert out.read_bytes() == want.read_bytes()
+    plan = json.loads(out.read_text())
+    assert len({n["segment"] for n in plan["nodes"] if n["role"] != "front"}) == 5
+    assert len(plan["nodes"]) == 15
+
+
+def test_vllm_plan_file_is_reproducible(tmp_path, monkeypatch, capsys):
+    """qwen3-30b/plan_vllm.json：vLLM 实测（batch 1、512 prompt + 512 生成）规划的方案（REPRODUCE 5.9）。"""
+    want = ROOT / "qwen3-30b" / "plan_vllm.json"
+    lb = ROOT / "qwen3-30b" / "layer_bench_vllm.json"
+    es = ROOT / "qwen3-30b" / "expert_sets_90" / "expert_sets_90_union.json"
+    if not (want.exists() and lb.exists() and es.exists() and (ROOT / "task3").exists()):
+        pytest.skip("缺 qwen3-30b/ 或 task3/ 数据")
+    sys.path.insert(0, str(ROOT))
+    import examples.task_deploy as td
+
+    out = tmp_path / "p.json"
+    monkeypatch.setattr(sys, "argv", [
+        "task_deploy", "--data", str(ROOT / "task3"), "--config", "qwen3-30b-a3b",
+        "--phase", "prefill", "--tasks", "gsm8k=1,mbpp=1,no_robots=1", "--expert-sets", str(es),
+        "--l0", "8", "--front-full", "--layer-times", str(lb), "--layer-time-key", "req@p512g512",
+        "--measured-mem", "--mem-margin-gb", "0", "--kv-reserve-gb", "2", "--endpoint-w", "0",
+        "--theta", "0.8", "--eta", "0.4", "--save-plan", str(out)])
     assert td.main() == 0
     assert out.read_bytes() == want.read_bytes()

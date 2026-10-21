@@ -418,13 +418,18 @@ def _log_run(m: dict) -> None:
              m["n_requests"], m["n_timeout"], m["wall_s"], m["inflight"])
     log.info("  生成时延  均值 %.0fms  p50 %.0f  p90 %.0f  p99 %.0f",
              L.get("mean", 0), L.get("p50", 0), L.get("p90", 0), L.get("p99", 0))
-    log.info("  TTFT      均值 %.0fms  p50 %.0f  p99 %.0f",
-             T.get("mean", 0), T.get("p50", 0), T.get("p99", 0))
+    log.info("  TTFT      均值 %.0fms ± %.0f（标准差）  p50 %.0f  p99 %.0f",
+             T.get("mean", 0), T.get("std", 0), T.get("p50", 0), T.get("p99", 0))
     S_ = m.get("ttft_service_ms", {})
-    log.info("  TTFT(去排队) 均值 %.0fms  p50 %.0f  p99 %.0f",
-             S_.get("mean", 0), S_.get("p50", 0), S_.get("p99", 0))
-    log.info("  TPOT      均值 %.1fms  p50 %.1f  p99 %.1f",
-             P.get("mean", 0), P.get("p50", 0), P.get("p99", 0))
+    log.info("  TTFT(去排队) 均值 %.0fms ± %.0f  p50 %.0f  p99 %.0f",
+             S_.get("mean", 0), S_.get("std", 0), S_.get("p50", 0), S_.get("p99", 0))
+    log.info("  TPOT      均值 %.1fms ± %.1f  p50 %.1f  p99 %.1f",
+             P.get("mean", 0), P.get("std", 0), P.get("p50", 0), P.get("p99", 0))
+    for name, k in (("含排队", "tok_per_s"), ("去排队", "tok_per_s_service"),
+                    ("解码", "decode_tok_per_s")):
+        v = m.get(k) or {}
+        log.info("  单请求 token/s（%s） 均值 %.2f ± %.2f  p50 %.2f",
+                 name, v.get("mean", 0), v.get("std", 0), v.get("p50", 0))
     log.info("  吞吐      %.2f 输出 token/s，%.2f 请求/分钟（输出共 %d token）",
              th["output_tok_per_s"] or 0, th["req_per_min"] or 0, m["output_tokens"])
     a = m.get("accuracy")

@@ -33,6 +33,14 @@ def test_metrics_definitions():
     assert m["latency_ms"]["p99"] == pytest.approx(np.percentile([1000, 3000], 99))
     assert set(m["by_task"]) == {"x", "y"}
     assert m["stop_reasons"] == {"eos": 1, "max_tokens": 1}
+    # 标准差（样本，n−1）与单请求 token/s
+    assert m["ttft_ms"]["std"] == pytest.approx(np.std([100, 300], ddof=1), abs=0.01)
+    assert m["tpot_ms"]["std"] == pytest.approx(np.std([900 / 9, 2700 / 27], ddof=1), abs=0.01)
+    assert m["tok_per_s"]["mean"] == pytest.approx((10 / 1.0 + 28 / 3.0) / 2, abs=0.01)
+    assert m["tok_per_s_service"]["mean"] == pytest.approx((10 / 0.95 + 28 / 3.0) / 2, abs=0.01)
+    assert m["decode_tok_per_s"]["mean"] == pytest.approx(10.0, abs=0.01)
+    assert m["by_task"]["x"]["tok_per_s"]["mean"] == pytest.approx(10.0)
+    assert run_metrics(rows[:1], wall_s=1.0)["ttft_ms"]["std"] == 0.0
 
 
 @pytest.mark.slow
@@ -71,7 +79,9 @@ def test_closed_loop_end_to_end(tmp_path) -> None:
                 "--k-probe", "2", "--skip-model-check", "--lr-model", str(sel),
                 "--prompts-file", str(cases), "--save-results", str(res), "--once",
                 "--closed-loop", "--inflight", "2", "--usage-interval", "0.2",
-                "--warmup", "1"]
+                "--warmup", "1",
+                # 小池 + 探测只采 2 次：θ=1 时偶尔凑不够公共带人口；这里测控制面，按文档初值留余量
+                "--theta", "0.8"]
         assert main(args) == 0
     finally:
         for s in srv:
@@ -114,7 +124,8 @@ def _report_renders(res) -> None:
     body = src.split("cmd_report() {", 1)[1].split("<<'PYEOF'\n", 1)[1].split("\nPYEOF", 1)[0]
     p = subprocess.run([sys.executable, "-c", body, str(res)], capture_output=True, text=True)
     assert p.returncode == 0, p.stderr[-2000:]
-    for want in ("连续性测试", "生成时延 ms", "TTFT ms", "TPOT ms/token", "吞吐", "资源占用"):
+    for want in ("连续性测试", "生成时延 ms", "TTFT ms", "TPOT ms/token", "吞吐", "资源占用",
+                 "标准差", "token/s(去排队)", "TPOT std", "tok/s均值"):
         assert want in p.stdout, (want, p.stdout[-1500:])
 
 

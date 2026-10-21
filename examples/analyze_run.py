@@ -5,7 +5,7 @@
     python3 examples/analyze_run.py results/run2.json --csv results/run2_latency.csv
 
 各节：
-  latency     端到端时延：含排队 vs 去排队（总体 + 分 task，Markdown 表）
+  latency     端到端时延：含排队 vs 去排队，TTFT、TPOT、单请求 token/s（总体 + 分 task，Markdown 表）
   ttft        TTFT：原始 / 去排队 / 排队本身（总体 + 分 task）
   throughput  吞吐：整体 / 稳态（在途数保持满）/ 收尾，以及每 5 分钟一段
   slowest     TTFT 最高的几条：链路、TTFT 拆分、排队时占着那条后段的是谁
@@ -41,28 +41,35 @@ def label(r):
     return str(max(raw, key=raw.get)).split("#")[0] if raw else r.get("task")
 
 
+def tok_s(n, ms):
+    return n / ms * 1000 if ms and ms > 0 else float("nan")
+
+
 def groups(rs):
     return [("全部", rs)] + [(u, [r for r in rs if r["true_task"] == u])
                              for u in sorted({r["true_task"] for r in rs})]
 
 
 def table(rows, unit, fmt="{:.2f}"):
-    print("| 指标 | mean | p50 | p90 | p99 | max |")
-    print("|---|---|---|---|---|---|")
+    print("| 指标 | mean | std | p50 | p90 | p99 | max |")
+    print("|---|---|---|---|---|---|---|")
     for name, xs in rows:
         a = np.asarray(xs, float)
         a = a[~np.isnan(a)] / unit
         if not len(a):
-            print(f"| {name} | — | — | — | — | — |")
+            print(f"| {name} | — | — | — | — | — | — |")
             continue
         print(f"| {name} | " + " | ".join(fmt.format(v) for v in (
-            a.mean(), np.percentile(a, 50), np.percentile(a, 90),
+            a.mean(), a.std(ddof=1) if len(a) > 1 else 0.0,
+            np.percentile(a, 50), np.percentile(a, 90),
             np.percentile(a, 99), a.max())) + " |")
 
 
 # --------------------------------------------------------------------------- #
 def sec_latency(rs, _d):
-    print("## 端到端时延：含排队 vs 去排队（秒；TPOT 毫秒）")
+    print("## 端到端时延：含排队 vs 去排队（秒；TPOT 毫秒；std 为样本标准差）")
+    print("单请求 token/s：每条请求的生成 token ÷ 用时，再对请求取均值 / 标准差 —— "
+          "含排队从提交算起，去排队从拿到前后段算起，解码 = 1000 ÷ TPOT")
     for name, s in groups(rs):
         share = sum(queue(r) for r in s) / max(sum(r["total_ms"] for r in s), 1e-9)
         print(f"\n### {name}（{len(s)} 条，排队占时延 {share:.1%}，平均生成 "
@@ -73,6 +80,10 @@ def sec_latency(rs, _d):
                ("TTFT（含排队）", [r["prefill_ms"] for r in s]),
                ("TTFT（去排队）", [r["prefill_ms"] - queue(r) for r in s])], 1000)
         table([("TPOT ms/token", [tpot(r) for r in s])], 1, "{:.1f}")
+        table([("单请求 token/s（含排队）", [tok_s(r["n_generated"], r["total_ms"]) for r in s]),
+               ("单请求 token/s（去排队）",
+                [tok_s(r["n_generated"], r["total_ms"] - queue(r)) for r in s]),
+               ("解码 token/s（1000/TPOT）", [tok_s(1, tpot(r)) for r in s])], 1)
 
 
 def sec_ttft(rs, _d):
@@ -185,7 +196,8 @@ def write_csv(rs, path):
         w = csv.writer(f)
         w.writerow(["req", "case_id", "task", "routed", "front", "back", "n_prompt",
                     "n_generated", "stop_reason", "e2e_ms", "e2e_noqueue_ms", "queue_front_ms",
-                    "queue_back_ms", "ttft_ms", "ttft_noqueue_ms", "tpot_ms", "rebinds",
+                    "queue_back_ms", "ttft_ms", "ttft_noqueue_ms", "tpot_ms",
+                    "tok_per_s", "tok_per_s_noqueue", "rebinds",
                     "t_submit_s", "t_done_s"])
         for r in sorted(rs, key=lambda r: int(re.sub(r"\D", "", r["req"]) or 0)):
             w.writerow([r["req"], r.get("case_id"), r["true_task"], r["task"], r["front"],
@@ -193,6 +205,8 @@ def write_csv(rs, path):
                         round(r["total_ms"], 1), round(r["total_ms"] - queue(r), 1),
                         r["queue_ms"], r["queue_back_ms"], round(r["prefill_ms"], 1),
                         round(r["prefill_ms"] - queue(r), 1), round(tpot(r), 2),
+                        round(tok_s(r["n_generated"], r["total_ms"]), 3),
+                        round(tok_s(r["n_generated"], r["total_ms"] - queue(r)), 3),
                         r.get("rebinds", 0), r.get("t_submit_s"), r.get("t_done_s")])
     print(f"\n逐条数据 → {path}")
 

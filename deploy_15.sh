@@ -713,15 +713,39 @@ if run:
     print(f"\n{B}  连续性测试：{run['n_requests']} 条（超时 {run['n_timeout']}），"
           f"在途 {run['inflight']}，最大生成 {run.get('max_tokens')}，"
           f"墙钟 {run['wall_s']:.0f}s{R}")
-    print(f"    {'指标':<16}{'均值':>10}{'p50':>10}{'p90':>10}{'p99':>10}{'最大':>10}")
-    for name, k, f in (("生成时延 ms", "latency_ms", "{:.0f}"), ("TTFT ms", "ttft_ms", "{:.0f}"),
-                       ("TTFT(去排队) ms", "ttft_service_ms", "{:.0f}"),
-                       ("TPOT ms/token", "tpot_ms", "{:.1f}"),
-                       ("后段排队 ms", "queue_back_ms", "{:.0f}"),
-                       ("生成长度 token", "gen_len", "{:.0f}")):
-        m = run.get(k) or {}
+    # 按逐条请求现算（旧结果文件里没有标准差与单请求 token/s，也能出）
+    def _q(r):
+        return r.get("queue_ms", 0.0) + r.get("queue_back_ms", 0.0)
+    def _tpot(r):
+        n = int(r.get("n_generated", 0))
+        return (r["total_ms"] - r["prefill_ms"]) / (n - 1) if n > 1 else None
+    def _div(n, ms):
+        return n / ms * 1000 if ms and ms > 0 else None
+    def _st(xs):
+        xs = sorted(float(x) for x in xs if x is not None)
+        if not xs:
+            return {}
+        def pct(p):
+            k = (len(xs) - 1) * p / 100; lo = int(k); hi = min(lo + 1, len(xs) - 1)
+            return xs[lo] + (xs[hi] - xs[lo]) * (k - lo)
+        return {"mean": st.mean(xs), "std": st.stdev(xs) if len(xs) > 1 else 0.0,
+                "p50": pct(50), "p90": pct(90), "p99": pct(99), "max": xs[-1]}
+    METRICS = (("生成时延 ms", lambda r: r["total_ms"], "{:.0f}"),
+               ("TTFT ms", lambda r: r["prefill_ms"], "{:.0f}"),
+               ("TTFT(去排队) ms", lambda r: r["prefill_ms"] - _q(r), "{:.0f}"),
+               ("TPOT ms/token", _tpot, "{:.1f}"),
+               ("后段排队 ms", lambda r: r.get("queue_back_ms", 0.0), "{:.0f}"),
+               ("生成长度 token", lambda r: r["n_generated"], "{:.0f}"),
+               ("token/s(含排队)", lambda r: _div(r["n_generated"], r["total_ms"]), "{:.2f}"),
+               ("token/s(去排队)", lambda r: _div(r["n_generated"], r["total_ms"] - _q(r)), "{:.2f}"),
+               ("token/s(解码)", lambda r: _div(1, _tpot(r)), "{:.2f}"))
+    print(f"    {'指标':<16}{'均值':>10}{'标准差':>10}{'p50':>10}{'p90':>10}{'p99':>10}{'最大':>10}")
+    for name, fn, f in METRICS:
+        m = _st(fn(r) for r in rs)
         print(f"    {name:<16}" + "".join(f"{S(m, q, f):>10}"
-                                         for q in ("mean", "p50", "p90", "p99", "max")))
+                                         for q in ("mean", "std", "p50", "p90", "p99", "max")))
+    print("    单请求 token/s：每条请求自己的生成速度（生成 token ÷ 用时），再对全部请求取均值 / 标准差；")
+    print("      含排队 = 提交→最后一个 token，去排队 = 拿到前后段→最后一个 token，解码 = 1000 ÷ TPOT")
     th = run["throughput"]
     print(f"    吞吐：输出 {th['output_tok_per_s']:.2f} token/s，"
           f"含 prompt {th['total_tok_per_s']:.2f} token/s，{th['req_per_min']:.2f} 请求/分钟"
@@ -730,18 +754,25 @@ if run:
     if a:
         print(f"    识别：{a['correct']}/{a['n']} = {a['rate']:.1%}（选择器自己判的类）；"
               f"通道二报警 {run.get('alarms', 0)} 次，换绑 {run.get('rebinds', 0)} 次")
-    print(f"\n    {'task':<11}{'条数':>5}{'时延均值':>10}{'时延p99':>10}{'TTFT均值':>10}"
-          f"{'去排队TTFT':>11}{'TPOT均值':>10}{'后段排队':>10}{'生成均长':>9}{'识别':>8}{'换绑':>5}")
+    print(f"\n    {'task':<11}{'条数':>5}{'时延均值':>10}{'时延p99':>10}{'TTFT均值':>10}{'TTFT std':>10}"
+          f"{'去排队TTFT':>11}{'TPOT均值':>10}{'TPOT std':>10}{'tok/s均值':>10}{'tok/s std':>10}"
+          f"{'后段排队':>10}{'生成均长':>9}{'识别':>8}{'换绑':>5}")
     for u, m in run["by_task"].items():
         acc = m.get("accuracy")
         acc_s = "{:.0%}".format(acc["rate"]) if acc else "—"
+        ru = [r for r in rs if (r.get("true_task") or "?") == u]
+        tt, tp = _st(r["prefill_ms"] for r in ru), _st(_tpot(r) for r in ru)
+        sp = _st(_div(r["n_generated"], r["total_ms"] - _q(r)) for r in ru)
         print(f"    {u:<11}{m['n']:>5}{S(m['latency_ms'],'mean'):>10}"
-              f"{S(m['latency_ms'],'p99'):>10}{S(m['ttft_ms'],'mean'):>10}"
+              f"{S(m['latency_ms'],'p99'):>10}{S(tt,'mean'):>10}{S(tt,'std'):>10}"
               f"{S(m.get('ttft_service_ms') or {},'mean'):>11}"
-              f"{S(m['tpot_ms'],'mean','{:.1f}'):>10}{S(m['queue_back_ms'],'mean'):>10}"
+              f"{S(tp,'mean','{:.1f}'):>10}{S(tp,'std','{:.1f}'):>10}"
+              f"{S(sp,'mean','{:.2f}'):>10}{S(sp,'std','{:.2f}'):>10}"
+              f"{S(m['queue_back_ms'],'mean'):>10}"
               f"{S(m['gen_len'],'mean'):>9}"
               f"{acc_s:>8}"
               f"{m.get('rebinds', 0):>5}")
+    print("    （tok/s = 单请求 token/s，去排队口径）")
     if run.get("nodes"):
         print(f"\n{B}  资源占用（连续测试窗口内）{R}")
         print(f"    {'节点':<6}{'段':<13}{'计算占用':>8}{'GPU均值%':>9}{'GPU p95%':>9}"

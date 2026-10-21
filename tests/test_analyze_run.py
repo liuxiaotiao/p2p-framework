@@ -38,7 +38,8 @@ def test_every_section_runs(tmp_path, capsys):
     assert ar.main([str(p), "--csv", str(tmp_path / "o.csv")]) == 0
     out = capsys.readouterr().out
     for want in ("E2E（去排队）", "TTFT（去排队）", "稳态", "TTFT 最高", "总计 12/12",
-                 "后段排队 > TTFT 的 0 条"):
+                 "后段排队 > TTFT 的 0 条", "| mean | std |", "单请求 token/s（去排队）",
+                 "解码 token/s（1000/TPOT）"):
         assert want in out, want
     assert (tmp_path / "o.csv").read_text().count("\n") == 13
 
@@ -47,3 +48,17 @@ def test_section_filter(tmp_path, capsys):
     assert ar.main([str(_fake(tmp_path)), "ttft"]) == 0
     out = capsys.readouterr().out
     assert "TTFT（原始）" in out and "选择器" not in out
+
+
+def test_token_rate_and_std(tmp_path, capsys):
+    """单请求 token/s = 生成 token ÷ 用时；std 为样本标准差。"""
+    import numpy as np
+
+    assert ar.tok_s(20, 4000) == 5.0
+    assert ar.main([str(_fake(tmp_path)), "latency"]) == 0
+    out = capsys.readouterr().out
+    # 全部 12 条：8 条 4000ms、4 条 9000ms（no_robots 排队 5000ms）→ 含排队 5.0 / 2.22 token/s
+    xs = np.array([5.0] * 8 + [20 / 9.0] * 4)
+    row = next(l for l in out.splitlines() if l.startswith("| 单请求 token/s（含排队）"))
+    assert row.split("|")[2].strip() == f"{xs.mean():.2f}"
+    assert row.split("|")[3].strip() == f"{xs.std(ddof=1):.2f}"

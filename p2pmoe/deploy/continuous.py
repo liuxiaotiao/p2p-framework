@@ -13,6 +13,10 @@
     - 生成时延：提交 → 最后一个 token（端到端，含排队），均值 / p50 / p90 / p99
     - TTFT：提交 → 第一个 token（含排队与 prefill）
     - TPOT：decode 阶段每 token 的平均间隔
+    - 单请求 token/s：每条请求自己的生成速度，再对全部请求求均值与标准差
+      （含排队 = 生成 token ÷ 提交→最后一个 token；去排队 = 生成 token ÷ 拿到前后段→最后一个 token；
+      解码 = 1000 ÷ TPOT）
+    - 各项都给均值、标准差（样本标准差，n−1）、p50 / p90 / p99 / 最大
     - 吞吐：输出 token/s、请求/分钟（墙钟 = 第一条提交 → 最后一条完成）
     - 资源：各节点的计算占用（forward 时间 / 墙钟）、GPU 利用率（nvidia-smi 采样）、
       显存（nvidia-smi 整卡峰值 + torch 分配器峰值）
@@ -188,6 +192,7 @@ def _stats(xs: Sequence[float]) -> dict:
         return {"n": 0}
     a = np.asarray(xs)
     return {"n": len(xs), "mean": round(float(a.mean()), 2),
+            "std": round(float(a.std(ddof=1)), 2) if len(xs) > 1 else 0.0,
             "p50": round(float(np.percentile(a, 50)), 2),
             "p90": round(float(np.percentile(a, 90)), 2),
             "p99": round(float(np.percentile(a, 99)), 2),
@@ -222,6 +227,30 @@ def tpot_ms(r: dict) -> float | None:
     return (r["total_ms"] - r["prefill_ms"]) / (n - 1)
 
 
+def tok_per_s(r: dict) -> float | None:
+    """这条请求的生成速度（含排队）：生成 token ÷ 提交 → 最后一个 token。"""
+    t = float(r.get("total_ms", 0.0))
+    return int(r["n_generated"]) / t * 1000 if t > 0 else None
+
+
+def service_tok_per_s(r: dict) -> float | None:
+    """去排队的生成速度：生成 token ÷ 拿到前后段 → 最后一个 token（含 prefill）。"""
+    t = float(r.get("total_ms", 0.0)) - r.get("queue_ms", 0.0) - r.get("queue_back_ms", 0.0)
+    return int(r["n_generated"]) / t * 1000 if t > 0 else None
+
+
+def decode_tok_per_s(r: dict) -> float | None:
+    """decode 阶段的速度：1000 ÷ TPOT（不含 prefill 与排队）。"""
+    t = tpot_ms(r)
+    return 1000.0 / t if t and t > 0 else None
+
+
+def _speed(rows: Sequence[dict]) -> dict:
+    return {"tok_per_s": _stats([tok_per_s(r) for r in rows]),
+            "tok_per_s_service": _stats([service_tok_per_s(r) for r in rows]),
+            "decode_tok_per_s": _stats([decode_tok_per_s(r) for r in rows])}
+
+
 def run_metrics(rows: Sequence[dict], wall_s: float, *,
                 usage: dict | None = None, inflight: int | None = None,
                 n_timeout: int = 0) -> dict:
@@ -242,6 +271,7 @@ def run_metrics(rows: Sequence[dict], wall_s: float, *,
         "output_tokens": out_tok,
         "prompt_tokens": in_tok,
         "gen_len": _stats([r["n_generated"] for r in rows]),
+        **_speed(rows),
         "throughput": {
             "output_tok_per_s": round(out_tok / wall_s, 3) if wall_s else None,
             "total_tok_per_s": round((out_tok + in_tok) / wall_s, 3) if wall_s else None,
@@ -266,6 +296,7 @@ def run_metrics(rows: Sequence[dict], wall_s: float, *,
         "queue_back_ms": _stats([r.get("queue_back_ms", 0.0) for r in rs]),
         "output_tokens": sum(int(r["n_generated"]) for r in rs),
         "gen_len": _stats([r["n_generated"] for r in rs]),
+        **_speed(rs),
         "accuracy": _acc(rs),
         "rebinds": sum(int(r.get("rebinds", 0)) for r in rs),
     } for u, rs in sorted(by.items())}

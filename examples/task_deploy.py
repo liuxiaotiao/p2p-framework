@@ -170,6 +170,9 @@ def main() -> int:
                          "此时 --reserve-gb 不再使用")
     ap.add_argument("--mem-margin-gb", type=float, default=0.5,
                     help="--measured-mem 时每台再额外留的余量（GB）")
+    ap.add_argument("--kv-reserve-gb", type=float, default=None,
+                    help="--measured-mem 时每台固定留给 KV cache 的显存（GB），剩下的全给权重；"
+                         "给了它 KV 就不再按 --ctx 逐层算进段驻留")
     ap.add_argument("--mem-prefill-tokens", type=int, default=None,
                     help="--measured-mem 时按多长的 prompt 留激活峰值（取实测里不小于它的最短一档）；"
                          "默认取量过的最长一档。KV 按 --ctx（prompt + 生成的总长）算")
@@ -186,6 +189,10 @@ def main() -> int:
     ap.add_argument("--save-spec", type=Path, default=None,
                     help="导出 deploy/run.py 能吃的布局文件")
     args = ap.parse_args()
+    if args.kv_reserve_gb is not None and not args.measured_mem:
+        raise SystemExit("--kv-reserve-gb 要配 --measured-mem")
+    if args.kv_reserve_gb is not None and args.kv_reserve_gb < 0:
+        raise SystemExit(f"--kv-reserve-gb 不能为负，收到 {args.kv_reserve_gb}")
 
     D = Path(args.data)
     hf_cfg, model_name = _model_config(args.config)
@@ -245,9 +252,12 @@ def main() -> int:
                    if v.get("total_gb")}
             if not mem:
                 raise SystemExit(f"{args.layer_times} 里没有显存实测（旧版 layerbench 的结果？重跑一次）")
-            topo, mrows = apply_layer_memory(topo, mem, margin_gb=args.mem_margin_gb)
+            topo, mrows = apply_layer_memory(topo, mem, margin_gb=args.mem_margin_gb,
+                                             kv_reserve_gb=args.kv_reserve_gb or 0.0)
             ats = sorted({v.get("prefill_extra_at") for v in mem.values()} - {None})
-            print(f"  显存     用实测（GB=1e9），激活峰值按 prompt {ats} token，KV 按上下文 {args.ctx}；"
+            kvs = (f"KV 每台固定留 {args.kv_reserve_gb:g}GB（不再按上下文逐层计入）"
+                   if args.kv_reserve_gb is not None else f"KV 按上下文 {args.ctx}")
+            print(f"  显存     用实测（GB=1e9），激活峰值按 prompt {ats} token，{kvs}；"
                   f"每台可用量（原「标称 − {args.reserve_gb}」→ 实测）：")
             for nid, tier, old_v, new_v, src in mrows:
                 print(f"           {nid:<5}{tier:<9} {old_v:>7.2f} → {new_v:>7.2f}  {src}")
@@ -276,6 +286,12 @@ def main() -> int:
         emb = int(hf_cfg["vocab_size"]) * int(hf_cfg["hidden_size"]) * args.dtype_bytes / 1e9
         spec = dataclasses.replace(spec, embed_gb=emb,
                                    lm_head_gb=emb + int(hf_cfg["hidden_size"]) * args.dtype_bytes / 1e9)
+        if args.kv_reserve_gb is not None:
+            # KV 已经在每台的可用量里整块扣掉了，段驻留里不再逐层算
+            kv_tok = spec.kv_gb_per_layer / max(spec.ctx_max, 1) * 1e9
+            spec = dataclasses.replace(spec, ctx_max=0)
+            print(f"  KV       每台固定留 {args.kv_reserve_gb:g}GB（每 token 每层 {kv_tok:.0f}B；"
+                  f"放 30 层的节点约可容 {args.kv_reserve_gb * 1e9 / (kv_tok * 30):,.0f} token）")
         print(f"  首尾额外 前段 head 词嵌入 {spec.embed_gb:.3f}GB，后段 tail 输出头 {spec.lm_head_gb:.3f}GB（已计入）")
     bad = [u for u, p in profiles.items()
            if (p.n_layers, p.n_experts) != (info.n_layers, info.n_experts)]

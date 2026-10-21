@@ -249,6 +249,60 @@ def test_apply_layer_memory(tmp_path):
     assert "标称" in next(r[4] for r in rows if r[0] == "T1")
 
 
+def test_apply_layer_memory_kv_reserve(tmp_path):
+    """--kv-reserve-gb：每台再整块扣掉给 KV 的那份，来源说明里写明。"""
+    from p2pmoe.planner.from_data import apply_layer_memory
+
+    topo = _topo(tmp_path)
+    meas = {"A1": {"total_gb": 25.3, "context_gb": 0.4, "prefill_extra_gb": 0.6, "overhead_ratio": 1.0}}
+    new, rows = apply_layer_memory(topo, meas, margin_gb=0.0, kv_reserve_gb=2.0)
+    u = {n.id: n.usable_gb for n in new.nodes}
+    assert u["A1"] == pytest.approx(25.3 - 0.4 - 0.6 - 2.0, abs=1e-3)
+    assert "KV 预留 2.00" in next(r[4] for r in rows if r[0] == "A1")
+    _, rows0 = apply_layer_memory(topo, meas, margin_gb=0.0)
+    assert "KV 预留" not in next(r[4] for r in rows0 if r[0] == "A1")
+
+
+def test_kv_reserve_drops_per_layer_kv(monkeypatch, capsys):
+    """给了 --kv-reserve-gb，清单里各段的 KV 记 0（已在每台可用量里整块扣掉）。"""
+    import json
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    lb = root / "qwen3-30b" / "layer_bench_wash1.json"
+    es = root / "qwen3-30b" / "expert_sets_90" / "expert_sets_90_union.json"
+    if not (lb.exists() and es.exists() and (root / "task3").exists()):
+        pytest.skip("缺 qwen3-30b/ 或 task3/ 数据")
+    sys.path.insert(0, str(root))
+    import examples.task_deploy as td
+
+    out = Path(pytest.importorskip("tempfile").mkdtemp()) / "p.json"
+    monkeypatch.setattr(sys, "argv", [
+        "task_deploy", "--data", str(root / "task3"), "--config", "qwen3-30b-a3b",
+        "--phase", "prefill", "--tasks", "gsm8k=1,mbpp=1,no_robots=1", "--expert-sets", str(es),
+        "--l0", "8", "--front-full", "--layer-times", str(lb), "--measured-mem",
+        "--mem-margin-gb", "0", "--kv-reserve-gb", "2", "--endpoint-w", "0", "--save-plan", str(out)])
+    assert td.main() == 0
+    plan = json.loads(out.read_text())
+    assert all(n["kv_gb"] == 0 for n in plan["nodes"])
+    assert "KV 每台固定留 2GB" in capsys.readouterr().out
+
+
+def test_kv_reserve_requires_measured_mem(monkeypatch):
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(root))
+    import examples.task_deploy as td
+
+    monkeypatch.setattr(sys, "argv", ["task_deploy", "--data", str(root / "task3"),
+                                      "--tasks", "gsm8k=1", "--kv-reserve-gb", "2"])
+    with pytest.raises(SystemExit, match="--measured-mem"):
+        td.main()
+
+
 def test_head_and_tail_extras_count_only_at_the_ends():
     from p2pmoe.planner.types import SegmentSpec
 

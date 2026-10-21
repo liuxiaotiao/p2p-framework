@@ -266,10 +266,13 @@ def apply_layer_times(
 
 def apply_layer_memory(
     topo: TopoInfo, measured: Mapping[str, Mapping], *, margin_gb: float = 0.5,
+    kv_reserve_gb: float = 0.0,
 ) -> tuple[TopoInfo, list[tuple[str, str, float, float, str]]]:
     """用实测显存（`deploy/layer_bench.py` 的 memory 表）代替「标称容量 − 固定预留」。
 
-    每台的可用量 = (实测容量 − CUDA context − prefill 激活峰值 − margin) ÷ 分配器开销比。
+    每台的可用量 = (实测容量 − CUDA context − prefill 激活峰值 − margin − kv_reserve) ÷ 分配器开销比。
+    kv_reserve_gb > 0 时 KV 不再按上下文长度逐层算进段驻留（调用方把 ctx_max 置 0），
+    而是每台固定留这么多给 KV cache，剩下的全给权重。
     除以开销比，等价于把每层权重按实测的碎片/取整放大。缺测的量依次退到同型号实测均值、
     全部实测的中位数；容量也缺就保留拓扑的标称值。
 
@@ -307,9 +310,11 @@ def apply_layer_memory(
         ratio, s_r = pick(n.id, "overhead_ratio", 1.0)
         if ratio < 1.0:              # < 1 物理上不可能，是测量基线没清干净（旧版 layerbench）
             ratio, s_r = 1.0, "实测<1，按 1"
-        usable = max(0.0, (total - ctx_gb - act - margin_gb) / ratio)
+        usable = max(0.0, (total - ctx_gb - act - margin_gb - kv_reserve_gb) / ratio)
         src = (f"容量 {total:.2f}({s_total}) − context {ctx_gb:.2f}({s_ctx}) − 激活 {act:.2f}({s_act})"
-               f" − 余量 {margin_gb:.2f}，÷ 开销比 {ratio:.3f}({s_r})")
+               f" − 余量 {margin_gb:.2f}"
+               + (f" − KV 预留 {kv_reserve_gb:.2f}" if kv_reserve_gb else "")
+               + f"，÷ 开销比 {ratio:.3f}({s_r})")
         rows.append((n.id, n.tier, round(n.usable_gb, 3), round(usable, 3), src))
         out.append(_replace(n, mem_gb=round(total, 4), reserve_gb=round(total - usable, 4)))
     return TopoInfo(nodes=out, p50_ms=topo.p50_ms, bandwidth_mbps=topo.bandwidth_mbps,

@@ -152,10 +152,11 @@ def main() -> int:
     ap.add_argument("--hop-slack", type=int, default=1,
                     help="链长上限：段的跳数 ≤ 整数下界 hops_min（按段大小算）+ 此值；"
                          "负数表示不限（PlannerConfig.max_hops_slack）")
-    ap.add_argument("--rent-policy", default="smallest_sufficient",
-                    choices=("smallest_sufficient", "largest"),
-                    help="影子租金 R_F 怎么选：largest = 文档 III.8.4（内存最大的 N 台）；"
-                         "smallest_sufficient = 现行默认（够装前段的最小 N 台）")
+    ap.add_argument("--rent-policy", default="none",
+                    choices=("none", "smallest_sufficient", "largest"),
+                    help="影子租金 R_F（后段建段时给前段预留节点）：none = 不预留（默认，前段压到每台都放得下）；"
+                         "largest = 文档 III.8.4（内存最大的 N 台）；smallest_sufficient = 够装前段的最小 N 台"
+                         "（2026-10-20 之前的默认，原样重出旧方案时加 --rent-policy smallest_sufficient）")
     ap.add_argument("--endpoint-w", type=float, default=None,
                     help="后段端点项权重（PlannerConfig.endpoint_w，默认 1.0）；0 = 文档原始目标函数")
     ap.add_argument("--layer-times", type=Path, default=None,
@@ -169,6 +170,15 @@ def main() -> int:
                          "此时 --reserve-gb 不再使用")
     ap.add_argument("--mem-margin-gb", type=float, default=0.5,
                     help="--measured-mem 时每台再额外留的余量（GB）")
+    ap.add_argument("--mem-prefill-tokens", type=int, default=None,
+                    help="--measured-mem 时按多长的 prompt 留激活峰值（取实测里不小于它的最短一档）；"
+                         "默认取量过的最长一档。KV 按 --ctx（prompt + 生成的总长）算")
+    ap.add_argument("--theta", type=float, default=1.0,
+                    help="Step 2 的折扣 θ：可建通道数 = ⌊θ × 显存配平上限⌋。默认 1.0 = 不打折；"
+                         "文档初值 0.8。2026-10-20 之前的方案都是 0.8，原样重出时加 --theta 0.8")
+    ap.add_argument("--avail", type=float, default=1.0,
+                    help="各节点可用率 r_v（稳定性项 μ·Σ(−ln r_v) 用）。默认 1.0 = 不计稳定性罚；"
+                         "2026-10-20 之前的方案都是 0.95，原样重出时加 --avail 0.95")
     ap.add_argument("--fill-idle", action="store_true",
                     help="主流程之后补位：提拔备胎、用空闲节点加通道、剩下的分摊到显存最紧的段，"
                          "让每台节点都有活干。补位段不过公共带（见 planner/fill.py）")
@@ -207,8 +217,13 @@ def main() -> int:
                     f"（专家 {d['suspect_experts'][:4]}…，最多占该层 {sh:.0%} 的计数）"
                     f"—— 采集端的 bug，这些专家会被当成没激活")
         print(f"  {name:<8} {d['n_layers']} 层 × {d['n_experts']} 专家，{args.phase} 相{warn}")
+    if not 0 < args.theta <= 1:
+        raise SystemExit(f"--theta 要在 (0, 1] 里，收到 {args.theta}")
+    if not 0 < args.avail <= 1:
+        raise SystemExit(f"--avail 要在 (0, 1] 里，收到 {args.avail}")
     topo = load_topology(D / "topo_fabric_mbps.json", d_model=int(hf_cfg["hidden_size"]),
-                         dtype_bytes=args.dtype_bytes, reserve_gb=args.reserve_gb)
+                         dtype_bytes=args.dtype_bytes, reserve_gb=args.reserve_gb,
+                         avail=args.avail)
     if args.layer_times:
         from p2pmoe.deploy.layer_bench import per_node_ms
         from p2pmoe.planner.from_data import apply_layer_times
@@ -226,11 +241,14 @@ def main() -> int:
             from p2pmoe.deploy.layer_bench import per_node_memory
             from p2pmoe.planner.from_data import apply_layer_memory
 
-            mem = {k: v for k, v in per_node_memory(table).items() if v.get("total_gb")}
+            mem = {k: v for k, v in per_node_memory(table, args.mem_prefill_tokens).items()
+                   if v.get("total_gb")}
             if not mem:
                 raise SystemExit(f"{args.layer_times} 里没有显存实测（旧版 layerbench 的结果？重跑一次）")
             topo, mrows = apply_layer_memory(topo, mem, margin_gb=args.mem_margin_gb)
-            print(f"  显存     用实测（GB=1e9），每台可用量（原「标称 − {args.reserve_gb}」→ 实测）：")
+            ats = sorted({v.get("prefill_extra_at") for v in mem.values()} - {None})
+            print(f"  显存     用实测（GB=1e9），激活峰值按 prompt {ats} token，KV 按上下文 {args.ctx}；"
+                  f"每台可用量（原「标称 − {args.reserve_gb}」→ 实测）：")
             for nid, tier, old_v, new_v, src in mrows:
                 print(f"           {nid:<5}{tier:<9} {old_v:>7.2f} → {new_v:>7.2f}  {src}")
     elif args.measured_mem:
@@ -320,7 +338,7 @@ def main() -> int:
     tasks = [TaskProfile(name=u, lam=lam[u],
                          experts_per_layer=plc[u].as_experts_per_layer(),
                          placement=plc[u]) for u in sorted(lam)]
-    cfg = PlannerConfig(eta=args.eta, beta=1.3, j_cap_ms=args.j_cap, theta=0.8,
+    cfg = PlannerConfig(eta=args.eta, beta=1.3, j_cap_ms=args.j_cap, theta=args.theta,
                         kappa_over=0.3, n_standby=0, seed=args.seed,
                         fill_idle=args.fill_idle,
                         exhaustive_short=args.exhaustive_short,

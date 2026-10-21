@@ -71,19 +71,26 @@ MEM_FIELDS = ("total_gb", "context_gb", "overhead_ratio", "kv_bytes_per_token_la
               "embed_gb", "lm_head_gb")
 
 
-def _memory(r: dict) -> dict:
+def _memory(r: dict, prefill_tokens: int | None = None) -> dict:
     """单台结果 → 显存的几个关键量（GB，1e9）。取「全部专家」那一组；没有就取第一组。
 
-    prefill_extra_gb / decode_extra_gb 取量过的各长度里最大的那个 —— 规划要的是上限。
+    prefill_extra_gb：默认取量过的各长度里最大的那个（规划要上限）；给了 prefill_tokens
+    就取「不小于它的最短那档」—— 量过 512 就用 512，只量过 1024 就保守地用 1024。
+    decode_extra_gb 取最大的那个。
     """
     v = (r.get("variants") or {}).get("all") or next(iter((r.get("variants") or {}).values()), {})
     m = dict(v.get("memory") or {})
     dm = r.get("device_memory") or {}
+    pe = {int(k): float(x) for k, x in (m.get("prefill_extra_gb") or {}).items()}
+    at = max(pe, default=None)
+    if prefill_tokens is not None and pe:
+        ge = [t for t in pe if t >= prefill_tokens]
+        at = min(ge) if ge else max(pe)
     out = {"total_gb": dm.get("total_gb"), "context_gb": dm.get("context_gb"),
            "overhead_ratio": m.get("overhead_ratio"),
            "kv_bytes_per_token_layer": m.get("kv_bytes_per_token_layer"),
-           "prefill_extra_gb": max(m.get("prefill_extra_gb", {}).values(), default=None),
-           "prefill_extra_at": max((int(k) for k in m.get("prefill_extra_gb", {})), default=None),
+           "prefill_extra_gb": None if at is None else pe[at],
+           "prefill_extra_at": at,
            "decode_extra_gb": max(m.get("decode_extra_gb", {}).values(), default=None),
            "weights_per_layer_gb": m.get("weights_per_layer_gb"),
            "embed_gb": m.get("embed_gb"), "lm_head_gb": m.get("lm_head_gb")}
@@ -129,9 +136,17 @@ def merge(results: Sequence[dict], *, key: str = DEFAULT_KEY) -> dict:
             "raw": nodes}
 
 
-def per_node_memory(table: Mapping) -> dict[str, dict]:
-    """merge 的产物 → {节点: 显存量表}（见 _memory）。"""
-    return {n: dict(v.get("memory") or {}) for n, v in table.get("per_node", {}).items()}
+def per_node_memory(table: Mapping, prefill_tokens: int | None = None) -> dict[str, dict]:
+    """merge 的产物 → {节点: 显存量表}（见 _memory）。
+
+    给了 prefill_tokens 时从原始结果（table["raw"]）重新取那一档的激活峰值。
+    """
+    raw = table.get("raw") or {}
+    out = {}
+    for n, v in table.get("per_node", {}).items():
+        out[n] = (_memory(raw[n], prefill_tokens) if prefill_tokens is not None and n in raw
+                  else dict(v.get("memory") or {}))
+    return out
 
 
 def per_node_ms(table: Mapping, key: str = DEFAULT_KEY) -> dict[str, float]:

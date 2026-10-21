@@ -70,7 +70,9 @@ def select_rent_nodes(
 
     policy:
       "largest"             —— 文档 III.8.4 口径：按 (M_v, 稳定性) 取前 N 名。
-      "smallest_sufficient" —— 本实现默认：在**够装下前段**的节点里取最小的 N 台。
+      "smallest_sufficient" —— 在**够装下前段**的节点里取最小的 N 台。
+      "none"                —— 不预留（返回空集），后段建段时不再为前段让节点。
+                               前段层数可调、压到每台设备都放得下之后，预留就没有意义了。
 
     为什么默认改了口径：III.8.4 的论证前提是「前段候选几乎全落在排序前列」，
     这在前段驻留量最重时成立。但前段只需装 L₀ 层并集，而后段要装 (L−L₀) 层
@@ -79,6 +81,8 @@ def select_rent_nodes(
     节点划给根本用不上那么多内存的前段，逼得后段多一跳，代价是数十毫秒/token。
     取「够用的最小者」把大节点留给真正需要的一侧，与「跳数优先」一致。
     """
+    if policy == "none":
+        return frozenset()
     need = front_spec.total_gb()
     ok = [v for v in nodes if v.usable_gb >= need - 1e-9]
     if policy == "largest":
@@ -118,7 +122,10 @@ def scarcity_rent_nodes(
     mine = forms.get(spec_key, [])
     avoidable_here = {t for t in all_tiers if any(t not in f for f in mine)} if mine else set()
     charged = unavoidable_elsewhere & avoidable_here
-    return frozenset(n.id for n in nodes if n.tier in charged)
+    from .capacity import tier_names
+
+    names = tier_names(nodes)          # 与 classify_tiers 同一套档名（同型号分两档时带容量）
+    return frozenset(n.id for n in nodes if names[n.id] in charged)
 
 
 # --------------------------------------------------------------------------- #

@@ -291,3 +291,14 @@ def test_length_ranges():
         with pytest.raises(ValueError):
             LB._ints(bad)
     assert RB.DEFAULT_CTX[:8] == tuple(range(128, 1025, 128)) and RB.DEFAULT_CTX[-1] == 2048
+
+
+def test_prefill_tokens_picks_the_matching_activation_peak():
+    a = _run("N01")
+    a["device_memory"] = {"total_gb": 25.3, "context_gb": 0.4}
+    a["variants"]["all"]["memory"]["prefill_extra_gb"] = {"256": 0.03, "512": 0.10, "1024": 0.37}
+    m = LB.merge([a])
+    assert LB.per_node_memory(m)["N01"]["prefill_extra_gb"] == 0.37              # 默认取最长
+    assert LB.per_node_memory(m, 512)["N01"]["prefill_extra_gb"] == 0.10
+    assert LB.per_node_memory(m, 300)["N01"]["prefill_extra_gb"] == 0.10         # 取 ≥ 它的最短一档
+    assert LB.per_node_memory(m, 2048)["N01"]["prefill_extra_gb"] == 0.37        # 没量到就用最长的

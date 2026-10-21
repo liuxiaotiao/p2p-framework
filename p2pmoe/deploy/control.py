@@ -829,7 +829,7 @@ def collect_capabilities(addrs: dict[str, Addr], *, mem_cap_mb: float | None,
             ms_per_layer=round(0.35 * rel, 4),
             # 真机上留一档给激活/碎片/系统；toy 那边 5% 就够
             reserve_gb=(max(1.0, mem * 0.05) if real_units else mem * 0.05),
-            avail=0.95,
+            avail=1.0,   # 可用率 r_v：真机上没有 churn 统计，不计稳定性罚（与 task_deploy 默认一致）
         ))
     return nodes
 
@@ -1157,6 +1157,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--thinking", choices=("auto", "on", "off", "default"), default="auto",
                     help="对话模板的 enable_thinking。auto：接了只数 body 的 task 选择器时"
                          "关掉（它就是在非思考模式下训练的），否则沿用模板默认")
+    ap.add_argument("--rent-policy", default="none",
+                    choices=("none", "smallest_sufficient", "largest"),
+                    help="在线规划的影子租金 R_F：none = 不给前段预留节点（默认）；largest = 文档 III.8.4")
+    ap.add_argument("--theta", type=float, default=1.0,
+                    help="在线规划 Step 2 的折扣 θ（可建通道数 = ⌊θ × 显存配平上限⌋）。默认 1.0 不打折；"
+                         "文档初值 0.8。池子小、探测抖动大时调低能留出余量（--load-plan 时不用）")
     ap.add_argument("--fill-idle", action="store_true",
                     help="规划完再补位：提拔备胎、用空闲节点加通道、剩下的分摊到显存最紧的段。"
                          "补位段不过公共带（planner/fill.py）")
@@ -1262,7 +1268,7 @@ def main(argv: list[str] | None = None) -> int:
         log.info("      全部就绪")
 
     # ---------------- 2. 探测 + 3. 规划 ---------------------------------- #
-    cfg = PlannerConfig(eta=args.eta, beta=1.3, j_cap_ms=args.j_cap, theta=0.8,
+    cfg = PlannerConfig(eta=args.eta, beta=1.3, j_cap_ms=args.j_cap, theta=args.theta,
                         kappa_over=0.3, n_standby=0, k_probe=args.k_probe,
                         k_gate=args.k_probe, k_audit=args.k_probe, seed=args.seed,
                         fill_idle=args.fill_idle)
@@ -1315,7 +1321,7 @@ def main(argv: list[str] | None = None) -> int:
         p_curve = {l: min(0.97, 0.70 + 0.05 * l) for l in range(1, setup.n_layers)}
         try:
             res = plan(nodes, spec, setup.tasks, front_plc, net, cfg, p_curve,
-                       p_min=0.80)
+                       p_min=0.80, rent_policy=args.rent_policy)
         except PlanningError as e:
             for line in e.log:
                 log.info("      %s", line)

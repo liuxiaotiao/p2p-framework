@@ -286,6 +286,8 @@ def run_bench(hf_cfg: Mapping, *, device: str = "cuda", n_layers: int = 4,
                 f"（直接量已加载的层），否则先 bash ./deploy_15.sh stop 或把 --layers 调小")
         experts = list(range(n_res))
         _sync(device)
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()   # 进程里先前缓存的块不还掉，新权重会复用它们，开销比就算小了
         a0 = _alloc(device)
         w = synth_weights(cfg, layers, experts, device=device, dtype=tdt, seed=seed)
         _sync(device)
@@ -306,8 +308,11 @@ def run_bench(hf_cfg: Mapping, *, device: str = "cuda", n_layers: int = 4,
             **({} if a0 is None else {
                 "allocated_per_layer_gb": round((a1[0] - a0[0]) / n_layers / 1e9, 5),
                 "reserved_per_layer_gb": round((a1[1] - a0[1]) / n_layers / 1e9, 5),
-                # PyTorch 分配器为这些权重实际占的 / 张量本身的大小（碎片、取整）
-                "overhead_ratio": round((a1[1] - a0[1]) / max(1, a1[0] - a0[0]), 4),
+                # PyTorch 分配器为这些权重实际占的 / 张量本身的大小（碎片、取整）。
+                # 基线里还有缓存（a0 已占 − 已分配 > 64MB）或比值 < 1 时量不准，给 None
+                "overhead_ratio": (round((a1[1] - a0[1]) / max(1, a1[0] - a0[0]), 4)
+                                   if a0[1] - a0[0] <= 64 * 2**20 and a1[1] - a0[1] >= a1[0] - a0[0]
+                                   else None),
             }))
         out["variants"]["all" if res is None else str(n_res)] = v
         del model, w

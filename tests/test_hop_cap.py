@@ -137,6 +137,29 @@ def test_strict_doc_plan_file_is_reproducible(tmp_path, monkeypatch, capsys):
         "task_deploy", "--data", str(ROOT / "task3"), "--config", "qwen3-30b-a3b",
         "--phase", "prefill", "--tasks", "gsm8k=1,mbpp=1,no_robots=1", "--expert-sets", str(es),
         "--l0", "8", "--front-full", "--reserve-gb", "2.5", "--hop-slack", "0",
-        "--rent-policy", "largest", "--endpoint-w", "0", "--save-plan", str(out)])
+        "--rent-policy", "largest", "--endpoint-w", "0", "--avail", "0.95", "--theta", "0.8",
+        "--save-plan", str(out)])
+    assert td.main() == 0
+    assert out.read_bytes() == want.read_bytes()
+
+
+def test_doc_v2_plan_file_is_reproducible(tmp_path, monkeypatch, capsys):
+    """qwen3-30b/plan_doc_v2.json（文档六步 + 实测每层耗时/显存 + r_v=1、θ=1、不留租金、
+    无端点项、不穷举；KV 按 512 prompt + 2048 生成留）能用 REPRODUCE 5.7 那条命令逐字节重出。"""
+    want = ROOT / "qwen3-30b" / "plan_doc_v2.json"
+    lb = ROOT / "qwen3-30b" / "layer_bench_wash1.json"
+    es = ROOT / "qwen3-30b" / "expert_sets_90" / "expert_sets_90_union.json"
+    if not (want.exists() and lb.exists() and es.exists() and (ROOT / "task3").exists()):
+        pytest.skip("缺 qwen3-30b/ 或 task3/ 数据")
+    sys.path.insert(0, str(ROOT))
+    import examples.task_deploy as td
+
+    out = tmp_path / "p.json"
+    monkeypatch.setattr(sys, "argv", [
+        "task_deploy", "--data", str(ROOT / "task3"), "--config", "qwen3-30b-a3b",
+        "--phase", "prefill", "--tasks", "gsm8k=1,mbpp=1,no_robots=1", "--expert-sets", str(es),
+        "--l0", "8", "--front-full", "--layer-times", str(lb), "--measured-mem",
+        "--ctx", "2560", "--mem-prefill-tokens", "512", "--endpoint-w", "0",
+        "--save-plan", str(out)])
     assert td.main() == 0
     assert out.read_bytes() == want.read_bytes()

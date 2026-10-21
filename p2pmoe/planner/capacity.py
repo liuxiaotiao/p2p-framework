@@ -26,6 +26,7 @@ __all__ = [
     "Tier",
     "TierReport",
     "classify_tiers",
+    "tier_names",
     "enumerate_forms",
     "CapacityEstimate",
     "estimate_capacity_by_tier",
@@ -44,11 +45,26 @@ class Tier:
     count: int
 
 
+def tier_names(nodes: Sequence[Node], *, round_to: float = 0.5) -> dict[str, str]:
+    """节点 id → 档名。档 = (型号, 可用量取整到 round_to)。
+
+    同一型号落进两个档时（比如实测可用量 24.43 与 24.13GB），档名要带上容量区分开，
+    否则下游按名字记账的地方（形态枚举的容量表、配平的供给表）会把两档混成一档，
+    后写的覆盖先写的 —— 8 台 A30 被当成 1 台，可建条数凭空少一条。
+    """
+    keys = {n.id: (n.tier, round(n.usable_gb / round_to) * round_to) for n in nodes}
+    caps: dict[str, set[float]] = {}
+    for t, u in keys.values():
+        caps.setdefault(t, set()).add(u)
+    return {nid: (t if len(caps[t]) == 1 else f"{t}@{u:g}GB") for nid, (t, u) in keys.items()}
+
+
 def classify_tiers(nodes: Sequence[Node], *, round_to: float = 0.5) -> list[Tier]:
     """按 (M_v − 预留) 分档。同档节点在内存判据上不可区分。"""
+    names = tier_names(nodes, round_to=round_to)
     buckets: dict[tuple[str, float], int] = {}
     for n in nodes:
-        key = (n.tier, round(n.usable_gb / round_to) * round_to)
+        key = (names[n.id], round(n.usable_gb / round_to) * round_to)
         buckets[key] = buckets.get(key, 0) + 1
     tiers = [Tier(name=k[0], usable_gb=k[1], count=v) for k, v in buckets.items()]
     tiers.sort(key=lambda t: -t.usable_gb)
@@ -337,7 +353,10 @@ def largest_remainder(lams: Sequence[float], n: int, *, min_one: bool = True) ->
     q = [lam / total_lam * n for lam in lams]
     base = [int(floor(x)) for x in q]
     rem = n - sum(base)
-    order = sorted(range(m), key=lambda i: (-(q[i] - base[i]), i))
+    # 余额按小数部分降序补足；小数部分相等时，占比 λ 低的 task 先得（它多拿一条
+    # 的相对增益更大，公平比更不易失衡）；λ 也相等才按输入顺序。小数部分取到
+    # 1e-9 再比，避免浮点误差把「相等」判成不等。
+    order = sorted(range(m), key=lambda i: (-round(q[i] - base[i], 9), lams[i], i))
     for i in order[:rem]:
         base[i] += 1
     return base

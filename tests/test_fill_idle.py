@@ -260,8 +260,10 @@ def _real(*extra: str):
 
     argv = sys.argv
     TD.plan = spy
+    # 这组用例记录的是 Qwen3-Next 那轮线上方案的行为，按当时的口径（θ=0.8、r_v=0.95）规划
     sys.argv = ["task_deploy", "--data", str(ROOT / "task"), "--tasks", "mbpp=5,gsm8k=3",
-                "--coverage", "0.70", *extra]
+                "--coverage", "0.70", "--theta", "0.8", "--avail", "0.95",
+                "--rent-policy", "smallest_sufficient", *extra]
     try:
         with contextlib.redirect_stdout(io.StringIO()):
             TD.main()

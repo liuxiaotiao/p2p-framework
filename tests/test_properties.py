@@ -174,6 +174,17 @@ def test_min_one_matches_document_example() -> None:
     assert min(fair, key=fair.get) == "Y"  # 瓶颈池，下一条链加给它
 
 
+@pytest.mark.parametrize("lams,n,want", [
+    ([0.75, 0.25], 2, [1, 1]),            # q = (1.5, 0.5)：余额相等 → λ 低的先得
+    ([0.25, 0.75], 2, [1, 1]),            # 与输入顺序无关
+    ([0.6, 0.2, 0.2], 3, [2, 1, 0]),      # q = (1.8, 0.6, 0.6)：两人并列且 λ 也相等 → 按输入顺序
+    ([0.3, 0.1, 0.6], 5, [1, 1, 3]),      # q = (1.5, 0.5, 3.0)：0.3 与 0.1 并列 → 给 0.1
+    ([0.45, 0.15, 0.4], 2, [1, 0, 1]),    # q = (0.9, 0.3, 0.8)：余额不等时仍按余额，不看 λ
+])
+def test_remainder_tie_goes_to_lower_lambda(lams, n, want) -> None:
+    assert largest_remainder(lams, n, min_one=False) == want
+
+
 def test_min_one_forces_a_slot_for_tiny_tasks() -> None:
     out = largest_remainder([0.9, 0.05, 0.05], 4)
     assert all(v >= 1 for v in out) and sum(out) == 4

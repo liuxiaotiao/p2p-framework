@@ -305,7 +305,8 @@ def apply_layer_memory(
         ctx_gb, s_ctx = pick(n.id, "context_gb", 0.5)
         act, s_act = pick(n.id, "prefill_extra_gb", 0.0)
         ratio, s_r = pick(n.id, "overhead_ratio", 1.0)
-        ratio = max(1.0, ratio)
+        if ratio < 1.0:              # < 1 物理上不可能，是测量基线没清干净（旧版 layerbench）
+            ratio, s_r = 1.0, "实测<1，按 1"
         usable = max(0.0, (total - ctx_gb - act - margin_gb) / ratio)
         src = (f"容量 {total:.2f}({s_total}) − context {ctx_gb:.2f}({s_ctx}) − 激活 {act:.2f}({s_act})"
                f" − 余量 {margin_gb:.2f}，÷ 开销比 {ratio:.3f}({s_r})")

@@ -161,7 +161,7 @@ bash ./deploy_15.sh status                                                # 不�
 | 改最大生成长度 | `MAX_TOKENS=512` |
 | 只跑前 N 条 | `continuous` 后面加 `--requests N` |
 | 按文件顺序而不是 task 轮转 | `continuous` 后面加 `--order file` |
-| 原样重出现在用的方案 | 规划命令加 `--beam-legacy`（2026-10-14 修了 beam 之后，默认参数重出的方案在 gsm8k-0、mbpp-0 的切层点上会不同；`qwen3-30b/plan_es90_fill.json` 本身没变，直接用它就不受影响） |
+| 原样重出现在用的方案 | 规划命令加 `--beam-legacy --avail 0.95 --theta 0.8 --rent-policy smallest_sufficient`（自 2026-10-20 起可用率 r_v 默认 1.0、不计稳定性罚，θ 默认 1.0、不打折，影子租金默认不预留（前段压到每台都放得下）；之前的方案都按 r_v=0.95、θ=0.8、租金「够装前段的最小 N 台」规划；2026-10-14 修了 beam 之后，默认参数重出的方案在 gsm8k-0、mbpp-0 的切层点上会不同；`qwen3-30b/plan_es90_fill.json` 本身没变，直接用它就不受影响） |
 | 调链长上限 | 规划命令加 `--hop-slack N`：每条段的跳数 ≤ 整数下界 hops_min（按段驻留量 ÷ 最大单机可用算）+ N，默认 1；`--hop-slack -1` 不限。求解器搜索时就剪掉超长前缀，防止 beam 交出吃光节点的长链（`--beam-legacy` 下不生效）。用现在的部署参数重出方案，开不开它结果逐字节相同 |
 | 给 no_robots 两条通道 | 重新规划（`examples/task_deploy.py … --tasks gsm8k=1,mbpp=1,no_robots=2`），换 `PLAN` 后从第 3 步的 `fetch`/`verify` 重来 |
 
@@ -174,7 +174,7 @@ python3 examples/task_deploy.py --data task3 --config qwen3-30b-a3b --phase pref
   --tasks gsm8k=1,mbpp=1,no_robots=1 \
   --expert-sets qwen3-30b/expert_sets_90/expert_sets_90_union.json \
   --l0 8 --front-full --reserve-gb 2.5 --hop-slack 0 \
-  --rent-policy largest --endpoint-w 0 \
+  --rent-policy largest --endpoint-w 0 --avail 0.95 --theta 0.8 \
   --save-plan qwen3-30b/plan_doc_l8.json
 ```
 
@@ -309,8 +309,85 @@ python3 examples/task_deploy.py ...原参数... \
 | 每层权重、每 token 每层 KV | 张量字节数（已加载模式逐层给出） | 与规划器公式对账（日志里打印） |
 | 词嵌入 / 输出头 | vocab × d_model × dtype | 计入前段第一台 / 后段最后一台（以前漏算的 0.62GB） |
 
-每台可用量 = (容量 − context − 激活峰值 − 余量) ÷ 开销比；`--reserve-gb` 此时不用。缺测的量退到同型号均值、
+每台可用量 = (容量 − context − 激活峰值 − 余量) ÷ 开销比；`--reserve-gb` 此时不用。
+按实际请求长度留显存：`--ctx` 是 KV 按多长的上下文（prompt + 生成）算，`--mem-prefill-tokens` 是激活峰值按多长的
+prompt 取（实测里不小于它的最短一档）。例如 prompt 512、生成 512：`--ctx 1024 --mem-prefill-tokens 512`。缺测的量退到同型号均值、
 再退到全体中位数；容量没测且没有同型号可借时保留标称值。
+
+### 5.7 文档六步 + 实测输入的方案（`qwen3-30b/plan_doc_v2.json`）
+
+规划命令（Mac 或 wash1 上跑都行，结果逐字节相同，`tests/test_hop_cap.py::test_doc_v2_plan_file_is_reproducible` 有校验）：
+
+```bash
+python3 examples/task_deploy.py --data task3 --config qwen3-30b-a3b --phase prefill \
+  --tasks gsm8k=1,mbpp=1,no_robots=1 \
+  --expert-sets qwen3-30b/expert_sets_90/expert_sets_90_union.json \
+  --l0 8 --front-full \
+  --layer-times qwen3-30b/layer_bench_wash1.json --measured-mem \
+  --ctx 2560 --mem-prefill-tokens 512 --endpoint-w 0 \
+  --save-plan qwen3-30b/plan_doc_v2.json
+```
+
+* 文档六步流水线，只用文档里有的东西：不开 `--exhaustive-short`、无端点项、不开 `--fill-idle`；
+  超参全取默认（w_cap = 1.5 × 典型跳 ≈ 4.6ms、η = 15%、β = 1.3、κ_over = 0.3）；
+  r_v = 1、θ = 1、不留影子租金；链长上限 `--hop-slack 1`（默认，这份方案里不起作用）；
+* 每层耗时与显存用 `layerbench` 实测（`qwen3-30b/layer_bench_wash1.json` = wash1 上的 `results/layer_bench.json`）；
+  KV 按 512 prompt + 2048 生成 = 2560 留，激活峰值按 512 token prompt 取，余量 0.5GB；
+* 规划日志：`qwen3-30b/plan_doc_v2.log`。
+
+| 角色 | 节点 |
+|---|---|
+| 前段（层 1–8，全专家） | N07、N08、N09、N10 |
+| gsm8k | N04(9–36)→N01(37–48) |
+| mbpp | N02(9–37)→N03(38–48)、N05(9–36)→N06(37–48) |
+| no_robots | N12(9–31)→N11(32–48) |
+| 不用 | N13、N14、N15（到其他组 > 11ms，进不了 4.6ms 的公共带） |
+
+4 条通道（gsm8k 1、mbpp 2、no_robots 1），静态组合 p50 114–128ms，终审最坏相对极差 9.1%。
+
+权重就地替换：从 `plan_doc_l8.json` 换过来 12 台全部删旧下新（约 159GB）；从 `plan_es90_fill.json`
+换过来只有 N10 跳过（约 149GB）。
+
+```bash
+# 0) Mac → wash1 推代码（同第 1 步的 rsync，带上 plan_doc_v2.json）
+
+# 1) 环境（新终端）
+cd /home/ubuntu/p2p-framework && conda activate moe && source qwen3-30b/env.sh
+export ADVERTISE=192.168.3.4 && mkdir -p results
+
+# 2) 用完整的 15 台清单把现在所有 agent 停掉（不论之前跑的是哪份方案）
+HOSTS=task/hosts.txt bash ./deploy_15.sh stop
+
+# 3) 切到新方案：清单 + 只含 12 台的 hosts
+export PLAN=qwen3-30b/plan_doc_v2.json
+awk '$1!="N13" && $1!="N14" && $1!="N15"' task/hosts.txt > task/hosts_v2.txt
+export HOSTS=task/hosts_v2.txt
+
+# 4) 推代码与清单 → 各节点就地换权重 → 核对
+bash ./deploy_15.sh sync
+REPLACE=1 bash ./deploy_15.sh fetch   # 会问 [y/N]；走 HF 镜像就先 export HF_ENDPOINT=…
+bash ./deploy_15.sh verify            # 12 台都 ✓；失败的再跑一次上一条（已完成的会跳过）
+
+# 5) 起 agent
+bash ./deploy_15.sh start
+bash ./deploy_15.sh status            # 12/12，无残留 KV
+
+# 6) 连续性测试：与 5.3 同样的设置（150 条、三 task 轮转、前段共享池、闭环、最大生成 2048）
+export DUMP_FRONT=results/cont_front_v2.jsonl
+RESULTS=results/run_v2.json bash ./deploy_15.sh continuous 2>&1 | tee results/continuous_v2.log
+
+# 7) 看结果
+bash ./deploy_15.sh report results/run_v2.json | sed -n '/连续性测试/,$p'
+python3 examples/analyze_run.py results/run_v2.json --csv results/run_v2_latency.csv
+python3 -m p2pmoe.deploy.lr_tool check --model $LR_MODEL --dump $DUMP_FRONT --probe-dir $PROBE
+bash ./deploy_15.sh status            # 不应有残留 KV
+```
+
+* 同时在途 = 4（后段通道数）；gsm8k、no_robots 各 1 条通道、各 50 条请求，开头会提示「每条通道分到的
+  请求数不均」—— 是方案的容量结构，不是故障；
+* N12（T4）后段 14.48GB / 可用 14.92GB，是余量最小的一台。加载或长生成时若 N12 报 CUDA OOM，
+  规划命令加 `--mem-margin-gb 1.0` 重出（N12 变 9–29 层、13.26GB，其余不变），再从第 4 步来；
+* 切回其他方案：stop → 换 `PLAN`/`HOSTS` → `REPLACE=1 bash ./deploy_15.sh fetch` → verify → start。
 
 ## 6. 参考数值（用来判断复现是否正常）
 

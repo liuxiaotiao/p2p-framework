@@ -146,6 +146,33 @@ def fill_idle(
                            exhaustive_short=True, legacy_beam=cfg.beam_legacy,
                            hop_slack=cfg.max_hops_slack)
 
+    def can_pair(pool: set[str]) -> bool:
+        """pool 里还能不能再凑出一整条通道（任一 task 的后段 + 一条前段）。"""
+        for u in lam:
+            b = build_back(u, pool)
+            if b is not None and build_front(pool - set(b.nodes)) is not None:
+                return True
+        return False
+
+    def pick_front(pool: set[str]) -> Segment | None:
+        """给刚建好的后段配前段。
+
+        默认取最快的那条前段。但最快的前段往往占着一台大显存的卡（RTX/A30），
+        而剩下的小卡（T4）两台凑不出一条后段 —— 于是这一对建成了，下一对就建不出来，
+        剩下的节点只能去分摊（每挂一台多一跳）。向前看一步（cfg.fill_lookahead）：
+        最快的前段会堵死下一条通道时，改用「能留出下一条通道」的单台前段里显存最小的。
+        """
+        best = build_front(pool)
+        if best is None or not cfg.fill_lookahead or can_pair(pool - set(best.nodes)):
+            return best
+        for v in sorted(pool, key=lambda v: (node_map[v].usable_gb, node_map[v].ms_per_layer, v)):
+            f = build_front({v})
+            if f is not None and can_pair(pool - {v}):
+                log.append(f"[补位·前瞻] 最快的前段 {best.label()} 会让剩下的节点凑不出下一条通道 "
+                           f"→ 改用 {f.label()}（{f.delay_ms:.1f}ms vs {best.delay_ms:.1f}ms）")
+                return f
+        return best
+
     while True:
         nf, nb = len(fronts), _n_back(backs)
         fair = fair_ratios({u: len(backs[u]) for u in lam}, lam)
@@ -174,7 +201,7 @@ def fill_idle(
             b = build_back(u, idle)
             if b is None:
                 continue
-            f = build_front(idle - set(b.nodes))
+            f = pick_front(idle - set(b.nodes))
             if f is not None:
                 pair = (u, b, f)
                 break

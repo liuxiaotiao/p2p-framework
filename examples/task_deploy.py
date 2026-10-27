@@ -196,6 +196,9 @@ def main() -> int:
     ap.add_argument("--fill-idle", action="store_true",
                     help="主流程之后补位：提拔备胎、用空闲节点加通道、剩下的分摊到显存最紧的段，"
                          "让每台节点都有活干。补位段不过公共带（见 planner/fill.py）")
+    ap.add_argument("--fill-greedy", action="store_true",
+                    help="补位配前段时不向前看（2026-10-27 之前的行为）：总取最快的前段，"
+                         "哪怕它让剩下的节点凑不出下一条通道")
     ap.add_argument("--save-plan", type=Path, default=None)
     ap.add_argument("--save-spec", type=Path, default=None,
                     help="导出 deploy/run.py 能吃的布局文件")
@@ -375,6 +378,7 @@ def main() -> int:
                         exhaustive_short=args.exhaustive_short,
                         beam_legacy=args.beam_legacy,
                         build_order=args.build_order,
+                        fill_lookahead=not args.fill_greedy,
                         max_hops_slack=None if args.hop_slack < 0 else args.hop_slack)
     if args.endpoint_w is not None:
         cfg.endpoint_w = args.endpoint_w

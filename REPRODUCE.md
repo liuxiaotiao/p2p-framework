@@ -177,6 +177,7 @@ bash ./deploy_15.sh status                                                # 不�
 | 每台固定留显存给 KV | 规划命令加 `--measured-mem --kv-reserve-gb 2`：每台整块留 2GB 给 KV cache，剩下全给权重，KV 不再按 `--ctx` 逐层计入 |
 | 不裁剪专家（完整模型） | 规划命令加 `--back-full`（配 `--front-full`）：后段每层也装全部专家，例见 5.10 |
 | 手写分配（不经过规划器） | 写布局 JSON → `python3 examples/manual_plan.py 布局.json --out 清单.json`，例见 5.11 |
+| 补位不向前看 | 规划命令加 `--fill-greedy`：补位配前段总取最快的（2026-10-27 之前的行为），可能少补一条、剩下的去分摊 |
 | 放宽公共带 | 规划命令加 `--w-cap <ms>`（直接给上沿）或 `--rho-w <倍数>`（上沿 = 倍数 × 典型跳 p50，默认 1.5）；配合 `--eta` 放宽终审均匀性，例见 5.8 |
 | 建段顺序 | 默认 `--build-order bottleneck`：Step 3 按公平比从低到高建后段（瓶颈池先挑节点）；2026-10-27 之前是 `constrained`（形态最少的池先建）。5.5–5.10 的清单都是 `constrained` 规划的，命令里已带上 |
 | 调链长上限 | 规划命令加 `--hop-slack N`：每条段的跳数 ≤ 整数下界 hops_min（按段驻留量 ÷ 最大单机可用算）+ N，默认 1；`--hop-slack -1` 不限。求解器搜索时就剪掉超长前缀，防止 beam 交出吃光节点的长链（`--beam-legacy` 下不生效）。用现在的部署参数重出方案，开不开它结果逐字节相同 |
@@ -582,6 +583,60 @@ decode 平均取上下文 512→1023 的插值；逐节点按 `ms_per_layer_node
 
 用 vLLM 起这份方案时，`gpu_memory_utilization` 至少要到（权重 + 首尾表 + 固定开销 + 2GB KV）÷ 整卡：
 N01 0.92、N12 0.91、N05/N07 0.89、N08 0.79，其余 ≤ 0.66；统一设 0.93 即可（默认 0.9 时 N01、N12 的 KV 不到 2GB）。
+
+### 5.9b vLLM 实测，θ=1 选完再补位（`qwen3-30b/plan_vllm_bn_fill.json`）
+
+5.9 的输入，但 θ 回到 1、超参全取默认（η=15%、w_cap≈4.6ms）、瓶颈池优先建段；主流程选完后
+用剩下的节点补位（`--fill-idle`，补位带前瞻）。`tests/test_hop_cap.py::test_vllm_bn_fill_plan_file_is_reproducible`
+校验逐字节重出：
+
+```bash
+python3 examples/task_deploy.py --data task3 --config qwen3-30b-a3b --phase prefill \
+  --tasks gsm8k=1,mbpp=1,no_robots=1 \
+  --expert-sets qwen3-30b/expert_sets_90/expert_sets_90_union.json \
+  --l0 8 --front-full \
+  --layer-times qwen3-30b/layer_bench_vllm.json --layer-time-key req@p512g512 \
+  --measured-mem --mem-margin-gb 0 --kv-reserve-gb 2 --endpoint-w 0 \
+  --fill-idle --save-plan qwen3-30b/plan_vllm_bn_fill.json
+```
+
+**主流程**（θ=1 → 配额 {gsm8k 2, mbpp 2, no_robots 1}；建段 no_robots → mbpp → gsm8k；公共带凑不够，
+Step 4 先后降掉 mbpp、gsm8k 各一条）：3 条通道，前段全是 A30（N06、N07、N08），终审 1.4%。
+
+| 通道 | 前段 → 后段 | 组合 p50 |
+|---|---|---|
+| no_robots | N07 → N01(9–37)+N04 | 11.9ms |
+| mbpp | N06 → N05(9–33)+N03 | 12.7ms |
+| gsm8k | N08 → N02(9–32)+N11(RTX) | 43.7ms |
+
+**补位**（空闲 N09、N10、N12、N13、N14、N15，一前一后成对地加）：
+
+| 通道 | 前段 → 后段 | 组合 p50 |
+|---|---|---|
+| gsm8k-1 | N12(T4) → N09(9–33)+N10（RTX×2） | 98.1ms |
+| no_robots-1 | N14(T4) → N13(9–39,RTX)+N15(40–48,T4) | 110.7ms |
+
+补位配前段时**向前看一步**（`planner/fill.py` 的 `pick_front`，2026-10-27 起默认）：最快的前段 N13
+会让剩下的三台 T4 凑不出下一条后段，于是改用 N12（T4），把 N13 留给第二条后段 —— 补出 2 条、
+15 台全上岗、没有分摊。不向前看（`--fill-greedy`，旧行为）只补出 1 条，剩下 3 台挂到那条后段上
+分摊，它变成 5 台 4 跳、每 token 约 169ms。
+
+盲绑全网格组合 p50（vLLM 下核心段只要 12ms，补位段与 T4 前段的差距被放大）：
+
+| task | 核心 3 条 | 含补位 |
+|---|---|---|
+| no_robots | 11.9–12.0ms | 11.9–137.3ms |
+| mbpp | 12.6–12.7ms | 12.6–57.5ms |
+| gsm8k | 43.5–43.7ms | 43.5–125.4ms |
+
+核心网格 1.4%（通过）；全网格 218% 是补位的已知代价（日志里 21 条公共带警告）：接到 T4 前段
+（N12/N14）或补位后段（N09+N10、N13+N15）的组合每 token 要 40–137ms。
+
+用真 vLLM 跑时 `gpu_memory_utilization` 至少：N13 0.98、N09 0.98、N05 0.92、N12/N14 0.91（按每台留 2GB KV；
+单条请求实际只要 0.1–0.2GB，统一设 0.95 时 N13、N09 仍各有约 1.3GB KV）。
+
+部署：`source qwen3-30b/use_plan.sh vllm_bn_fill`（15 台），其余同 5.9。与 `plan_vllm.json` 只有 N12
+一台相同，其余 14 台都要换，约 183GB。
 
 ### 5.10 不裁剪专家的对照组：完整模型（`qwen3-30b/plan_full.json`）
 

@@ -240,3 +240,52 @@ def test_full_model_plan_file_is_reproducible(tmp_path, monkeypatch, capsys):
     for n in backs:
         covered[n["role"].split(":")[1]] |= {l["layer"] for l in n["layers"]}
     assert all(c == set(range(9, 49)) for c in covered.values())
+
+
+def test_vllm_bn_fill_plan_file_is_reproducible(tmp_path, monkeypatch, capsys):
+    """qwen3-30b/plan_vllm_bn_fill.json：vLLM 实测，θ=1、默认超参、瓶颈池优先建段，主流程选完后
+    用剩余节点补位（补位带前瞻，REPRODUCE 5.9b）。"""
+    want = ROOT / "qwen3-30b" / "plan_vllm_bn_fill.json"
+    lb = ROOT / "qwen3-30b" / "layer_bench_vllm.json"
+    es = ROOT / "qwen3-30b" / "expert_sets_90" / "expert_sets_90_union.json"
+    if not (want.exists() and lb.exists() and es.exists() and (ROOT / "task3").exists()):
+        pytest.skip("缺 qwen3-30b/ 或 task3/ 数据")
+    sys.path.insert(0, str(ROOT))
+    import examples.task_deploy as td
+
+    out = tmp_path / "p.json"
+    monkeypatch.setattr(sys, "argv", [
+        "task_deploy", "--data", str(ROOT / "task3"), "--config", "qwen3-30b-a3b",
+        "--phase", "prefill", "--tasks", "gsm8k=1,mbpp=1,no_robots=1", "--expert-sets", str(es),
+        "--l0", "8", "--front-full", "--layer-times", str(lb), "--layer-time-key", "req@p512g512",
+        "--measured-mem", "--mem-margin-gb", "0", "--kv-reserve-gb", "2", "--endpoint-w", "0",
+        "--fill-idle", "--save-plan", str(out)])
+    assert td.main() == 0
+    assert out.read_bytes() == want.read_bytes()
+    plan = json.loads(out.read_text())
+    assert len({n["node"] for n in plan["nodes"]}) == 15
+    assert len({n["segment"] for n in plan["nodes"] if n["role"] == "front"}) == 5   # 补出 2 条
+    assert "补位·前瞻" in capsys.readouterr().out
+
+
+def test_fill_greedy_keeps_the_old_fill(tmp_path, monkeypatch, capsys):
+    """--fill-greedy：补位配前段不向前看 —— 同样的输入只补出 1 条，剩下 3 台去分摊。"""
+    lb = ROOT / "qwen3-30b" / "layer_bench_vllm.json"
+    es = ROOT / "qwen3-30b" / "expert_sets_90" / "expert_sets_90_union.json"
+    if not (lb.exists() and es.exists() and (ROOT / "task3").exists()):
+        pytest.skip("缺 qwen3-30b/ 或 task3/ 数据")
+    sys.path.insert(0, str(ROOT))
+    import examples.task_deploy as td
+
+    out = tmp_path / "p.json"
+    monkeypatch.setattr(sys, "argv", [
+        "task_deploy", "--data", str(ROOT / "task3"), "--config", "qwen3-30b-a3b",
+        "--phase", "prefill", "--tasks", "gsm8k=1,mbpp=1,no_robots=1", "--expert-sets", str(es),
+        "--l0", "8", "--front-full", "--layer-times", str(lb), "--layer-time-key", "req@p512g512",
+        "--measured-mem", "--mem-margin-gb", "0", "--kv-reserve-gb", "2", "--endpoint-w", "0",
+        "--fill-idle", "--fill-greedy", "--save-plan", str(out)])
+    assert td.main() == 0
+    log = capsys.readouterr().out
+    plan = json.loads(out.read_text())
+    assert len({n["segment"] for n in plan["nodes"] if n["role"] == "front"}) == 4
+    assert "补位·分摊" in log and "补位·前瞻" not in log

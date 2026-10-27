@@ -206,7 +206,7 @@ def test_beam_legacy_reproduces_the_deployed_plan(tmp_path):
                 "--phase", "prefill", "--tasks", "gsm8k=1,mbpp=1,no_robots=1",
                 "--expert-sets", str(es), "--l0", "8", "--front-full", "--reserve-gb", "2.5",
                 "--exhaustive-short", "--fill-idle", "--beam-legacy", "--avail", "0.95", "--theta", "0.8",
-                "--rent-policy", "smallest_sufficient",
+                "--rent-policy", "smallest_sufficient", "--build-order", "constrained",
                 "--save-plan", str(out)]
     try:
         assert td.main() == 0

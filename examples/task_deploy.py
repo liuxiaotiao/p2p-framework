@@ -136,6 +136,9 @@ def main() -> int:
     ap.add_argument("--beam-legacy", action="store_true",
                     help="用修复前的 beam（完整解与半成品同榜截断）。只为复现旧方案；"
                          "见 PlannerConfig.beam_legacy")
+    ap.add_argument("--build-order", default="bottleneck", choices=("bottleneck", "constrained"),
+                    help="Step 3 各池建后段的先后：bottleneck = 公平比最低的池先建（默认）；"
+                         "constrained = 形态最少的池先建（2026-10-27 之前的默认，原样重出旧方案时用）")
     ap.add_argument("--front-full", action="store_true",
                     help="前段每层装**全部**专家，不按并集裁。前段出口接 task 选择器时要它："
                          "选择器是按完整模型的路由训练的（SELECTOR_USAGE.md：前 8 层不屏蔽），"
@@ -371,6 +374,7 @@ def main() -> int:
                         fill_idle=args.fill_idle,
                         exhaustive_short=args.exhaustive_short,
                         beam_legacy=args.beam_legacy,
+                        build_order=args.build_order,
                         max_hops_slack=None if args.hop_slack < 0 else args.hop_slack)
     if args.endpoint_w is not None:
         cfg.endpoint_w = args.endpoint_w
@@ -442,6 +446,13 @@ def main() -> int:
               f"{sum(len(l.experts) for l in p.layers):>7}"
               f"{p.weight_gb:>9.2f}{p.total_gb:>9.2f}   / {n.mem_gb:.0f}GB{tag}")
 
+    if not man.ok:
+        # 校验没过的清单（节点复用、层没接上、内存超……）部署下去只会在节点上出事，
+        # 而且症状很难查（两条请求在同一台上互相污染 KV）—— 不存，直接失败。
+        print(f"\n  ✗ 清单校验未通过，不保存：")
+        for v in man.violations:
+            print(f"      {v}")
+        return 3
     if args.save_plan:
         args.save_plan.write_text(man.to_json(), encoding="utf-8")
         print(f"\n  清单已存 {args.save_plan}")

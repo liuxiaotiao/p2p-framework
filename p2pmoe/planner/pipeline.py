@@ -397,9 +397,19 @@ def plan(
     backs: dict[str, list[Segment]] = {}
     shortfall_build: dict[str, int] = {}
 
-    # 建段顺序：形态最少（最受约束）的池先建 —— 否则宽松的池会先占光稀缺档。
-    order = sorted(tasks, key=lambda t: (len(cap.forms.get(f"back:{t.name}", [])), -t.lam))
-    log.append("[Step 3] 建段顺序（受约束者优先）: " + " → ".join(t.name for t in order))
+    # 建段顺序（PlannerConfig.build_order）：
+    #   bottleneck  —— 公平比最低的池先建（并列时形态少的先、λ 大的先）；
+    #   constrained —— 形态最少（最受约束）的池先建，免得宽松的池先占光稀缺档。
+    n_forms = {t.name: len(cap.forms.get(f"back:{t.name}", [])) for t in tasks}
+    if cfg.build_order == "constrained":
+        order = sorted(tasks, key=lambda t: (n_forms[t.name], -t.lam))
+        why = "受约束者优先"
+    elif cfg.build_order == "bottleneck":
+        order = sorted(tasks, key=lambda t: (round(fair[t.name], 9), n_forms[t.name], -t.lam))
+        why = "瓶颈池优先：公平比 " + "、".join(f"{t.name}={fair[t.name]:.2f}" for t in order)
+    else:
+        raise ValueError(f"build_order 只能是 bottleneck / constrained，收到 {cfg.build_order!r}")
+    log.append(f"[Step 3] 建段顺序（{why}）: " + " → ".join(t.name for t in order))
 
     task_rent: dict[str, frozenset[str]] = {}
     for t in tasks:

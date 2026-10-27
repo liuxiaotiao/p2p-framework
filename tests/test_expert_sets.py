@@ -70,9 +70,11 @@ def test_mismatches_are_rejected(tmp_path, kw, msg) -> None:
 def test_exhaustive_short_is_off_by_default() -> None:
     """打开它会改变 Qwen3-Next 在 L₀=11 下的方案，所以默认必须是关的。"""
     assert PlannerConfig().exhaustive_short is False
-    for f in ("p2pmoe/planner/pipeline.py", "p2pmoe/planner/tighten.py"):
+    # 每处调 deploy_path 都把开关原样传下去（tighten.py 的两处重建已合并成一个 _rebuild）
+    for f, n in (("p2pmoe/planner/pipeline.py", 2), ("p2pmoe/planner/tighten.py", 1)):
         src = (ROOT / f).read_text(encoding="utf-8")
-        assert src.count("exhaustive_short=cfg.exhaustive_short") >= 2, f
+        assert src.count("exhaustive_short=cfg.exhaustive_short") >= n, f
+        assert src.count("exhaustive_short=cfg.exhaustive_short") == src.count("deploy_path("), f
 
 
 @pytest.mark.slow

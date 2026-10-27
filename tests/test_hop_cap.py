@@ -100,7 +100,7 @@ def _strict_doc_run(monkeypatch, slack):
         "task_deploy", "--data", str(ROOT / "task3"), "--config", "qwen3-30b-a3b",
         "--phase", "prefill", "--tasks", "gsm8k=1,mbpp=1,no_robots=1", "--expert-sets", str(es),
         "--l0", "8", "--front-full", "--reserve-gb", "2.5",
-        "--rent-policy", "largest", "--endpoint-w", "0",
+        "--rent-policy", "largest", "--endpoint-w", "0", "--build-order", "constrained",
         "--hop-slack", str(-1 if slack is None else slack)])
     td.main()
     return built
@@ -138,7 +138,7 @@ def test_strict_doc_plan_file_is_reproducible(tmp_path, monkeypatch, capsys):
         "task_deploy", "--data", str(ROOT / "task3"), "--config", "qwen3-30b-a3b",
         "--phase", "prefill", "--tasks", "gsm8k=1,mbpp=1,no_robots=1", "--expert-sets", str(es),
         "--l0", "8", "--front-full", "--reserve-gb", "2.5", "--hop-slack", "0",
-        "--rent-policy", "largest", "--endpoint-w", "0", "--avail", "0.95", "--theta", "0.8",
+        "--rent-policy", "largest", "--endpoint-w", "0", "--build-order", "constrained", "--avail", "0.95", "--theta", "0.8",
         "--save-plan", str(out)])
     assert td.main() == 0
     assert out.read_bytes() == want.read_bytes()
@@ -160,7 +160,7 @@ def test_doc_v2_plan_file_is_reproducible(tmp_path, monkeypatch, capsys):
         "task_deploy", "--data", str(ROOT / "task3"), "--config", "qwen3-30b-a3b",
         "--phase", "prefill", "--tasks", "gsm8k=1,mbpp=1,no_robots=1", "--expert-sets", str(es),
         "--l0", "8", "--front-full", "--layer-times", str(lb), "--measured-mem",
-        "--mem-margin-gb", "0", "--kv-reserve-gb", "2", "--mem-prefill-tokens", "512", "--endpoint-w", "0",
+        "--mem-margin-gb", "0", "--kv-reserve-gb", "2", "--mem-prefill-tokens", "512", "--endpoint-w", "0", "--build-order", "constrained",
         "--save-plan", str(out)])
     assert td.main() == 0
     assert out.read_bytes() == want.read_bytes()
@@ -182,7 +182,7 @@ def test_doc_v2_5ch_plan_file_is_reproducible(tmp_path, monkeypatch, capsys):
         "task_deploy", "--data", str(ROOT / "task3"), "--config", "qwen3-30b-a3b",
         "--phase", "prefill", "--tasks", "gsm8k=1,mbpp=1,no_robots=1", "--expert-sets", str(es),
         "--l0", "8", "--front-full", "--layer-times", str(lb), "--measured-mem",
-        "--mem-margin-gb", "0", "--kv-reserve-gb", "2", "--mem-prefill-tokens", "512", "--endpoint-w", "0",
+        "--mem-margin-gb", "0", "--kv-reserve-gb", "2", "--mem-prefill-tokens", "512", "--endpoint-w", "0", "--build-order", "constrained",
         "--w-cap", "14", "--eta", "0.21", "--save-plan", str(out)])
     assert td.main() == 0
     log = capsys.readouterr().out
@@ -208,7 +208,7 @@ def test_vllm_plan_file_is_reproducible(tmp_path, monkeypatch, capsys):
         "task_deploy", "--data", str(ROOT / "task3"), "--config", "qwen3-30b-a3b",
         "--phase", "prefill", "--tasks", "gsm8k=1,mbpp=1,no_robots=1", "--expert-sets", str(es),
         "--l0", "8", "--front-full", "--layer-times", str(lb), "--layer-time-key", "req@p512g512",
-        "--measured-mem", "--mem-margin-gb", "0", "--kv-reserve-gb", "2", "--endpoint-w", "0",
+        "--measured-mem", "--mem-margin-gb", "0", "--kv-reserve-gb", "2", "--endpoint-w", "0", "--build-order", "constrained",
         "--theta", "0.8", "--eta", "0.4", "--save-plan", str(out)])
     assert td.main() == 0
     assert out.read_bytes() == want.read_bytes()
@@ -230,7 +230,7 @@ def test_full_model_plan_file_is_reproducible(tmp_path, monkeypatch, capsys):
         "--phase", "prefill", "--tasks", "gsm8k=1,mbpp=1,no_robots=1", "--expert-sets", str(es),
         "--l0", "8", "--front-full", "--back-full", "--layer-times", str(lb), "--measured-mem",
         "--mem-margin-gb", "0", "--kv-reserve-gb", "2", "--mem-prefill-tokens", "512",
-        "--endpoint-w", "0", "--hop-slack", "0", "--save-plan", str(out)])
+        "--endpoint-w", "0", "--build-order", "constrained", "--hop-slack", "0", "--save-plan", str(out)])
     assert td.main() == 0
     assert out.read_bytes() == want.read_bytes()
     plan = json.loads(out.read_text())

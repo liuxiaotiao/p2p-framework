@@ -117,6 +117,9 @@ def appendix_c(
         kappa_over=0.3,
         n_standby=1,
         seed=seed,
+        # 算例 C 的数值是按「受约束者优先」的建段顺序校出来的（2026-10-27 之前的默认）；
+        # 换成瓶颈池优先后 seed=7 的终审是 13.3% > η=12%。保持原顺序以复现算例。
+        build_order="constrained",
     )
     net = MeasurementCache(sim, k=cfg.k_probe, j_cap_ms=cfg.j_cap_ms, k_gate=cfg.k_gate)
 

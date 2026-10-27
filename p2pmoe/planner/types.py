@@ -395,6 +395,15 @@ class PlannerConfig:
     新 beam 会改变部分旧场景的方案：Qwen3-Next 的 L₀=11 下主流程多建一条通道，
     但一台 T4 被选成前段，终审从 6.1% 变成 49.7%（与开 exhaustive_short 的效果相同）。
     要复现修复前的方案就打开它。"""
+    build_order: str = "bottleneck"
+    """Step 3 各池建后段的先后（文档没规定，只说「逐条 deploy_path」）：
+
+    * ``bottleneck``（默认）：瓶颈池优先 —— 按 Step 2 的公平比从低到高建，并列时
+      形态少（受约束）的先、λ 大的先。与文档 II.7.3「下一条链加给瓶颈池」同一思路：
+      分得最少的池先挑节点，免得它只能捡别人剩下的（之前 no_robots 总是最后建、
+      总落到最慢的那几台上，通道比别的慢一截）；
+    * ``constrained``：受约束者优先 —— 形态最少的池先建，并列时 λ 大的先。
+      2026-10-27 之前的默认；原样重出旧方案时用它（task_deploy --build-order constrained）。"""
     fill_idle: bool = False
     """六步流水线之后再跑一轮补位（planner/fill.py）：提拔备胎、用空闲节点加通道、
     剩下的挂到显存最紧的节点旁边分摊。补出来的段不过公共带。

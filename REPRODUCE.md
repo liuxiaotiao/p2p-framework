@@ -49,6 +49,18 @@ export ADVERTISE=192.168.3.4       # 控制机对节点可见的 IP —— 不�
 mkdir -p results                   # tee 写日志前目录必须存在
 ```
 
+**按清单设环境（推荐）**：上面四行加上 `PLAN` / `HOSTS` 一次设好，hosts 自动按清单用到的节点生成，
+并核对 WORKDIR / NODE_PY / REPO / WEIGHTS：
+
+```bash
+cd /home/ubuntu/p2p-framework && conda activate moe
+source qwen3-30b/use_plan.sh vllm        # 或 full_2ch / doc_v2 / doc_v2_5ch / full / doc_l8 / es90_fill / 清单路径
+HOSTS=$HOSTS_ALL bash ./deploy_15.sh stop   # 停 agent 用全部 15 台
+```
+
+没 source 就跑 `deploy_15.sh` 时，脚本会退回旧默认值（`/home/ubuntu/P2P_MoE`、系统 Python 3.8、Qwen3-Next）——
+症状是 fetch 预检报 `Addr = tuple[str, int]` / `'type' object is not subscriptable`。
+
 一次性（`moe` 环境没被删就不用重装，装过会直接跳过）：
 
 ```bash
@@ -166,6 +178,7 @@ bash ./deploy_15.sh status                                                # 不�
 | 不裁剪专家（完整模型） | 规划命令加 `--back-full`（配 `--front-full`）：后段每层也装全部专家，例见 5.10 |
 | 手写分配（不经过规划器） | 写布局 JSON → `python3 examples/manual_plan.py 布局.json --out 清单.json`，例见 5.11 |
 | 放宽公共带 | 规划命令加 `--w-cap <ms>`（直接给上沿）或 `--rho-w <倍数>`（上沿 = 倍数 × 典型跳 p50，默认 1.5）；配合 `--eta` 放宽终审均匀性，例见 5.8 |
+| 建段顺序 | 默认 `--build-order bottleneck`：Step 3 按公平比从低到高建后段（瓶颈池先挑节点）；2026-10-27 之前是 `constrained`（形态最少的池先建）。5.5–5.10 的清单都是 `constrained` 规划的，命令里已带上 |
 | 调链长上限 | 规划命令加 `--hop-slack N`：每条段的跳数 ≤ 整数下界 hops_min（按段驻留量 ÷ 最大单机可用算）+ N，默认 1；`--hop-slack -1` 不限。求解器搜索时就剪掉超长前缀，防止 beam 交出吃光节点的长链（`--beam-legacy` 下不生效）。用现在的部署参数重出方案，开不开它结果逐字节相同 |
 | 给 no_robots 两条通道 | 重新规划（`examples/task_deploy.py … --tasks gsm8k=1,mbpp=1,no_robots=2`），换 `PLAN` 后从第 3 步的 `fetch`/`verify` 重来 |
 
@@ -178,7 +191,7 @@ python3 examples/task_deploy.py --data task3 --config qwen3-30b-a3b --phase pref
   --tasks gsm8k=1,mbpp=1,no_robots=1 \
   --expert-sets qwen3-30b/expert_sets_90/expert_sets_90_union.json \
   --l0 8 --front-full --reserve-gb 2.5 --hop-slack 0 \
-  --rent-policy largest --endpoint-w 0 --avail 0.95 --theta 0.8 \
+  --rent-policy largest --endpoint-w 0 --avail 0.95 --theta 0.8 --build-order constrained \
   --save-plan qwen3-30b/plan_doc_l8.json
 ```
 
@@ -328,7 +341,7 @@ python3 examples/task_deploy.py --data task3 --config qwen3-30b-a3b --phase pref
   --expert-sets qwen3-30b/expert_sets_90/expert_sets_90_union.json \
   --l0 8 --front-full \
   --layer-times qwen3-30b/layer_bench_wash1.json --measured-mem \
-  --mem-prefill-tokens 512 --mem-margin-gb 0 --kv-reserve-gb 2 --endpoint-w 0 \
+  --mem-prefill-tokens 512 --mem-margin-gb 0 --kv-reserve-gb 2 --endpoint-w 0 --build-order constrained \
   --save-plan qwen3-30b/plan_doc_v2.json
 ```
 
@@ -396,6 +409,64 @@ bash ./deploy_15.sh status            # 不应有残留 KV
 * 每台权重之外留着 2GB 给 KV（N12 是 13.15GB 权重 / 15.66GB 整卡）；仍有节点 OOM 就把 `--kv-reserve-gb` 或 `--mem-margin-gb` 调大重出，再从第 4 步来；
 * 切回其他方案：stop → 换 `PLAN`/`HOSTS` → `REPLACE=1 bash ./deploy_15.sh fetch` → verify → start。
 
+### 5.7b 瓶颈池优先建段的 4 通道方案（`qwen3-30b/plan_doc_v2_bn.json`）
+
+与 5.7 参数完全相同，只是建段顺序用新的默认 `bottleneck`（公平比最低的池先建：no_robots → gsm8k → mbpp）。
+`tests/test_build_order.py::test_bn_plan_file_is_reproducible` 校验逐字节重出：
+
+```bash
+python3 examples/task_deploy.py --data task3 --config qwen3-30b-a3b --phase prefill \
+  --tasks gsm8k=1,mbpp=1,no_robots=1 \
+  --expert-sets qwen3-30b/expert_sets_90/expert_sets_90_union.json \
+  --l0 8 --front-full \
+  --layer-times qwen3-30b/layer_bench_wash1.json --measured-mem \
+  --mem-prefill-tokens 512 --mem-margin-gb 0 --kv-reserve-gb 2 --endpoint-w 0 \
+  --save-plan qwen3-30b/plan_doc_v2_bn.json
+```
+
+| 角色 | 5.7（constrained） | 5.7b（bottleneck） |
+|---|---|---|
+| 前段 | N07、N08、N09、N10 | N02、N03、N09、N10 |
+| no_robots | N12(T4)+N11 | **N07+N08**（A30） |
+| gsm8k | N04+N01 | N04+N01 |
+| mbpp | N02+N03、N05+N06 | N05+N06、**N12(T4)+N11** |
+| 各 task 组合 p50 区间 | no_robots 128–131ms | no_robots 111.5–118.9、gsm8k 113.6–123.0、mbpp 118.5–132.3ms |
+| 终审最坏相对极差 | 9.1% | 11.4%（mbpp） |
+
+慢的那组节点（T4 N12 + RTX N11）从 no_robots 挪到了 mbpp 的第 2 条：no_robots 只有 1 条通道，
+它变快对排队最有利；mbpp 有 2 条，慢的那条只承担一半请求。部署：`source qwen3-30b/use_plan.sh doc_v2_bn`，
+其余同 5.7（从 5.7 的权重换过来动 6 台，约 76GB）。
+
+### 5.7c 5.7b 的 4 条主通道 + 剩余节点补位（`qwen3-30b/plan_doc_v2_bn_fill.json`）
+
+5.7b 的命令加 `--fill-idle`：主流程（瓶颈池优先建段）照旧出 4 条、12 台原样不动，剩下的 N13、N14、N15
+交给补位再建一条通道（`tests/test_build_order.py::test_bn_fill_plan_file_is_reproducible` 校验）：
+
+```bash
+python3 examples/task_deploy.py --data task3 --config qwen3-30b-a3b --phase prefill \
+  --tasks gsm8k=1,mbpp=1,no_robots=1 \
+  --expert-sets qwen3-30b/expert_sets_90/expert_sets_90_union.json \
+  --l0 8 --front-full \
+  --layer-times qwen3-30b/layer_bench_wash1.json --measured-mem \
+  --mem-prefill-tokens 512 --mem-margin-gb 0 --kv-reserve-gb 2 --endpoint-w 0 \
+  --fill-idle --save-plan qwen3-30b/plan_doc_v2_bn_fill.json
+```
+
+补位按公平比给最堵的池加一条：no_robots[N15(9–29)+N14(30–48)]（两台 T4），前段 F[N13]（RTX）。
+配额变成 {gsm8k 1, mbpp 2, no_robots 2}，5 条通道、15 台全上岗。
+
+补位段不过公共带：C 组到 A/B 组单程 11.5–13.5ms，盲绑下 N13 前段接 A 组后段、或 A/B 组前段接
+N15+N14 后段，每 token 都要多付约 23ms。全网格组合 p50：
+
+| task | 范围 | 相对极差 |
+|---|---|---|
+| no_robots | 111.5–156.5ms | 34.9% |
+| mbpp | 118.5–155.8ms | 29.0% |
+| gsm8k | 113.6–139.2ms | 19.9% |
+
+核心 4×4 网格仍是 11.4%（通过）；全网格 34.9% 是补位的已知代价（日志里 16 条公共带警告）。
+部署：`source qwen3-30b/use_plan.sh doc_v2_bn_fill`（15 台），其余同 5.7。
+
 ### 5.8 五条通道的方案（`qwen3-30b/plan_doc_v2_5ch.json`）
 
 5.7 的参数，只放宽两个阈值，让五条后段都能留住（`tests/test_hop_cap.py::test_doc_v2_5ch_plan_file_is_reproducible` 校验逐字节重出）：
@@ -406,7 +477,7 @@ python3 examples/task_deploy.py --data task3 --config qwen3-30b-a3b --phase pref
   --expert-sets qwen3-30b/expert_sets_90/expert_sets_90_union.json \
   --l0 8 --front-full \
   --layer-times qwen3-30b/layer_bench_wash1.json --measured-mem \
-  --mem-prefill-tokens 512 --mem-margin-gb 0 --kv-reserve-gb 2 --endpoint-w 0 \
+  --mem-prefill-tokens 512 --mem-margin-gb 0 --kv-reserve-gb 2 --endpoint-w 0 --build-order constrained \
   --w-cap 14 --eta 0.21 \
   --save-plan qwen3-30b/plan_doc_v2_5ch.json
 ```
@@ -476,7 +547,7 @@ python3 examples/task_deploy.py --data task3 --config qwen3-30b-a3b --phase pref
   --expert-sets qwen3-30b/expert_sets_90/expert_sets_90_union.json \
   --l0 8 --front-full \
   --layer-times qwen3-30b/layer_bench_vllm.json --layer-time-key req@p512g512 \
-  --measured-mem --mem-margin-gb 0 --kv-reserve-gb 2 --endpoint-w 0 \
+  --measured-mem --mem-margin-gb 0 --kv-reserve-gb 2 --endpoint-w 0 --build-order constrained \
   --theta 0.8 --eta 0.4 \
   --save-plan qwen3-30b/plan_vllm.json
 ```
@@ -524,7 +595,7 @@ python3 examples/task_deploy.py --data task3 --config qwen3-30b-a3b --phase pref
   --expert-sets qwen3-30b/expert_sets_90/expert_sets_90_union.json \
   --l0 8 --front-full --back-full \
   --layer-times qwen3-30b/layer_bench_wash1.json --measured-mem \
-  --mem-prefill-tokens 512 --mem-margin-gb 0 --kv-reserve-gb 2 --endpoint-w 0 \
+  --mem-prefill-tokens 512 --mem-margin-gb 0 --kv-reserve-gb 2 --endpoint-w 0 --build-order constrained \
   --hop-slack 0 \
   --save-plan qwen3-30b/plan_full.json
 ```
@@ -651,6 +722,8 @@ req12 在第 27 个 token 处停于 eos。对不上就说明代码版本或配�
 | 症状 | 原因 | 处理 |
 |---|---|---|
 | `✗ 必须设 ADVERTISE` | 新终端没 export | 第 2 步 |
+| fetch 预检 `TypeError: 'type' object is not subscriptable`，路径是 `/home/ubuntu/P2P_MoE` | 没 `source qwen3-30b/env.sh`：脚本退回旧默认（旧目录、系统 Python 3.8） | `source qwen3-30b/use_plan.sh <清单>` |
+| verify/fetch 报「清单里没有节点 Nxx」、某台没拉 | hosts 与清单不配套 | `source qwen3-30b/use_plan.sh <清单>` 自动生成对应 hosts |
 | `No module named 'tokenizers'` / 奇怪的导入错误 | 用了 base 的 Python 3.9 | `conda activate moe` |
 | `tee: results/xxx.log: No such file or directory` | `results/` 不存在 | `mkdir -p results` |
 | `mkdir: cannot create directory '/weights-q3-30b'` | 没 `source qwen3-30b/env.sh`，`$WORKDIR` 为空 | 第 2 步 |

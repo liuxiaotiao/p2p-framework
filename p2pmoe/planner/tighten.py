@@ -188,6 +188,23 @@ def tighten_lex(
             pool |= set(segs[i].nodes)
 
         new: dict[int, Segment] = {}
+        broken = False
+
+        def _rebuild(i: int, obj: Objective) -> Segment | None:
+            """在 pool 里重建第 i 条；建不出来就退回原段 —— 但只有原段的节点
+            **还都在 pool 里**才能退回。同一轮里先重建的段可能已经拿走了它的节点
+            （拆掉的段的节点都进了 pool），这时退回原段等于一台节点进两条段。
+            返回 None 表示这一轮作废（整轮回退）。"""
+            got = deploy_path(
+                spec, sorted(pool), nodes, net, obj,
+                beam_width=cfg.beam_width, prune_topk=cfg.prune_topk,
+                exhaustive_short=cfg.exhaustive_short,
+                legacy_beam=cfg.beam_legacy,
+                hop_slack=cfg.max_hops_slack,
+            )
+            if got is not None:
+                return got
+            return segs[i] if set(segs[i].nodes) <= pool else None
 
         # 先富后贫：占好节点最多的过快者先拆
         for i in sorted(fast, key=lambda i: -len(set(segs[i].nodes) & good_nodes)):
@@ -203,18 +220,15 @@ def tighten_lex(
                 tail_cost=tail_cost,
                 endpoint_w=cfg.endpoint_w if head_cost else 0.0,
             )
-            got = deploy_path(
-                spec, sorted(pool), nodes, net, obj,
-                beam_width=cfg.beam_width, prune_topk=cfg.prune_topk,
-                exhaustive_short=cfg.exhaustive_short,
-                legacy_beam=cfg.beam_legacy,
-                hop_slack=cfg.max_hops_slack,
-            ) or segs[i]
+            got = _rebuild(i, obj)
+            if got is None:
+                broken = True
+                break
             new[i] = got
             pool -= set(got.nodes)
 
         # 慢者纯求快：优先消跳
-        for i in sorted(slow, key=lambda i: -segs[i].delay_ms):
+        for i in ([] if broken else sorted(slow, key=lambda i: -segs[i].delay_ms)):
             obj = Objective(
                 mu_ms=cfg.mu_ms,
                 jitter_w=cfg.jitter_w,
@@ -225,17 +239,19 @@ def tighten_lex(
                 tail_cost=tail_cost,
                 endpoint_w=cfg.endpoint_w if head_cost else 0.0,
             )
-            got = deploy_path(
-                spec, sorted(pool), nodes, net, obj,
-                beam_width=cfg.beam_width, prune_topk=cfg.prune_topk,
-                exhaustive_short=cfg.exhaustive_short,
-                legacy_beam=cfg.beam_legacy,
-                hop_slack=cfg.max_hops_slack,
-            ) or segs[i]
+            got = _rebuild(i, obj)
+            if got is None:
+                broken = True
+                break
             new[i] = got
             pool -= set(got.nodes)
 
+        if broken:
+            rolled_back += 1  # 有段既重建不出、原节点又被占了 → 整轮回退
+            break
         cand = [new.get(i, s) for i, s in enumerate(segs)]
+        used = [v for s in cand for v in s.nodes]
+        assert len(used) == len(set(used)), f"tighten_lex 产生了节点复用：{used}"
         cand_key = _lex_key(cand, band)
 
         if cand_key <= prev_key:  # 字典序验收

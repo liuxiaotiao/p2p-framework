@@ -40,6 +40,22 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# 新终端里忘了 `source qwen3-30b/env.sh` 时，下面的默认值指向旧项目（/home/ubuntu/P2P_MoE、
+# 系统 python3 3.8、Qwen3-Next）—— fetch 预检会报 `Addr = tuple[str, int]` / `'type' object is
+# not subscriptable`，sync 会把代码推进旧目录。没设 WORKDIR 且本目录有 qwen3-30b/env.sh 时自动
+# source 它；已经 export 的 PLAN / HOSTS / PROFILE / WEIGHTS 保持不变（env.sh 会重置 PLAN）。
+if [ -z "${WORKDIR:-}" ] && [ -f qwen3-30b/env.sh ]; then
+  _keep_plan=${PLAN:-}; _keep_hosts=${HOSTS:-}; _keep_profile=${PROFILE:-}; _keep_weights=${WEIGHTS:-}
+  # shellcheck disable=SC1091
+  source qwen3-30b/env.sh >/dev/null 2>&1 || true
+  [ -n "$_keep_plan" ] && PLAN=$_keep_plan
+  [ -n "$_keep_hosts" ] && HOSTS=$_keep_hosts
+  [ -n "$_keep_profile" ] && PROFILE=$_keep_profile
+  [ -n "$_keep_weights" ] && WEIGHTS=$_keep_weights
+  echo "（没设 WORKDIR —— 已自动 source qwen3-30b/env.sh：WORKDIR=$WORKDIR  NODE_PY=$NODE_PY  PLAN=$PLAN  HOSTS=${HOSTS:-task/hosts.txt}）" >&2
+  unset _keep_plan _keep_hosts _keep_profile _keep_weights
+fi
+
 # ---- 改这里 ----------------------------------------------------------------
 HOSTS=${HOSTS:-task/hosts.txt}                 # 节点 id → IP:端口
 PLAN=${PLAN:-task/plan_deploy.json}            # 离线算好的部署清单

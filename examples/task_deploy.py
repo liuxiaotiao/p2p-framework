@@ -139,6 +139,8 @@ def main() -> int:
     ap.add_argument("--build-order", default="bottleneck", choices=("bottleneck", "constrained"),
                     help="Step 3 各池建后段的先后：bottleneck = 公平比最低的池先建（默认）；"
                          "constrained = 形态最少的池先建（2026-10-27 之前的默认，原样重出旧方案时用）")
+    ap.add_argument("--build-interleave", action="store_true",
+                    help="Step 3 按轮次交错建段：各池先各建第 1 条，再各建第 2 条（池的先后仍按 --build-order）")
     ap.add_argument("--front-full", action="store_true",
                     help="前段每层装**全部**专家，不按并集裁。前段出口接 task 选择器时要它："
                          "选择器是按完整模型的路由训练的（SELECTOR_USAGE.md：前 8 层不屏蔽），"
@@ -378,6 +380,7 @@ def main() -> int:
                         exhaustive_short=args.exhaustive_short,
                         beam_legacy=args.beam_legacy,
                         build_order=args.build_order,
+                        build_interleave=args.build_interleave,
                         fill_lookahead=not args.fill_greedy,
                         max_hops_slack=None if args.hop_slack < 0 else args.hop_slack)
     if args.endpoint_w is not None:

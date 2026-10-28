@@ -421,7 +421,21 @@ def plan(
                 f" → 对这些档收稀缺租金"
             )
 
-    for t in order:
+    # 建段序列：默认按池逐个建满配额（gsm8k 0、gsm8k 1、mbpp 0 …）；
+    # cfg.build_interleave 时按轮次交错（每个池先各建第 1 条，再各建第 2 条 …），
+    # 这样配额多的池的第 2 条不会抢在别的池的第 1 条之前挑节点。
+    if cfg.build_interleave:
+        seq = [t for k in range(max((quota[t.name] for t in order), default=0))
+               for t in order if k < quota[t.name]]
+        log.append("[Step 3] 按轮次交错建段: " + " → ".join(
+            f"{t.name}{sum(1 for x in seq[:i] if x is t)}" for i, t in enumerate(seq)))
+    else:
+        seq = [t for t in order for _ in range(quota[t.name])]
+    built: dict[str, list[Segment]] = {t.name: [] for t in order}
+    stopped: set[str] = set()
+    for t in seq:
+        if t.name in stopped:
+            continue
         spec = back_specs[t.name]
         build_obj = Objective(
             mu_ms=cfg.mu_ms,
@@ -432,35 +446,37 @@ def plan(
             tail_cost=tail_cost,
             endpoint_w=cfg.endpoint_w,
         )
-        segs: list[Segment] = []
-        for _ in range(quota[t.name]):
-            s = deploy_path(
-                spec, sorted(free), node_map, net, build_obj,
-                beam_width=cfg.beam_width, prune_topk=cfg.prune_topk,
-                exhaustive_short=cfg.exhaustive_short,
-                legacy_beam=cfg.beam_legacy,
-                hop_slack=cfg.max_hops_slack,
+        segs = built[t.name]
+        s = deploy_path(
+            spec, sorted(free), node_map, net, build_obj,
+            beam_width=cfg.beam_width, prune_topk=cfg.prune_topk,
+            exhaustive_short=cfg.exhaustive_short,
+            legacy_beam=cfg.beam_legacy,
+            hop_slack=cfg.max_hops_slack,
+        )
+        if s is None:
+            log.append(
+                f"[Step 3] task {t.name} 只建出 {len(segs)}/{quota[t.name]} 条"
+                f"（无可行放置）—— 记入公平比缺口"
             )
-            if s is None:
-                log.append(
-                    f"[Step 3] task {t.name} 只建出 {len(segs)}/{quota[t.name]} 条"
-                    f"（无可行放置）—— 记入公平比缺口"
-                )
-                break
-            # 质量下限：跳数超出 III.5.2 的整数下界太多，等于建不出（cfg.max_hops_slack）
-            floor_hops = hops_min(
-                spec.total_gb(), max(node_map[v].usable_gb for v in free)
+            stopped.add(t.name)
+            continue
+        # 质量下限：跳数超出 III.5.2 的整数下界太多，等于建不出（cfg.max_hops_slack）
+        floor_hops = hops_min(
+            spec.total_gb(), max(node_map[v].usable_gb for v in free)
+        )
+        if cfg.max_hops_slack is not None and s.hops > floor_hops + cfg.max_hops_slack:
+            log.append(
+                f"[Step 3] task {t.name} 第 {len(segs) + 1} 条被质量下限否决："
+                f"{s.label()} 用了 {s.hops} 跳，而剩余池的跳数下界只有 {floor_hops}"
+                f"（{s.delay_ms:.0f}ms，多出的跳每 token 各付一次）—— 记入公平比缺口"
             )
-            if cfg.max_hops_slack is not None and s.hops > floor_hops + cfg.max_hops_slack:
-                log.append(
-                    f"[Step 3] task {t.name} 第 {len(segs) + 1} 条被质量下限否决："
-                    f"{s.label()} 用了 {s.hops} 跳，而剩余池的跳数下界只有 {floor_hops}"
-                    f"（{s.delay_ms:.0f}ms，多出的跳每 token 各付一次）—— 记入公平比缺口"
-                )
-                break
-            segs.append(s)
-            free -= set(s.nodes)
-        backs[t.name] = segs
+            stopped.add(t.name)
+            continue
+        segs.append(s)
+        free -= set(s.nodes)
+    for t in order:
+        backs[t.name] = built[t.name]
 
     # 两轮筛：先间隙检测去慢尾，再字典序收紧
     for t in tasks:

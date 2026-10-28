@@ -289,3 +289,58 @@ def test_fill_greedy_keeps_the_old_fill(tmp_path, monkeypatch, capsys):
     plan = json.loads(out.read_text())
     assert len({n["segment"] for n in plan["nodes"] if n["role"] == "front"}) == 4
     assert "补位·分摊" in log and "补位·前瞻" not in log
+
+
+def test_vllm_fill_plan_keeps_plan_vllm(tmp_path, monkeypatch, capsys):
+    """qwen3-30b/plan_vllm_fill.json：plan_vllm.json 原样不动，只用空闲的 N13–N15 补一条通道（REPRODUCE 5.9c）。"""
+    want = ROOT / "qwen3-30b" / "plan_vllm_fill.json"
+    base = ROOT / "qwen3-30b" / "plan_vllm.json"
+    lb = ROOT / "qwen3-30b" / "layer_bench_vllm.json"
+    es = ROOT / "qwen3-30b" / "expert_sets_90" / "expert_sets_90_union.json"
+    if not (want.exists() and base.exists() and lb.exists() and es.exists() and (ROOT / "task3").exists()):
+        pytest.skip("缺 qwen3-30b/ 或 task3/ 数据")
+    sys.path.insert(0, str(ROOT))
+    import examples.task_deploy as td
+
+    out = tmp_path / "p.json"
+    monkeypatch.setattr(sys, "argv", [
+        "task_deploy", "--data", str(ROOT / "task3"), "--config", "qwen3-30b-a3b",
+        "--phase", "prefill", "--tasks", "gsm8k=1,mbpp=1,no_robots=1", "--expert-sets", str(es),
+        "--l0", "8", "--front-full", "--layer-times", str(lb), "--layer-time-key", "req@p512g512",
+        "--measured-mem", "--mem-margin-gb", "0", "--kv-reserve-gb", "2", "--endpoint-w", "0",
+        "--build-order", "constrained", "--theta", "0.8", "--eta", "0.4", "--fill-idle",
+        "--save-plan", str(out)])
+    assert td.main() == 0
+    assert out.read_bytes() == want.read_bytes()
+    key = lambda p: {(n["node"], n["role"], tuple(n["layer_range"]),
+                      tuple(tuple(l["experts"]) for l in n["layers"]))
+                     for n in json.loads(p.read_text())["nodes"]}
+    added = key(want) - key(base)
+    assert key(base) <= key(want) and {x[0] for x in added} == {"N13", "N14", "N15"}
+
+
+def test_vllm_rr_fill_plan_file_is_reproducible(tmp_path, monkeypatch, capsys):
+    """qwen3-30b/plan_vllm_rr_fill.json：plan_vllm_fill 的参数 + 按轮次交错建段（no_robots 0 先于
+    gsm8k 1），η 放到 0.45（REPRODUCE 5.9d）。"""
+    want = ROOT / "qwen3-30b" / "plan_vllm_rr_fill.json"
+    lb = ROOT / "qwen3-30b" / "layer_bench_vllm.json"
+    es = ROOT / "qwen3-30b" / "expert_sets_90" / "expert_sets_90_union.json"
+    if not (want.exists() and lb.exists() and es.exists() and (ROOT / "task3").exists()):
+        pytest.skip("缺 qwen3-30b/ 或 task3/ 数据")
+    sys.path.insert(0, str(ROOT))
+    import examples.task_deploy as td
+
+    out = tmp_path / "p.json"
+    monkeypatch.setattr(sys, "argv", [
+        "task_deploy", "--data", str(ROOT / "task3"), "--config", "qwen3-30b-a3b",
+        "--phase", "prefill", "--tasks", "gsm8k=1,mbpp=1,no_robots=1", "--expert-sets", str(es),
+        "--l0", "8", "--front-full", "--layer-times", str(lb), "--layer-time-key", "req@p512g512",
+        "--measured-mem", "--mem-margin-gb", "0", "--kv-reserve-gb", "2", "--endpoint-w", "0",
+        "--build-order", "constrained", "--build-interleave", "--theta", "0.8", "--eta", "0.45",
+        "--fill-idle", "--save-plan", str(out)])
+    assert td.main() == 0
+    log = capsys.readouterr().out
+    assert "按轮次交错建段: mbpp0 → gsm8k0 → no_robots0 → gsm8k1" in log
+    assert out.read_bytes() == want.read_bytes()
+    roles = {n["node"]: n["role"] for n in json.loads(out.read_text())["nodes"]}
+    assert roles["N05"] == roles["N03"] == "back:no_robots"      # no_robots 0 先挑到 A1 的一对

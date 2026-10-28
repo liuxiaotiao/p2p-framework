@@ -177,6 +177,7 @@ bash ./deploy_15.sh status                                                # 不�
 | 每台固定留显存给 KV | 规划命令加 `--measured-mem --kv-reserve-gb 2`：每台整块留 2GB 给 KV cache，剩下全给权重，KV 不再按 `--ctx` 逐层计入 |
 | 不裁剪专家（完整模型） | 规划命令加 `--back-full`（配 `--front-full`）：后段每层也装全部专家，例见 5.10 |
 | 手写分配（不经过规划器） | 写布局 JSON → `python3 examples/manual_plan.py 布局.json --out 清单.json`，例见 5.11 |
+| 按轮次交错建段 | 规划命令加 `--build-interleave`：各池先各建第 1 条、再各建第 2 条（池的先后仍按 `--build-order`），例见 5.9d |
 | 补位不向前看 | 规划命令加 `--fill-greedy`：补位配前段总取最快的（2026-10-27 之前的行为），可能少补一条、剩下的去分摊 |
 | 放宽公共带 | 规划命令加 `--w-cap <ms>`（直接给上沿）或 `--rho-w <倍数>`（上沿 = 倍数 × 典型跳 p50，默认 1.5）；配合 `--eta` 放宽终审均匀性，例见 5.8 |
 | 建段顺序 | 默认 `--build-order bottleneck`：Step 3 按公平比从低到高建后段（瓶颈池先挑节点）；2026-10-27 之前是 `constrained`（形态最少的池先建）。5.5–5.10 的清单都是 `constrained` 规划的，命令里已带上 |
@@ -637,6 +638,68 @@ Step 4 先后降掉 mbpp、gsm8k 各一条）：3 条通道，前段全是 A30�
 
 部署：`source qwen3-30b/use_plan.sh vllm_bn_fill`（15 台），其余同 5.9。与 `plan_vllm.json` 只有 N12
 一台相同，其余 14 台都要换，约 183GB。
+
+### 5.9c 在 `plan_vllm.json` 上再补一条（`qwen3-30b/plan_vllm_fill.json`）
+
+5.9 的命令原样加 `--fill-idle`（建段顺序钉在 `constrained`，与 5.9 一致）：`plan_vllm.json` 的 12 台、4 条通道
+一点不变，只把空闲的 N13–N15 补成第 5 条（`tests/test_hop_cap.py::test_vllm_fill_plan_keeps_plan_vllm` 校验）：
+
+```bash
+python3 examples/task_deploy.py --data task3 --config qwen3-30b-a3b --phase prefill \
+  --tasks gsm8k=1,mbpp=1,no_robots=1 \
+  --expert-sets qwen3-30b/expert_sets_90/expert_sets_90_union.json \
+  --l0 8 --front-full \
+  --layer-times qwen3-30b/layer_bench_vllm.json --layer-time-key req@p512g512 \
+  --measured-mem --mem-margin-gb 0 --kv-reserve-gb 2 --endpoint-w 0 --build-order constrained \
+  --theta 0.8 --eta 0.4 --fill-idle \
+  --save-plan qwen3-30b/plan_vllm_fill.json
+```
+
+| 通道 | 前段 → 后段 | 每 token |
+|---|---|---|
+| ch0 gsm8k | N10 → N07+N06 | 29.3ms |
+| ch1 gsm8k | N11 → N05+N03 | 29.2ms |
+| ch2 mbpp | N09 → N01+N04 | 28.5ms |
+| ch3 no_robots | N12(T4) → N08+N02 | 42.1ms |
+| **ch4 no_robots（补位）** | **N14(T4) → N13(9–39，RTX)+N15(40–48，T4)** | **110.7ms** |
+
+补位给最堵的 no_robots（公平比 0.75）：三台只够一条（N13+N14 可装 gsm8k/no_robots，装不下 mbpp）。
+盲绑下 N09–N12 前段接 N13+N15 后段要 126–137ms，前段 N14 接 A30 后段要 57–59ms；全网格各 task 范围
+gsm8k 29.1–57.6、mbpp 28.5–56.9、no_robots 30.9–137.3ms（全网格相对极差 268%，核心 4×4 仍是 38.4%）。
+
+部署：`source qwen3-30b/use_plan.sh vllm_fill`（15 台）。节点上已经是 `plan_vllm.json` 的权重时，
+`REPLACE=1 fetch` 只动 N13、N14、N15（约 35GB），其余 12 台跳过。用真 vLLM 跑时 N13 的
+`gpu_memory_utilization` 要 0.98（留 2GB KV）；设 0.95 也还有约 1.2GB KV。
+
+### 5.9d 5.9c 改成按轮次交错建段（`qwen3-30b/plan_vllm_rr_fill.json`）
+
+5.9c 的命令加 `--build-interleave`：池的先后不变（mbpp → gsm8k → no_robots），但每个池先各建第 1 条、
+再建第 2 条，于是顺序是 mbpp0 → gsm8k0 → **no_robots0 → gsm8k1**（原来 gsm8k1 先于 no_robots0）。
+`tests/test_hop_cap.py::test_vllm_rr_fill_plan_file_is_reproducible` 校验：
+
+```bash
+python3 examples/task_deploy.py --data task3 --config qwen3-30b-a3b --phase prefill \
+  --tasks gsm8k=1,mbpp=1,no_robots=1 \
+  --expert-sets qwen3-30b/expert_sets_90/expert_sets_90_union.json \
+  --l0 8 --front-full \
+  --layer-times qwen3-30b/layer_bench_vllm.json --layer-time-key req@p512g512 \
+  --measured-mem --mem-margin-gb 0 --kv-reserve-gb 2 --endpoint-w 0 --build-order constrained \
+  --build-interleave --theta 0.8 --eta 0.45 --fill-idle \
+  --save-plan qwen3-30b/plan_vllm_rr_fill.json
+```
+
+| 后段 | 5.9c（plan_vllm_fill） | 5.9d（plan_vllm_rr_fill） |
+|---|---|---|
+| gsm8k0 | N07+N06 | N07+N06 |
+| gsm8k1 | N05(9–32)+N03（A1 内，跳 0.04ms） | **N08(9–34)+N02（A2→A1，跳 1.23ms）** |
+| mbpp0 | N01+N04 | N01+N04 |
+| no_robots0 | N08+N02 | **N05(9–25)+N03（A1 内）** |
+| no_robots1（补位） | N13+N15 | N13+N15 |
+
+前段不变（N09–N12、补位 N14）。核心 4×4 终审 43.9%，超过 5.9 的 η=0.40，所以 η 放到 0.45（分配与 0.40 下完全相同）。
+全网格各 task：gsm8k 29.2–59.3、mbpp 28.5–56.9、no_robots 29.1–137.3ms。
+
+部署：`source qwen3-30b/use_plan.sh vllm_rr_fill`（15 台）。从 5.9c 的权重换过来只动 N02、N03、N05、N08（约 56GB）。
 
 ### 5.10 不裁剪专家的对照组：完整模型（`qwen3-30b/plan_full.json`）
 

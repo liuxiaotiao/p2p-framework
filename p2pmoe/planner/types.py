@@ -404,6 +404,10 @@ class PlannerConfig:
       总落到最慢的那几台上，通道比别的慢一截）；
     * ``constrained``：受约束者优先 —— 形态最少的池先建，并列时 λ 大的先。
       2026-10-27 之前的默认；原样重出旧方案时用它（task_deploy --build-order constrained）。"""
+    build_interleave: bool = False
+    """Step 3 按轮次交错建段：每个池先各建第 1 条，再各建第 2 条……（池的先后仍按 build_order）。
+    默认关 = 一个池建满配额再建下一个。打开后配额多的池的第 2 条不会抢在别的池第 1 条之前挑节点
+    （task_deploy --build-interleave）。"""
     fill_lookahead: bool = True
     """补位配前段时向前看一步：最快的前段会让剩下的节点凑不出下一条通道时，改用能留出
     下一条通道的、显存最小的单台前段（planner/fill.py 的 pick_front）。2026-10-27 之前没有这一步

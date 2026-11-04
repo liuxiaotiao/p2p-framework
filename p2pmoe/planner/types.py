@@ -412,6 +412,14 @@ class PlannerConfig:
     """补位配前段时向前看一步：最快的前段会让剩下的节点凑不出下一条通道时，改用能留出
     下一条通道的、显存最小的单台前段（planner/fill.py 的 pick_front）。2026-10-27 之前没有这一步
     （task_deploy --fill-greedy 复现）。"""
+    quota_equal: bool = False
+    """Step 2 按 task 均分：每个 task 的条数 = ⌊N_work / task 数⌋（N_work 照旧由 Step 1 的
+    显存估算 × θ 得到），不按 λ 做最大余额分配。之后 Step 3–6 不变（前后段仍盲绑、任意组合）。
+    均分剩下的显存（不够每个 task 再各分一条的那部分）交给 raw_fill（task_deploy --quota-equal）。"""
+    raw_fill: bool = False
+    """六步流水线之后，用剩下的节点建**原始模型路径**（planner/raw.py）：后段装全部专家，
+    进共享池 SHARED_POOL（任何 task 都能用，专属池全忙时溢出过去），前段并入前段池一起盲绑。
+    与 fill_idle 二选一（task_deploy --raw-fill）。"""
     fill_idle: bool = False
     """六步流水线之后再跑一轮补位（planner/fill.py）：提拔备胎、用空闲节点加通道、
     剩下的挂到显存最紧的节点旁边分摊。补出来的段不过公共带。

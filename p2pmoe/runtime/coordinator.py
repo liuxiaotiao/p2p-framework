@@ -89,6 +89,9 @@ class RequestRecord:
     token_ms: list[float] = field(default_factory=list)
     miss_window: deque = field(default_factory=lambda: deque(maxlen=16))
     rebinds: int = 0
+    back_pool: str = ""
+    """当前后段属于哪个池。通常 = task；专属池全忙、溢出到原始模型路径（共享池
+    SHARED_POOL）时是 SHARED_POOL，而 task 仍是识别结果 —— 归还按池，统计按 task。"""
     force_task: str | None = None
     """故障注入：强制绑到这个池（无视识别结果）。"""
     tried: set = field(default_factory=set)
@@ -508,15 +511,24 @@ class Coordinator:
         self._start_front(nxt)
 
     def _release_back(self, task: str, b: str) -> None:
-        """后段用完归还。同理，等这个池的请求优先。"""
+        """后段用完归还。同理，等这个池的请求优先。
+
+        原始模型路径（SHARED_POOL）谁都能接：放出来时交给**所有**池里等得最久的那条。"""
         with self._lock:
-            q = self._await_back.get(task)
-            if q:
-                nxt = q.popleft()
+            if task == SHARED_POOL:
+                heads = [(q[0].t0, u) for u, q in self._await_back.items() if q]
+                u = min(heads)[1] if heads else None
+                nxt = self._await_back[u].popleft() if u is not None else None
             else:
+                q = self._await_back.get(task)
+                u = task
+                nxt = q.popleft() if q else None
+            if nxt is None:
                 self.free_backs.setdefault(task, deque()).append(b)
                 return
-        self._attach_back(nxt, task, b, rebind=False)
+        if u != task:
+            nxt.log(f"原始模型路径 {b} 空出来 → 接走（{u} 池仍全忙）")
+        self._attach_back(nxt, u, b, rebind=False, pool=task)
 
     def _on(self, h: dict) -> None:
         t = h.get("type")
@@ -591,19 +603,30 @@ class Coordinator:
                             f"降低 --coverage 让每条段更小、或增加节点，"
                             f"让规划器能给 {task} 分到配额")
             return
+        pool = task
         with self._lock:
             q = self.free_backs.get(task)
+            shared = self.free_backs.get(SHARED_POOL) if task != SHARED_POOL else None
             if q:
                 b = q.popleft()
+            elif shared:
+                # 原始模型路径（task_deploy --raw-fill）：专属池全忙时溢出过去 ——
+                # 它装全部专家，哪个 task 都能接
+                b, pool = shared.popleft(), SHARED_POOL
             else:
                 self._await_back.setdefault(task, deque()).append(rec)
                 depth = len(self._await_back[task])
                 b = None
         if b is None:
-            rec.log(f"{task} 池 {self.back_capacity[task]} 条全忙，排队"
-                    f"（队深 {depth}）—— 有界等待（II.5）")
+            rec.log(f"{task} 池 {self.back_capacity[task]} 条全忙"
+                    + ("、原始模型路径也全忙" if self.back_capacity.get(SHARED_POOL)
+                       and task != SHARED_POOL else "")
+                    + f"，排队（队深 {depth}）—— 有界等待（II.5）")
             return
-        self._attach_back(rec, task, b, rebind=rebind)
+        if pool != task:
+            rec.log(f"{task} 池 {self.back_capacity[task]} 条全忙 → 溢出到原始模型路径"
+                    f"（{SHARED_POOL}，全部专家）")
+        self._attach_back(rec, task, b, rebind=rebind, pool=pool)
 
     def _fail(self, rec: RequestRecord, why: str) -> None:
         """把请求判死并唤醒等它的人。**不走 `_finish`** —— 那条路要归还通道，
@@ -615,9 +638,11 @@ class Coordinator:
         self.errors.append(f"{rec.req}: {why}")
         rec.done.set()
 
-    def _attach_back(self, rec: RequestRecord, task: str, b: str, *, rebind: bool) -> None:
+    def _attach_back(self, rec: RequestRecord, task: str, b: str, *, rebind: bool,
+                     pool: str | None = None) -> None:
         old, rec.back = rec.back, b
         rec.task = task
+        rec.back_pool = pool or task
         rec.t_back = time.perf_counter()
         if not rec.t_back_first:
             rec.t_back_first = rec.t_back
@@ -626,7 +651,7 @@ class Coordinator:
                                    "from": old, "to": b, "task": task,
                                    "at_token": len(rec.tokens)})
         w = rec.wait_back_ms
-        rec.log(f"{'换绑' if rebind else '派发'}: pop({task} 池) → {b}"
+        rec.log(f"{'换绑' if rebind else '派发'}: pop({rec.back_pool} 池) → {b}"
                 + (f"（原 {old}）" if rebind and old else "")
                 + (f"，排队等了 {w:.0f}ms" if w > 1 else ""))
         with self._lock:
@@ -757,6 +782,7 @@ class Coordinator:
             return
         rec.rebinds += 1
         old, old_task = rec.back, rec.task
+        old_pool = rec.back_pool or old_task
         rec.miss_window.clear()
         rec.log(f"换绑决策: {old_task} → {nxt}（前段 KV 保留，只重算后段 prefill）")
         # 旧后段 KV 作废并归还队列；**前段 KV 一层都不动**（命题 III.7.1）
@@ -764,7 +790,7 @@ class Coordinator:
             self.pool.send(n, {"type": "drop_kv", "req": rec.req}, delay=False)
         rec.task = nxt
         self._bind(rec, nxt, rebind=True)
-        self._release_back(old_task, old)   # 归还旧后段，可能立刻被排队者接走
+        self._release_back(old_pool, old)   # 归还旧后段，可能立刻被排队者接走
 
     def expected_trace_nodes(self, rec: RequestRecord) -> list[str]:
         return sorted(set(self.seg_nodes.get(rec.front, []))
@@ -805,7 +831,7 @@ class Coordinator:
         # 归还：若有请求在排队，直接交给队首（「重新进入可用池，等待下一个 request」）
         # 静态模式下前后段是一体的，归还前段即等于归还整条通道。
         if rec.back and not self.static:
-            self._release_back(rec.task, rec.back)
+            self._release_back(rec.back_pool or rec.task, rec.back)
         self._release_front(rec.front)
 
 

@@ -182,6 +182,7 @@ bash ./deploy_15.sh status                                                # 不�
 | 放宽公共带 | 规划命令加 `--w-cap <ms>`（直接给上沿）或 `--rho-w <倍数>`（上沿 = 倍数 × 典型跳 p50，默认 1.5）；配合 `--eta` 放宽终审均匀性，例见 5.8 |
 | 建段顺序 | 默认 `--build-order bottleneck`：Step 3 按公平比从低到高建后段（瓶颈池先挑节点）；2026-10-27 之前是 `constrained`（形态最少的池先建）。5.5–5.10 的清单都是 `constrained` 规划的，命令里已带上 |
 | 调链长上限 | 规划命令加 `--hop-slack N`：每条段的跳数 ≤ 整数下界 hops_min（按段驻留量 ÷ 最大单机可用算）+ N，默认 1；`--hop-slack -1` 不限。求解器搜索时就剪掉超长前缀，防止 beam 交出吃光节点的长链（`--beam-legacy` 下不生效）。用现在的部署参数重出方案，开不开它结果逐字节相同 |
+| 每个 task 均分 + 原始模型路径 | 规划命令加 `--quota-equal --raw-fill`：Step 2 每个 task ⌊N_work / task 数⌋ 条、照原算法建段并盲绑任意组合；剩下的节点（含备胎）建全专家的原始模型路径，专属后段全忙时溢出过去，例见 5.12 |
 | 给 no_robots 两条通道 | 重新规划（`examples/task_deploy.py … --tasks gsm8k=1,mbpp=1,no_robots=2`），换 `PLAN` 后从第 3 步的 `fetch`/`verify` 重来 |
 
 ### 5.5 对照组：严格按文档规划的方案（`qwen3-30b/plan_doc_l8.json`）
@@ -818,6 +819,95 @@ python3 examples/analyze_run.py results/run_full2.json --csv results/run_full2_l
 * 控制器仍在 wash1（N09，链 B 的第 17–24 层）上跑；原分配里 client 在 N01，要一致就在 N01 上执行上面的
   命令并把 `ADVERTISE` 换成 N01 的地址（192.168.1.2）；
 * 别的手写分配照这个格式写一个布局 JSON，`task` 写某个 task 名就是那个 task 的专属后段，写 `any` 进共享池。
+
+### 5.12 每个 task 均分 + 原始模型路径（`qwen3-30b/plan_vllm_eq_raw.json`、`plan_doc_v2_eq_raw.json`）
+
+六步流水线只改两处（`--quota-equal --raw-fill`）：
+
+1. **Step 2 按 task 均分**：N_work 照旧来自 Step 1 的显存估算（精确位配平 × θ），但不按 λ 做最大余额分配，
+   而是每个 task ⌊N_work / task 数⌋ 条。这里 N_work = 5、3 个 task → **每个 task 1 条**，余下 2 条的显存
+   不够每个 task 再各分一条；
+2. Step 3–6 **原样**：建后段、公共带、建前段、回环裁剪、终审 —— 前段仍是 task 无关的，**盲绑、任意组合**；
+3. **原始模型路径**（`p2pmoe/planner/raw.py`）：主流程之后剩下的节点（含备胎前段 —— 协调器从不用备胎）
+   一前一后成对地建：后段第 9–48 层装**全部 128 个专家**，进共享池 `any`；前段与主流程的前段相同，并入前段池
+   一起盲绑。建到放不下为止，仍空着的节点记在清单的 `idle` 里。全专家后段 50.5GB 要 3 台以上，用精确放置
+   （`p2pmoe/planner/exact.py`：枚举节点链 + 逐链 DP 切层，目标函数同 `deploy_path`）—— beam 在这种段上不可靠。
+
+在线（`runtime/coordinator.py`）：识别成 u 的请求先取 u 的专属后段；**u 全忙就溢出到原始模型路径**；两边都忙才在
+u 池排队。原始模型路径空出来时接**所有池里等得最久**的那条，专属后段只接本池。结果里的 `task` 仍是识别结果
+（准确率照常算），`back` 是 `Bany0` 的就是走了原始模型路径。
+
+`tests/test_raw_fill.py::test_eq_raw_plan_file_is_reproducible` 校验两份清单逐字节重出：
+
+```bash
+# vLLM 实测（5.9 的输入）
+python3 examples/task_deploy.py --data task3 --config qwen3-30b-a3b --phase prefill \
+  --tasks gsm8k=1,mbpp=1,no_robots=1 \
+  --expert-sets qwen3-30b/expert_sets_90/expert_sets_90_union.json \
+  --l0 8 --front-full \
+  --layer-times qwen3-30b/layer_bench_vllm.json --layer-time-key req@p512g512 \
+  --measured-mem --mem-margin-gb 0 --kv-reserve-gb 2 --endpoint-w 0 \
+  --quota-equal --raw-fill --save-plan qwen3-30b/plan_vllm_eq_raw.json
+
+# PyTorch layerbench 实测（5.7 的输入）
+python3 examples/task_deploy.py --data task3 --config qwen3-30b-a3b --phase prefill \
+  --tasks gsm8k=1,mbpp=1,no_robots=1 \
+  --expert-sets qwen3-30b/expert_sets_90/expert_sets_90_union.json \
+  --l0 8 --front-full \
+  --layer-times qwen3-30b/layer_bench_wash1.json --measured-mem \
+  --mem-prefill-tokens 512 --mem-margin-gb 0 --kv-reserve-gb 2 --endpoint-w 0 \
+  --quota-equal --raw-fill --save-plan qwen3-30b/plan_doc_v2_eq_raw.json
+```
+
+**`plan_vllm_eq_raw.json`**（15 台全上岗）：
+
+| 段 | 节点（层） | 段时延 |
+|---|---|---|
+| 前段 F0 | N02(1–7)+N12(8) | 7.9ms |
+| 前段 F1 | N08(1–7)+N10(8) | 6.6ms |
+| 前段 F2 | N09 | 14.4ms |
+| 前段 F3（原始模型路径） | N14 | 26.0ms |
+| gsm8k | N07(9–32)+N06(33–48) | 8.3ms |
+| mbpp | N01(9–33)+N04(34–48) | 7.9ms |
+| no_robots | N05(9–25)+N03(26–48) | 8.5ms |
+| any（原始模型路径） | N11(9–24)+N13(25–40)+N15(41–48) | 97.0ms |
+
+盲绑组合 p50：专属后段 18.2–29.2ms（接 F3 时 56.9–57.6ms），原始模型后段 115.3–136.5ms。
+核心 3×3 终审 56.4%（vLLM 输入下前段 6.6–14.4ms 与后段 8ms 同量级，3ms 的跨子网接口就占了组合时延的一大截）。
+N11 是 Step 6 裁下来的备胎，拆回来进了原始模型路径。
+
+**`plan_doc_v2_eq_raw.json`**（13 台，空 N13、N14）：
+
+| 段 | 节点（层） | 段时延 |
+|---|---|---|
+| 前段 F0 / F1 / F2 | N05 / N06 / N11 | 19.3 / 19.7 / 21.9ms |
+| 前段 F3（原始模型路径） | N15 | 21.1ms |
+| gsm8k | N07(9–37)+N08(38–48) | 89.3ms |
+| mbpp | N04(9–36)+N01(37–48) | 94.4ms |
+| no_robots | N02(9–44)+N03(45–48) | 95.7ms |
+| any（原始模型路径） | N09(9–21)+N10(22–38)+N12(39–48) | 109.1ms |
+
+盲绑组合 p50：专属后段 109.1–123.7ms（接 F3 时 133.8–139.8ms），原始模型后段 131.1–157.3ms。核心 3×3 终审 7.5%（通过）；
+N13、N14 合计 34.7GB，放不下第二条全专家后段（50.5GB）。
+
+原始模型路径不在公共带内：清单里涉及它的组合的公共带 / w_cap 检查记为警告（vLLM 11 条、PyTorch 8 条），其余校验照旧严格。
+
+```bash
+cd /home/ubuntu/p2p-framework && conda activate moe
+HOSTS=task/hosts.txt bash ./deploy_15.sh stop
+source qwen3-30b/use_plan.sh vllm_eq_raw               # 或 doc_v2_eq_raw；hosts 只含清单用到的节点
+bash ./deploy_15.sh sync
+REPLACE=1 bash ./deploy_15.sh fetch
+bash ./deploy_15.sh verify
+bash ./deploy_15.sh start && bash ./deploy_15.sh status
+
+RESULTS=results/run_vllm_eq_raw.json bash ./deploy_15.sh continuous 2>&1 | tee results/continuous_vllm_eq_raw.log
+python3 examples/analyze_run.py results/run_vllm_eq_raw.json --csv results/run_vllm_eq_raw_latency.csv
+python3 examples/analyze_run.py results/run_vllm_eq_raw.json channel   # 每条通道接了多少条、溢出到原始模型路径的有几条
+```
+
+* 同时在途 = 4（3 条专属后段 + 1 条原始模型后段）；日志里「…池 1 条全忙 → 溢出到原始模型路径」就是溢出；
+* 动态模式照常（不加 `--static`），选择器照常在前段尾识别。
 
 ## 6. 参考数值（用来判断复现是否正常）
 

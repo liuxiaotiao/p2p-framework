@@ -11,6 +11,8 @@
   slowest     TTFT 最高的几条：链路、TTFT 拆分、排队时占着那条后段的是谁
   accuracy    选择器：按 task 的正确率、混淆、置信不到 commit 区的
   rebind      换绑 / 通道二报警，以及「后段排队 > TTFT」这类异常
+  channel     按通道（前段 × 后段）：每条通道接了多少条、哪些 task、TPOT、单请求 token/s
+              —— --raw-fill 的方案里看有多少请求溢出到了原始模型路径（后段 Bany*）
 """
 
 from __future__ import annotations
@@ -24,7 +26,7 @@ import sys
 
 import numpy as np
 
-SECTIONS = ("latency", "ttft", "throughput", "slowest", "accuracy", "rebind")
+SECTIONS = ("latency", "ttft", "throughput", "slowest", "accuracy", "rebind", "channel")
 
 
 def queue(r):
@@ -191,6 +193,30 @@ def sec_rebind(rs, _d):
         f"{r['req']}({r['true_task']}，换绑 {r.get('rebinds', 0)})" for r in long_[:15]))
 
 
+def sec_channel(rs, _d):
+    print("## 按通道（前段 × 后段）")
+    print("| 通道 | 条数 | task | TPOT ms mean | TPOT std | token/s（去排队）mean | 排队 s mean |")
+    print("|---|---|---|---|---|---|---|")
+    by = collections.defaultdict(list)
+    for r in rs:
+        by[(r.get("front"), r.get("back"))].append(r)
+    for (f, b), s in sorted(by.items(), key=lambda kv: (str(kv[0][1]), str(kv[0][0]))):
+        tp = np.asarray([tpot(r) for r in s], float)
+        tp = tp[~np.isnan(tp)]
+        ts = [tok_s(r["n_generated"], r["total_ms"] - queue(r)) for r in s]
+        mix = collections.Counter(r["true_task"] for r in s)
+        print(f"| {f} × {b} | {len(s)} | "
+              + "、".join(f"{u} {n}" for u, n in sorted(mix.items()))
+              + f" | {tp.mean() if len(tp) else float('nan'):.1f} "
+              f"| {tp.std(ddof=1) if len(tp) > 1 else float('nan'):.1f} "
+              f"| {np.nanmean(ts):.2f} | {np.mean([queue(r) for r in s]) / 1000:.1f} |")
+    raw = [r for r in rs if str(r.get("back") or "").startswith("Bany")]
+    if raw:
+        print(f"\n走原始模型路径（Bany*）的 {len(raw)}/{len(rs)} 条："
+              + "、".join(f"{u} {n}" for u, n in
+                         sorted(collections.Counter(r["true_task"] for r in raw).items())))
+
+
 def write_csv(rs, path):
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -225,7 +251,8 @@ def main(argv=None) -> int:
     rs = d["requests"]
     print(f"{a.results}：{len(rs)} 条，模式 {d.get('mode')}，miss={d.get('miss_policy')}")
     fns = {"latency": sec_latency, "ttft": sec_ttft, "throughput": sec_throughput,
-           "slowest": sec_slowest, "accuracy": sec_accuracy, "rebind": sec_rebind}
+           "slowest": sec_slowest, "accuracy": sec_accuracy, "rebind": sec_rebind,
+           "channel": sec_channel}
     for s in (a.sections or SECTIONS):
         print()
         fns[s](rs, d)

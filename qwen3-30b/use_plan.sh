@@ -1,7 +1,7 @@
 # 新开终端后一条命令设好全部环境：env.sh + 指定清单 + 与清单对应的 hosts。
 #
 #     cd /home/ubuntu/p2p-framework && conda activate moe
-#     source qwen3-30b/use_plan.sh vllm          # 或 full_2ch / doc_v2 / doc_v2_5ch / full / doc_l8 / es90_fill
+#     source qwen3-30b/use_plan.sh vllm          # 或 vllm_eq_raw / doc_v2_eq_raw / full_2ch / doc_v2 / doc_v2_5ch / full / doc_l8 / es90_fill
 #     source qwen3-30b/use_plan.sh qwen3-30b/某个清单.json   # 也可以直接给路径
 #
 # hosts 不再手写排除哪几台：从 task/hosts.txt 里只留清单用到的节点，写到
@@ -12,7 +12,7 @@
 
 _up_name=${1:-}
 if [ -z "$_up_name" ]; then
-  echo "用法：source qwen3-30b/use_plan.sh <vllm|full_2ch|doc_v2|doc_v2_5ch|full|doc_l8|es90_fill|清单路径>"
+  echo "用法：source qwen3-30b/use_plan.sh <vllm|vllm_eq_raw|doc_v2_eq_raw|full_2ch|doc_v2|doc_v2_5ch|full|doc_l8|es90_fill|清单路径>"
   return 1 2>/dev/null || exit 1
 fi
 case "$_up_name" in

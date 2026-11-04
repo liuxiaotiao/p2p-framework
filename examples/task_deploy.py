@@ -201,12 +201,20 @@ def main() -> int:
     ap.add_argument("--fill-greedy", action="store_true",
                     help="补位配前段时不向前看（2026-10-27 之前的行为）：总取最快的前段，"
                          "哪怕它让剩下的节点凑不出下一条通道")
+    ap.add_argument("--quota-equal", action="store_true",
+                    help="Step 2 按 task 均分：每个 task ⌊N_work / task 数⌋ 条（不按 λ）；"
+                         "之后照原算法建段、盲绑任意组合")
+    ap.add_argument("--raw-fill", action="store_true",
+                    help="六步之后用剩下的节点建原始模型路径：后段装全部专家进共享池 any，"
+                         "前段并入前段池（planner/raw.py）。与 --fill-idle 二选一")
     ap.add_argument("--save-plan", type=Path, default=None)
     ap.add_argument("--save-spec", type=Path, default=None,
                     help="导出 deploy/run.py 能吃的布局文件")
     args = ap.parse_args()
     if args.kv_reserve_gb is not None and not args.measured_mem:
         raise SystemExit("--kv-reserve-gb 要配 --measured-mem")
+    if args.fill_idle and args.raw_fill:
+        raise SystemExit("--fill-idle 与 --raw-fill 二选一（都是给剩下的节点派活）")
     if args.kv_reserve_gb is not None and args.kv_reserve_gb < 0:
         raise SystemExit(f"--kv-reserve-gb 不能为负，收到 {args.kv_reserve_gb}")
 
@@ -377,6 +385,8 @@ def main() -> int:
     cfg = PlannerConfig(eta=args.eta, beta=1.3, j_cap_ms=args.j_cap, theta=args.theta,
                         kappa_over=0.3, n_standby=0, seed=args.seed,
                         fill_idle=args.fill_idle,
+                        quota_equal=args.quota_equal,
+                        raw_fill=args.raw_fill,
                         exhaustive_short=args.exhaustive_short,
                         beam_legacy=args.beam_legacy,
                         build_order=args.build_order,
@@ -431,9 +441,11 @@ def main() -> int:
           + (f"；备胎 {man.standby_fronts}" if man.standby_fronts else "")
           + (f"；仍空闲 {man.idle}" if man.idle else "")
           + (f"；未分配 {sorted({n.id for n in topo.nodes} - used)}"
-             if not args.fill_idle and len(used) < len(topo.nodes) else ""))
+             if not (args.fill_idle or args.raw_fill) and len(used) < len(topo.nodes) else ""))
     if man.warnings:
-        print(f"  ⚠ {len(man.warnings)} 条警告（补位段不在公共带内，--fill-idle 的已知代价），"
+        print(f"  ⚠ {len(man.warnings)} 条警告（"
+              + ("原始模型路径" if args.raw_fill else "补位段")
+              + "不在公共带内，已知代价），"
               f"首条：{man.warnings[0]}")
 
     wiring = assign_static_pairs(res.fronts_final, res.backs, net, k=cfg.k_audit)
@@ -446,7 +458,8 @@ def main() -> int:
     for p in man.nodes:
         n = next(x for x in topo.nodes if x.id == p.node)
         seg = man.segments.get(p.segment, {})
-        tag = {"promoted": "  ← 备胎提拔", "fill": "  ← 补位新建"}.get(seg.get("origin"), "")
+        tag = {"promoted": "  ← 备胎提拔", "fill": "  ← 补位新建",
+               "raw": "  ← 原始模型路径"}.get(seg.get("origin"), "")
         if p.node in seg.get("spread_nodes", ()):
             tag = "  ← 补位分摊"
         print(f"  {p.node:<6}{p.role:<16}{p.layer_range[0]}–{p.layer_range[1]:<7}"

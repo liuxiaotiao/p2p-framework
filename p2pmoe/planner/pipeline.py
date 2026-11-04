@@ -36,6 +36,7 @@ from .common_band import (
 )
 from .experts import ExpertPlacement
 from .fill import FillResult, fill_idle
+from .raw import RAW_POOL, RawFillResult, fill_raw
 from .loop_trim import TrimResult, loop_profile, trim_by_loop
 from .manifest import DeploymentManifest, build_manifest
 from .memory import L0Candidate, choose_l0, hops_min, make_back_spec, make_front_spec
@@ -304,6 +305,8 @@ class PlanResult:
     fill: FillResult | None = None
     """开了 cfg.fill_idle 时的补位记录。fronts_final / standby / backs 已是补位后的。"""
     audit_core: AuditReport | None = None
+    raw: RawFillResult | None = None
+    """开了 cfg.raw_fill 时的原始模型路径记录。fronts_final / backs 已含它们（backs["any"]）。"""
     """补位前、只含核心段的终审。开补位时 audit 是全网格的，这里留着核心那份做对照。"""
 
     @property
@@ -360,8 +363,25 @@ def plan(
     n_work = int(floor(cfg.theta * base))
     if n_work <= 0:
         raise PlanningError(f"N_work = ⌊{cfg.theta}×{base}⌋ = 0，该池群建不出任何通道", log)
-    q = largest_remainder([t.lam for t in tasks], n_work)
-    quota = {t.name: v for t, v in zip(tasks, q)}
+    if cfg.quota_equal:
+        # 按 task 均分：每个 task ⌊N_work / m⌋ 条；余下的（不够每个 task 再各一条）
+        # 留给 raw_fill 建原始模型路径
+        k_each = n_work // len(tasks)
+        if k_each <= 0:
+            raise PlanningError(
+                f"按 task 均分：⌊N_work / {len(tasks)}⌋ = ⌊{n_work}/{len(tasks)}⌋ = 0，"
+                f"不够每个 task 各一条", log)
+        quota = {t.name: k_each for t in tasks}
+        equal_note = (
+            f"[Step 2] 按 task 均分（--quota-equal）：每个 task ⌊N_work / {len(tasks)}⌋ = "
+            f"⌊{n_work}/{len(tasks)}⌋ = {k_each} 条；余下 {n_work - k_each * len(tasks)} 条的"
+            f"显存不够每个 task 再各分一条"
+            + ("，留给原始模型路径" if cfg.raw_fill else "")
+        )
+    else:
+        equal_note = None
+        q = largest_remainder([t.lam for t in tasks], n_work)
+        quota = {t.name: v for t, v in zip(tasks, q)}
     fair = fair_ratios(quota, {t.name: t.lam for t in tasks})
     n_back_total = sum(quota.values())
     log.append(
@@ -371,6 +391,8 @@ def plan(
         + "、".join(f"{u}={v:.2f}" for u, v in fair.items())
         + f"（瓶颈池 {min(fair, key=fair.get)}）"
     )
+    if equal_note:
+        log.append(equal_note)
 
     n_f_build_target = ceil((1 + cfg.kappa_over) * n_back_total)
     # R_F 只预留**最终**所需的前段条数，不预留超建量：超建（κ_over）是机会性的，
@@ -773,7 +795,26 @@ def plan(
 
     # ---------------- 补位（可选）：把空着的节点全部用上 --------------------
     fill: FillResult | None = None
+    raw: RawFillResult | None = None
     audit_core: AuditReport | None = None
+    if cfg.fill_idle and cfg.raw_fill:
+        raise ValueError("fill_idle 与 raw_fill 二选一")
+    if cfg.raw_fill:
+        raw = fill_raw(
+            fronts=fronts_final, standby=standby, backs=backs, model=model,
+            front_experts=union_experts, l0=l0, node_map=node_map, net=net, cfg=cfg,
+        )
+        log.extend(raw.log)
+        audit_core = audit
+        fronts_final, standby, backs = raw.fronts, raw.standby, raw.backs
+        n_back_total = sum(len(v) for v in backs.values())
+        audit = _audit(fronts_final, backs, net, cfg, [t.name for t in tasks])
+        log.append(
+            f"[原始模型路径·终审] 全网格 {len(fronts_final)}×{n_back_total} = {len(audit.pairs)} 组，"
+            f"最坏相对极差 {audit.worst_rel_spread * 100:.1f}%"
+            f"（核心网格 {audit_core.worst_rel_spread * 100:.1f}%，η={cfg.eta * 100:.0f}%）"
+            + ("" if audit.passed else " —— 原始模型路径不在公共带内，组合时延不保证均匀")
+        )
     if cfg.fill_idle:
         fill = fill_idle(
             fronts=fronts_final, standby=standby, backs=backs, tasks=tasks,
@@ -796,6 +837,8 @@ def plan(
     manifest: DeploymentManifest | None = None
     back_plc = {t.name: t.placement for t in tasks if t.placement is not None}
     if isinstance(union_experts, ExpertPlacement) and len(back_plc) == len(tasks):
+        if raw is not None and RAW_POOL in backs:
+            back_plc[RAW_POOL] = raw.placement
         manifest = build_manifest(
             model=model,
             model_name=f"{model.n_layers}L-d{model.d_model}-E{model.n_experts}",
@@ -813,6 +856,9 @@ def plan(
             **({} if fill is None else dict(
                 origin=fill.origin, relaxed=fill.relaxed,
                 spread_nodes={r for r, _ in fill.spread}, idle=fill.still_idle,
+            )),
+            **({} if raw is None else dict(
+                origin=raw.origin, relaxed=raw.relaxed, idle=raw.still_idle,
             )),
         )
         n_pairs = len(manifest.pairings)
@@ -846,6 +892,7 @@ def plan(
         n_probes=net.n_probes,
         fill=fill,
         audit_core=audit_core,
+        raw=raw,
     )
 
 

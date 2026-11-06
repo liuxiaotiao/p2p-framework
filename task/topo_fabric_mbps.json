@@ -50,9 +50,9 @@
     },
     {
       "id": "N09",
-      "compute_capacity": 130500.0,
+      "compute_capacity": 165000.0,
       "memory_capacity": 24,
-      "role": "RTX6000"
+      "role": "A30"
     },
     {
       "id": "N10",
@@ -68,15 +68,15 @@
     },
     {
       "id": "N12",
-      "compute_capacity": 65000.0,
-      "memory_capacity": 16,
-      "role": "T4"
-    },
-    {
-      "id": "N13",
       "compute_capacity": 130500.0,
       "memory_capacity": 24,
       "role": "RTX6000"
+    },
+    {
+      "id": "N13",
+      "compute_capacity": 65000.0,
+      "memory_capacity": 16,
+      "role": "T4"
     },
     {
       "id": "N14",
@@ -95,632 +95,632 @@
     {
       "u": "N01",
       "v": "N02",
-      "bandwidth": 22213.0,
+      "bandwidth": 22597.0,
+      "propagation_delay": 0.0385
+    },
+    {
+      "u": "N01",
+      "v": "N03",
+      "bandwidth": 20157.5,
+      "propagation_delay": 0.0467
+    },
+    {
+      "u": "N01",
+      "v": "N04",
+      "bandwidth": 21061.5,
       "propagation_delay": 0.0452
     },
     {
       "u": "N01",
-      "v": "N03",
-      "bandwidth": 25462.0,
-      "propagation_delay": 0.04
-    },
-    {
-      "u": "N01",
-      "v": "N04",
-      "bandwidth": 21026.5,
-      "propagation_delay": 0.0503
-    },
-    {
-      "u": "N01",
       "v": "N05",
-      "bandwidth": 22446.0,
-      "propagation_delay": 0.0445
+      "bandwidth": 17314.5,
+      "propagation_delay": 0.0508
     },
     {
       "u": "N01",
       "v": "N06",
-      "bandwidth": 16129.0,
-      "propagation_delay": 1.2243
+      "bandwidth": 13150.5,
+      "propagation_delay": 1.2268
     },
     {
       "u": "N01",
       "v": "N07",
-      "bandwidth": 15791.0,
-      "propagation_delay": 1.2332
+      "bandwidth": 13935.5,
+      "propagation_delay": 1.2125
     },
     {
       "u": "N01",
       "v": "N08",
-      "bandwidth": 16453.5,
-      "propagation_delay": 1.2138
+      "bandwidth": 15175.0,
+      "propagation_delay": 1.2005
     },
     {
       "u": "N01",
       "v": "N09",
-      "bandwidth": 13975.5,
-      "propagation_delay": 3.0817
+      "bandwidth": 15737.5,
+      "propagation_delay": 1.2188
     },
     {
       "u": "N01",
       "v": "N10",
-      "bandwidth": 13485.0,
-      "propagation_delay": 3.0735
+      "bandwidth": 12650.5,
+      "propagation_delay": 3.0857
     },
     {
       "u": "N01",
       "v": "N11",
-      "bandwidth": 12716.0,
-      "propagation_delay": 3.0852
+      "bandwidth": 14276.5,
+      "propagation_delay": 3.0753
     },
     {
       "u": "N01",
       "v": "N12",
-      "bandwidth": 13025.5,
-      "propagation_delay": 3.0797
+      "bandwidth": 11947.0,
+      "propagation_delay": 3.083
     },
     {
       "u": "N01",
       "v": "N13",
-      "bandwidth": 7504.0,
-      "propagation_delay": 11.4863
+      "bandwidth": 13123.0,
+      "propagation_delay": 3.0775
     },
     {
       "u": "N01",
       "v": "N14",
-      "bandwidth": 6431.5,
-      "propagation_delay": 11.488
+      "bandwidth": 4981.5,
+      "propagation_delay": 14.0237
     },
     {
       "u": "N01",
       "v": "N15",
-      "bandwidth": 5532.5,
-      "propagation_delay": 11.482
+      "bandwidth": 4936.5,
+      "propagation_delay": 14.0165
     },
     {
       "u": "N02",
       "v": "N03",
-      "bandwidth": 27465.0,
-      "propagation_delay": 0.0437
+      "bandwidth": 23045.0,
+      "propagation_delay": 0.037
     },
     {
       "u": "N02",
       "v": "N04",
-      "bandwidth": 27145.0,
-      "propagation_delay": 0.0503
-    },
-    {
-      "u": "N02",
-      "v": "N05",
-      "bandwidth": 27353.0,
+      "bandwidth": 27687.0,
       "propagation_delay": 0.0413
     },
     {
       "u": "N02",
+      "v": "N05",
+      "bandwidth": 26315.5,
+      "propagation_delay": 0.0432
+    },
+    {
+      "u": "N02",
       "v": "N06",
-      "bandwidth": 12591.0,
-      "propagation_delay": 1.2152
+      "bandwidth": 17048.5,
+      "propagation_delay": 1.2215
     },
     {
       "u": "N02",
       "v": "N07",
-      "bandwidth": 11432.5,
-      "propagation_delay": 1.2165
+      "bandwidth": 15348.0,
+      "propagation_delay": 1.2063
     },
     {
       "u": "N02",
       "v": "N08",
-      "bandwidth": 14872.5,
-      "propagation_delay": 1.217
+      "bandwidth": 13919.0,
+      "propagation_delay": 1.1957
     },
     {
       "u": "N02",
       "v": "N09",
-      "bandwidth": 12560.5,
-      "propagation_delay": 3.0827
+      "bandwidth": 13775.5,
+      "propagation_delay": 1.21
     },
     {
       "u": "N02",
       "v": "N10",
-      "bandwidth": 11581.5,
-      "propagation_delay": 3.083
+      "bandwidth": 10959.0,
+      "propagation_delay": 3.0842
     },
     {
       "u": "N02",
       "v": "N11",
-      "bandwidth": 9606.5,
-      "propagation_delay": 3.0877
+      "bandwidth": 12179.5,
+      "propagation_delay": 3.0752
     },
     {
       "u": "N02",
       "v": "N12",
-      "bandwidth": 13322.5,
-      "propagation_delay": 3.086
+      "bandwidth": 11723.0,
+      "propagation_delay": 3.0717
     },
     {
       "u": "N02",
       "v": "N13",
-      "bandwidth": 6046.0,
-      "propagation_delay": 11.4827
+      "bandwidth": 13547.0,
+      "propagation_delay": 3.0873
     },
     {
       "u": "N02",
       "v": "N14",
-      "bandwidth": 5975.0,
-      "propagation_delay": 11.4902
+      "bandwidth": 4625.0,
+      "propagation_delay": 14.016
     },
     {
       "u": "N02",
       "v": "N15",
-      "bandwidth": 7277.5,
-      "propagation_delay": 11.4883
+      "bandwidth": 6111.0,
+      "propagation_delay": 14.0207
     },
     {
       "u": "N03",
       "v": "N04",
-      "bandwidth": 26095.5,
-      "propagation_delay": 0.0405
+      "bandwidth": 21319.0,
+      "propagation_delay": 0.044
     },
     {
       "u": "N03",
       "v": "N05",
-      "bandwidth": 23413.0,
-      "propagation_delay": 0.0367
+      "bandwidth": 20332.0,
+      "propagation_delay": 0.0425
     },
     {
       "u": "N03",
       "v": "N06",
-      "bandwidth": 12102.0,
-      "propagation_delay": 1.2127
+      "bandwidth": 15682.0,
+      "propagation_delay": 1.2275
     },
     {
       "u": "N03",
       "v": "N07",
-      "bandwidth": 12326.5,
-      "propagation_delay": 1.2252
+      "bandwidth": 14147.5,
+      "propagation_delay": 1.2135
     },
     {
       "u": "N03",
       "v": "N08",
-      "bandwidth": 16979.5,
-      "propagation_delay": 1.2102
+      "bandwidth": 12005.0,
+      "propagation_delay": 1.2085
     },
     {
       "u": "N03",
       "v": "N09",
-      "bandwidth": 10166.5,
-      "propagation_delay": 3.0772
+      "bandwidth": 18904.5,
+      "propagation_delay": 1.2288
     },
     {
       "u": "N03",
       "v": "N10",
-      "bandwidth": 10631.0,
-      "propagation_delay": 3.077
+      "bandwidth": 11799.0,
+      "propagation_delay": 3.0747
     },
     {
       "u": "N03",
       "v": "N11",
-      "bandwidth": 11044.5,
-      "propagation_delay": 3.0808
+      "bandwidth": 12398.0,
+      "propagation_delay": 3.0773
     },
     {
       "u": "N03",
       "v": "N12",
-      "bandwidth": 13796.0,
-      "propagation_delay": 3.0857
+      "bandwidth": 13058.5,
+      "propagation_delay": 3.0812
     },
     {
       "u": "N03",
       "v": "N13",
-      "bandwidth": 6149.0,
-      "propagation_delay": 11.4973
+      "bandwidth": 12176.5,
+      "propagation_delay": 3.088
     },
     {
       "u": "N03",
       "v": "N14",
-      "bandwidth": 3594.5,
-      "propagation_delay": 11.4857
+      "bandwidth": 3642.5,
+      "propagation_delay": 14.0213
     },
     {
       "u": "N03",
       "v": "N15",
-      "bandwidth": 5370.5,
-      "propagation_delay": 11.4875
+      "bandwidth": 4247.5,
+      "propagation_delay": 14.0135
     },
     {
       "u": "N04",
       "v": "N05",
-      "bandwidth": 21533.5,
-      "propagation_delay": 0.0408
+      "bandwidth": 19796.5,
+      "propagation_delay": 0.0432
     },
     {
       "u": "N04",
       "v": "N06",
-      "bandwidth": 12044.0,
-      "propagation_delay": 1.2125
+      "bandwidth": 15874.0,
+      "propagation_delay": 1.2152
     },
     {
       "u": "N04",
       "v": "N07",
-      "bandwidth": 12573.0,
-      "propagation_delay": 1.2225
+      "bandwidth": 14491.0,
+      "propagation_delay": 1.2132
     },
     {
       "u": "N04",
       "v": "N08",
-      "bandwidth": 17153.0,
-      "propagation_delay": 1.2165
+      "bandwidth": 13206.5,
+      "propagation_delay": 1.211
     },
     {
       "u": "N04",
       "v": "N09",
-      "bandwidth": 11075.0,
-      "propagation_delay": 3.0768
+      "bandwidth": 12273.5,
+      "propagation_delay": 1.2155
     },
     {
       "u": "N04",
       "v": "N10",
-      "bandwidth": 11916.0,
-      "propagation_delay": 3.0708
+      "bandwidth": 8245.5,
+      "propagation_delay": 3.0862
     },
     {
       "u": "N04",
       "v": "N11",
-      "bandwidth": 12456.5,
-      "propagation_delay": 3.0933
+      "bandwidth": 11565.0,
+      "propagation_delay": 3.0753
     },
     {
       "u": "N04",
       "v": "N12",
-      "bandwidth": 12643.0,
-      "propagation_delay": 3.0767
+      "bandwidth": 11026.5,
+      "propagation_delay": 3.0877
     },
     {
       "u": "N04",
       "v": "N13",
-      "bandwidth": 6608.5,
-      "propagation_delay": 11.4958
+      "bandwidth": 12050.0,
+      "propagation_delay": 3.0805
     },
     {
       "u": "N04",
       "v": "N14",
-      "bandwidth": 5757.5,
-      "propagation_delay": 11.4917
+      "bandwidth": 3862.5,
+      "propagation_delay": 14.0168
     },
     {
       "u": "N04",
       "v": "N15",
-      "bandwidth": 4406.5,
-      "propagation_delay": 11.4893
+      "bandwidth": 4948.0,
+      "propagation_delay": 14.0237
     },
     {
       "u": "N05",
       "v": "N06",
-      "bandwidth": 14622.0,
-      "propagation_delay": 1.2015
+      "bandwidth": 12017.5,
+      "propagation_delay": 1.2072
     },
     {
       "u": "N05",
       "v": "N07",
-      "bandwidth": 15267.5,
-      "propagation_delay": 1.231
+      "bandwidth": 11963.5,
+      "propagation_delay": 1.2
     },
     {
       "u": "N05",
       "v": "N08",
-      "bandwidth": 16412.5,
-      "propagation_delay": 1.2105
+      "bandwidth": 13823.0,
+      "propagation_delay": 1.214
     },
     {
       "u": "N05",
       "v": "N09",
-      "bandwidth": 12119.0,
-      "propagation_delay": 3.079
+      "bandwidth": 13471.0,
+      "propagation_delay": 1.2178
     },
     {
       "u": "N05",
       "v": "N10",
-      "bandwidth": 11406.5,
-      "propagation_delay": 3.072
+      "bandwidth": 8055.5,
+      "propagation_delay": 3.0842
     },
     {
       "u": "N05",
       "v": "N11",
-      "bandwidth": 12113.0,
-      "propagation_delay": 3.0797
+      "bandwidth": 7167.0,
+      "propagation_delay": 3.0743
     },
     {
       "u": "N05",
       "v": "N12",
-      "bandwidth": 11658.5,
-      "propagation_delay": 3.0732
+      "bandwidth": 8151.5,
+      "propagation_delay": 3.0842
     },
     {
       "u": "N05",
       "v": "N13",
-      "bandwidth": 5959.5,
-      "propagation_delay": 11.4983
+      "bandwidth": 10030.5,
+      "propagation_delay": 3.075
     },
     {
       "u": "N05",
       "v": "N14",
-      "bandwidth": 5681.0,
-      "propagation_delay": 11.486
+      "bandwidth": 3398.5,
+      "propagation_delay": 14.0152
     },
     {
       "u": "N05",
       "v": "N15",
-      "bandwidth": 2977.5,
-      "propagation_delay": 11.4842
+      "bandwidth": 2138.0,
+      "propagation_delay": 14.012
     },
     {
       "u": "N06",
       "v": "N07",
-      "bandwidth": 14806.5,
-      "propagation_delay": 0.0465
+      "bandwidth": 16339.0,
+      "propagation_delay": 0.0355
     },
     {
       "u": "N06",
       "v": "N08",
-      "bandwidth": 25397.5,
-      "propagation_delay": 0.033
+      "bandwidth": 17438.0,
+      "propagation_delay": 0.0445
     },
     {
       "u": "N06",
       "v": "N09",
-      "bandwidth": 12744.5,
+      "bandwidth": 24301.0,
+      "propagation_delay": 0.036
+    },
+    {
+      "u": "N06",
+      "v": "N10",
+      "bandwidth": 13768.0,
+      "propagation_delay": 3.2395
+    },
+    {
+      "u": "N06",
+      "v": "N11",
+      "bandwidth": 13538.5,
+      "propagation_delay": 3.235
+    },
+    {
+      "u": "N06",
+      "v": "N12",
+      "bandwidth": 12908.0,
+      "propagation_delay": 3.2403
+    },
+    {
+      "u": "N06",
+      "v": "N13",
+      "bandwidth": 13391.5,
       "propagation_delay": 3.2313
     },
     {
       "u": "N06",
-      "v": "N10",
-      "bandwidth": 13715.0,
-      "propagation_delay": 3.223
-    },
-    {
-      "u": "N06",
-      "v": "N11",
-      "bandwidth": 12583.5,
-      "propagation_delay": 3.237
-    },
-    {
-      "u": "N06",
-      "v": "N12",
-      "bandwidth": 14556.0,
-      "propagation_delay": 3.2245
-    },
-    {
-      "u": "N06",
-      "v": "N13",
-      "bandwidth": 7418.5,
-      "propagation_delay": 11.6367
-    },
-    {
-      "u": "N06",
       "v": "N14",
-      "bandwidth": 7584.5,
-      "propagation_delay": 11.6415
+      "bandwidth": 6534.0,
+      "propagation_delay": 14.1683
     },
     {
       "u": "N06",
       "v": "N15",
-      "bandwidth": 7819.5,
-      "propagation_delay": 11.6305
+      "bandwidth": 6416.5,
+      "propagation_delay": 14.161
     },
     {
       "u": "N07",
       "v": "N08",
-      "bandwidth": 25567.0,
-      "propagation_delay": 0.0307
+      "bandwidth": 21616.0,
+      "propagation_delay": 0.0473
     },
     {
       "u": "N07",
       "v": "N09",
-      "bandwidth": 13699.5,
-      "propagation_delay": 3.2445
+      "bandwidth": 20716.0,
+      "propagation_delay": 0.0435
     },
     {
       "u": "N07",
       "v": "N10",
-      "bandwidth": 16452.5,
-      "propagation_delay": 3.2352
+      "bandwidth": 13286.0,
+      "propagation_delay": 3.2245
     },
     {
       "u": "N07",
       "v": "N11",
-      "bandwidth": 11961.5,
-      "propagation_delay": 3.2432
+      "bandwidth": 11886.5,
+      "propagation_delay": 3.2323
     },
     {
       "u": "N07",
       "v": "N12",
-      "bandwidth": 16459.5,
-      "propagation_delay": 3.2405
+      "bandwidth": 13683.5,
+      "propagation_delay": 3.2438
     },
     {
       "u": "N07",
       "v": "N13",
-      "bandwidth": 8086.5,
-      "propagation_delay": 11.6485
+      "bandwidth": 13810.5,
+      "propagation_delay": 3.237
     },
     {
       "u": "N07",
       "v": "N14",
-      "bandwidth": 6682.0,
-      "propagation_delay": 11.6363
+      "bandwidth": 6622.5,
+      "propagation_delay": 14.1615
     },
     {
       "u": "N07",
       "v": "N15",
-      "bandwidth": 7085.0,
-      "propagation_delay": 11.6378
+      "bandwidth": 6052.0,
+      "propagation_delay": 14.1675
     },
     {
       "u": "N08",
       "v": "N09",
-      "bandwidth": 12831.5,
-      "propagation_delay": 3.2305
+      "bandwidth": 28423.0,
+      "propagation_delay": 0.045
     },
     {
       "u": "N08",
       "v": "N10",
-      "bandwidth": 14281.5,
+      "bandwidth": 14290.0,
+      "propagation_delay": 3.233
+    },
+    {
+      "u": "N08",
+      "v": "N11",
+      "bandwidth": 15707.0,
       "propagation_delay": 3.2285
     },
     {
       "u": "N08",
-      "v": "N11",
-      "bandwidth": 13734.0,
-      "propagation_delay": 3.2258
-    },
-    {
-      "u": "N08",
       "v": "N12",
-      "bandwidth": 14255.0,
-      "propagation_delay": 3.2248
+      "bandwidth": 15494.0,
+      "propagation_delay": 3.2295
     },
     {
       "u": "N08",
       "v": "N13",
-      "bandwidth": 8100.0,
-      "propagation_delay": 11.6305
+      "bandwidth": 14023.5,
+      "propagation_delay": 3.2302
     },
     {
       "u": "N08",
       "v": "N14",
-      "bandwidth": 7851.0,
-      "propagation_delay": 11.6415
+      "bandwidth": 6557.0,
+      "propagation_delay": 14.1705
     },
     {
       "u": "N08",
       "v": "N15",
-      "bandwidth": 8092.5,
-      "propagation_delay": 11.6453
+      "bandwidth": 6638.0,
+      "propagation_delay": 14.1603
     },
     {
       "u": "N09",
       "v": "N10",
-      "bandwidth": 16966.5,
-      "propagation_delay": 0.0338
+      "bandwidth": 13992.5,
+      "propagation_delay": 3.2317
     },
     {
       "u": "N09",
       "v": "N11",
-      "bandwidth": 16687.0,
-      "propagation_delay": 0.0393
+      "bandwidth": 12023.5,
+      "propagation_delay": 3.2277
     },
     {
       "u": "N09",
       "v": "N12",
-      "bandwidth": 18421.5,
-      "propagation_delay": 0.0363
+      "bandwidth": 13974.5,
+      "propagation_delay": 3.2268
     },
     {
       "u": "N09",
       "v": "N13",
-      "bandwidth": 6840.5,
-      "propagation_delay": 13.4997
+      "bandwidth": 13493.0,
+      "propagation_delay": 3.2308
     },
     {
       "u": "N09",
       "v": "N14",
-      "bandwidth": 6966.0,
-      "propagation_delay": 13.4958
+      "bandwidth": 6359.0,
+      "propagation_delay": 14.1725
     },
     {
       "u": "N09",
       "v": "N15",
-      "bandwidth": 6928.5,
-      "propagation_delay": 13.5113
+      "bandwidth": 6620.5,
+      "propagation_delay": 14.168
     },
     {
       "u": "N10",
       "v": "N11",
-      "bandwidth": 17037.0,
-      "propagation_delay": 0.0328
+      "bandwidth": 12731.0,
+      "propagation_delay": 0.035
     },
     {
       "u": "N10",
       "v": "N12",
-      "bandwidth": 19660.0,
-      "propagation_delay": 0.0385
-    },
-    {
-      "u": "N10",
-      "v": "N13",
-      "bandwidth": 6916.5,
-      "propagation_delay": 13.4988
-    },
-    {
-      "u": "N10",
-      "v": "N14",
-      "bandwidth": 6899.5,
-      "propagation_delay": 13.4975
-    },
-    {
-      "u": "N10",
-      "v": "N15",
-      "bandwidth": 6738.5,
-      "propagation_delay": 13.5038
-    },
-    {
-      "u": "N11",
-      "v": "N12",
-      "bandwidth": 16835.5,
-      "propagation_delay": 0.0375
-    },
-    {
-      "u": "N11",
-      "v": "N13",
-      "bandwidth": 6691.0,
-      "propagation_delay": 13.51
-    },
-    {
-      "u": "N11",
-      "v": "N14",
-      "bandwidth": 6604.5,
-      "propagation_delay": 13.505
-    },
-    {
-      "u": "N11",
-      "v": "N15",
-      "bandwidth": 6812.5,
-      "propagation_delay": 13.5018
-    },
-    {
-      "u": "N12",
-      "v": "N13",
-      "bandwidth": 6952.0,
-      "propagation_delay": 13.504
-    },
-    {
-      "u": "N12",
-      "v": "N14",
-      "bandwidth": 6861.0,
-      "propagation_delay": 13.5035
-    },
-    {
-      "u": "N12",
-      "v": "N15",
-      "bandwidth": 6930.5,
-      "propagation_delay": 13.4995
-    },
-    {
-      "u": "N13",
-      "v": "N14",
-      "bandwidth": 18240.0,
-      "propagation_delay": 0.032
-    },
-    {
-      "u": "N13",
-      "v": "N15",
-      "bandwidth": 19644.0,
+      "bandwidth": 14050.0,
       "propagation_delay": 0.0427
+    },
+    {
+      "u": "N10",
+      "v": "N13",
+      "bandwidth": 16125.0,
+      "propagation_delay": 0.0412
+    },
+    {
+      "u": "N10",
+      "v": "N14",
+      "bandwidth": 5658.0,
+      "propagation_delay": 16.0395
+    },
+    {
+      "u": "N10",
+      "v": "N15",
+      "bandwidth": 5821.5,
+      "propagation_delay": 16.0378
+    },
+    {
+      "u": "N11",
+      "v": "N12",
+      "bandwidth": 12877.0,
+      "propagation_delay": 0.0395
+    },
+    {
+      "u": "N11",
+      "v": "N13",
+      "bandwidth": 17217.5,
+      "propagation_delay": 0.0358
+    },
+    {
+      "u": "N11",
+      "v": "N14",
+      "bandwidth": 5825.0,
+      "propagation_delay": 16.03
+    },
+    {
+      "u": "N11",
+      "v": "N15",
+      "bandwidth": 5741.5,
+      "propagation_delay": 16.029
+    },
+    {
+      "u": "N12",
+      "v": "N13",
+      "bandwidth": 17324.5,
+      "propagation_delay": 0.0398
+    },
+    {
+      "u": "N12",
+      "v": "N14",
+      "bandwidth": 5760.5,
+      "propagation_delay": 16.0295
+    },
+    {
+      "u": "N12",
+      "v": "N15",
+      "bandwidth": 4925.5,
+      "propagation_delay": 16.0373
+    },
+    {
+      "u": "N13",
+      "v": "N14",
+      "bandwidth": 5812.0,
+      "propagation_delay": 16.0315
+    },
+    {
+      "u": "N13",
+      "v": "N15",
+      "bandwidth": 5862.0,
+      "propagation_delay": 16.0343
     },
     {
       "u": "N14",
       "v": "N15",
-      "bandwidth": 14217.5,
-      "propagation_delay": 0.036
+      "bandwidth": 20388.5,
+      "propagation_delay": 0.0407
     }
   ]
 }

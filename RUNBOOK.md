@@ -88,7 +88,7 @@ export SSH_OPTS="-i ~/.ssh/pool.pem"  # 私钥/端口，没有就不设
 
 export WORKDIR=/home/ubuntu/P2P_MoE            # 各节点上代码放哪儿
 export WEIGHTS=weights                         # 权重放哪儿（相对路径按 WORKDIR 解释；15 台要一致）
-export NODE_PY=/home/ubuntu/anaconda3/envs/moe/bin/python   # 节点上带 torch 的解释器
+export NODE_PY=/home/ubuntu/miniforge3/envs/moe/bin/python   # 节点上带 torch 的解释器
 ```
 
 ### 权重别放 `/data`

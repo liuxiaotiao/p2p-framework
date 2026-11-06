@@ -8,12 +8,12 @@
 
 | 角色 | 节点 |
 |---|---|
-| 控制机 | wash1 = **N09**（192.168.3.4）—— 它同时是 no_robots 后段的头（层 9–14） |
+| 控制机 | wash1 = **N10**（192.168.3.2；2026-11-05 重新编号之前是 N09 = 192.168.3.4） |
 | 前段（层 1–8，全专家） | N01、N10、N11、N12、N15 |
 | 后段（层 9–48，按 task 的专家子集） | gsm8k：N03→N05、N04→N02；mbpp：N06→N07、N13→N14；no_robots：N09→N08 |
 | 代码目录（每台都一样） | `/home/ubuntu/p2p-framework` |
 | 权重目录（每台都一样） | `/home/ubuntu/p2p-framework/weights-q3-30b` |
-| Python（节点与控制机） | `conda activate moe`（`/home/ubuntu/anaconda3/envs/moe`，Python 3.10） |
+| Python（节点与控制机） | `conda activate moe`（`/home/ubuntu/miniforge3/envs/moe`（2026-11 之前是 anaconda3），Python 3.10） |
 
 ---
 
@@ -45,7 +45,7 @@ md5sum p2pmoe/runtime/node.py p2pmoe/runtime/coordinator.py p2pmoe/runtime/torch
 cd /home/ubuntu/p2p-framework
 conda activate moe
 source qwen3-30b/env.sh            # WORKDIR / NODE_PY / REPO / WEIGHTS / PLAN / PROFILE / LR_MODEL / PROBE …
-export ADVERTISE=192.168.3.4       # 控制机对节点可见的 IP —— 不设的话 measure/continuous 直接退出
+export ADVERTISE=192.168.3.2       # 控制机对节点可见的 IP —— 不设的话 measure/continuous 直接退出
 mkdir -p results                   # tee 写日志前目录必须存在
 ```
 
@@ -68,7 +68,7 @@ pip install -r requirements-control.txt      # 含 pyarrow（build_cases 读 par
 tar xzf Delta_30B/delta_30b.tgz -C Delta_30B  # 选择器复核用的 probe 数据 → $PROBE
 ```
 
-想以后不用每次手敲 `ADVERTISE`：把 `export ADVERTISE=192.168.3.4` 追加到 wash1 上
+想以后不用每次手敲 `ADVERTISE`：把 `export ADVERTISE=192.168.3.2` 追加到 wash1 上
 `qwen3-30b/env.sh` 的末尾（只在控制机上这么改）。
 
 ## 3. 模型文件
@@ -183,6 +183,7 @@ bash ./deploy_15.sh status                                                # 不�
 | 建段顺序 | 默认 `--build-order bottleneck`：Step 3 按公平比从低到高建后段（瓶颈池先挑节点）；2026-10-27 之前是 `constrained`（形态最少的池先建）。5.5–5.10 的清单都是 `constrained` 规划的，命令里已带上 |
 | 调链长上限 | 规划命令加 `--hop-slack N`：每条段的跳数 ≤ 整数下界 hops_min（按段驻留量 ÷ 最大单机可用算）+ N，默认 1；`--hop-slack -1` 不限。求解器搜索时就剪掉超长前缀，防止 beam 交出吃光节点的长链（`--beam-legacy` 下不生效）。用现在的部署参数重出方案，开不开它结果逐字节相同 |
 | 每个 task 均分 + 原始模型路径 | 规划命令加 `--quota-equal --raw-fill`：Step 2 每个 task ⌊N_work / task 数⌋ 条、照原算法建段并盲绑任意组合；剩下的节点（含备胎）建全专家的原始模型路径，专属后段全忙时溢出过去，例见 5.12 |
+| 前段限定单节点 | 规划命令加 `--front-max-nodes 1`：前段（第 1–L₀ 层）只能放在一台上（doc I.2.2「单节点成段是首选」），补位与原始模型路径的前段同样适用；默认不限，只受 `--hop-slack` 约束。例见 5.13 |
 | 给 no_robots 两条通道 | 重新规划（`examples/task_deploy.py … --tasks gsm8k=1,mbpp=1,no_robots=2`），换 `PLAN` 后从第 3 步的 `fetch`/`verify` 重来 |
 
 ### 5.5 对照组：严格按文档规划的方案（`qwen3-30b/plan_doc_l8.json`）
@@ -908,6 +909,137 @@ python3 examples/analyze_run.py results/run_vllm_eq_raw.json channel   # 每条�
 
 * 同时在途 = 4（3 条专属后段 + 1 条原始模型后段）；日志里「…池 1 条全忙 → 溢出到原始模型路径」就是溢出；
 * 动态模式照常（不加 `--static`），选择器照常在前段尾识别。
+
+### 5.13 2026-11-05 新拓扑重新规划（`qwen3-30b/plan_1105_*.json`）
+
+节点重新编号、换了机器（`task/hosts.txt`、`task/topo_fabric_mbps.json`）：9 台 A30（RUTG N01–N05、PRIN N06–N09）、
+3 台 RTX6000（WASH N10–N12，wash1 = N10）、3 台 T4（N13 = wash4，N14/N15 = MICH）。站点间单向时延：
+RUTG–PRIN 1.2ms，RUTG/PRIN–WASH 3.1–3.2ms，MICH 到其他站 14–16ms。
+
+**1. 数据目录**：`task4/` = `task3/` 的激活统计 CSV + 新拓扑（`task3/` 不动，旧方案的复现测试读它）：
+
+```bash
+mkdir -p task4 && cp task3/*_expert_activation.csv task4/ && cp task/topo_fabric_mbps.json task4/
+```
+
+**2. 逐层实测表改挂到新编号**：表里的键是节点编号、数据是按机器测的，编号重排后要按主机名对回去
+（`examples/remap_layer_bench.py`，主机名取 `hosts.txt` 每行注释里的括号）。旧表里没有的新机器
+（prin4 = N09、mich1/mich2 = N14/N15）**借同型号卡里耗时居中那台**的实测 —— 只是估计，
+尽快在新机器上跑一次 `bash ./deploy_15.sh layerbench`（vLLM 的也要重测）：
+
+```bash
+python3 examples/remap_layer_bench.py qwen3-30b/layer_bench_wash1.json \
+  --hosts task/hosts.txt --topo task4/topo_fabric_mbps.json --out qwen3-30b/layer_bench_wash1_1105.json
+python3 examples/remap_layer_bench.py qwen3-30b/layer_bench_vllm.json --ref qwen3-30b/layer_bench_wash1.json \
+  --hosts task/hosts.txt --topo task4/topo_fabric_mbps.json --out qwen3-30b/layer_bench_vllm_1105.json
+```
+
+**3. 规划**（与 5.12 相同的方案：每个 task 均分 + 原始模型路径，只换 `--data` 与实测表）：
+
+```bash
+python3 examples/task_deploy.py --data task4 --config qwen3-30b-a3b --phase prefill \
+  --tasks gsm8k=1,mbpp=1,no_robots=1 \
+  --expert-sets qwen3-30b/expert_sets_90/expert_sets_90_union.json --l0 8 --front-full \
+  --layer-times qwen3-30b/layer_bench_vllm_1105.json --layer-time-key req@p512g512 \
+  --measured-mem --mem-margin-gb 0 --kv-reserve-gb 2 --endpoint-w 0 \
+  --quota-equal --raw-fill --save-plan qwen3-30b/plan_1105_vllm_eq_raw.json
+
+python3 examples/task_deploy.py --data task4 --config qwen3-30b-a3b --phase prefill \
+  --tasks gsm8k=1,mbpp=1,no_robots=1 \
+  --expert-sets qwen3-30b/expert_sets_90/expert_sets_90_union.json --l0 8 --front-full \
+  --layer-times qwen3-30b/layer_bench_wash1_1105.json --measured-mem --mem-prefill-tokens 512 \
+  --mem-margin-gb 0 --kv-reserve-gb 2 --endpoint-w 0 \
+  --quota-equal --raw-fill --save-plan qwen3-30b/plan_1105_doc_eq_raw.json
+```
+
+换别的方案就照 5.7–5.12 的命令，把 `--data task3` 换成 `--data task4`、实测表换成 `*_1105.json`。
+
+| | vLLM（`plan_1105_vllm_eq_raw.json`） | PyTorch（`plan_1105_doc_eq_raw.json`） |
+|---|---|---|
+| 前段 | N02+N12、N08+N11、N06+N10（A30 放 1–7 层、RTX 放第 8 层） | N05、N09、N06；原始模型路径 N14 |
+| gsm8k | N07+N09 | N07+N08 |
+| mbpp | N01+N04 | N04+N01 |
+| no_robots | N05+N03 | N02+N03 |
+| 原始模型路径 | 建不出（剩 3 台 T4 共 36GB < 50.5GB） | N12+N13+N11 |
+| 组合 p50 | 17.5–19.4ms，终审 7.0% | 专属 108.6–144.9ms、原始模型 133.5–161.2ms；核心终审 2.4% |
+| 空闲 | N14、N15（备胎 N13） | N10、N15 |
+
+**前段为什么会拆到两台、怎么限定单节点**：vLLM 下组合时延中位只有 16ms，公共带宽上限 η × 16 = 2.4ms。
+后段入口在 RUTG/PRIN，空闲的 A30（N02/N06/N08）到三个入口 0.04–1.2ms（跨度 1.2ms），WASH（N10–N13）
+3.07–3.24ms（跨度 0.16ms）—— 两组进不了同一条 2.4ms 的带，按人口取了 4 台的 WASH 组。前段出口必须在 WASH，
+最快的放法是「A30 放 1–7 层 + RTX 放第 8 层」。加 `--front-max-nodes 1` 禁止这种拆法：
+
+| 方案（都在 vLLM 实测上） | 前段 | 组合 p50 | 原始模型路径 |
+|---|---|---|---|
+| `plan_1105_vllm_eq_raw.json`（默认） | N02+N12、N08+N11、N06+N10（两台） | 17.5–19.4ms | 建不出 |
+| `plan_1105_vllm_eq_raw_f1.json`（`--front-max-nodes 1`） | N10、N11、N12（单台 RTX，出口仍在 WASH）+ N13 | 专属 28.5–40.4ms，原始模型 30.8–41.9ms；核心终审 0.5% | N06+N08+N02（A30，10.0ms） |
+| `plan_1105_vllm_eq_raw_f1_rho1.json`（再加 `--rho-w 1`） | N02、N08、N06（单台 A30）+ N13 | 专属 9.7–40.4ms（接 A30 前段 9.7–12.7ms），原始模型 80.4–98.2ms；核心终审 20.2%（未过 15%） | N12+N10+N11（RTX，72.5ms） |
+
+`--rho-w 1`（doc 给的范围 1–1.5 的下端）让 w_cap = 3.1ms，WASH 的出口（≥ 3.07–3.24ms）出局，前段只能用 A30。
+三份都是 13 台、空 N14/N15；接 N13（T4）前段的组合都在 40ms 左右。
+
+**按 task 分配（不建原始模型路径）—— 现在用的方案**：六步流水线照原样（Step 2 按 λ 最大余额分配额），
+前段单节点（`--front-max-nodes 1`），主流程用不上的节点**按 task 补位**（`--fill-idle`：一前一后成对地加，
+后段给公平比最低的 task）。`tests/test_plan_1105.py` 校验逐字节重出：
+
+```bash
+# vLLM（加 --rho-w 1：w_cap = 3.1ms，前段出口落在 A30 上，不去 WASH）
+python3 examples/task_deploy.py --data task4 --config qwen3-30b-a3b --phase prefill \
+  --tasks gsm8k=1,mbpp=1,no_robots=1 \
+  --expert-sets qwen3-30b/expert_sets_90/expert_sets_90_union.json --l0 8 --front-full \
+  --layer-times qwen3-30b/layer_bench_vllm_1105.json --layer-time-key req@p512g512 --rho-w 1 \
+  --measured-mem --mem-margin-gb 0 --kv-reserve-gb 2 --endpoint-w 0 \
+  --front-max-nodes 1 --fill-idle --save-plan qwen3-30b/plan_1105_vllm_fill.json
+
+# PyTorch
+python3 examples/task_deploy.py --data task4 --config qwen3-30b-a3b --phase prefill \
+  --tasks gsm8k=1,mbpp=1,no_robots=1 \
+  --expert-sets qwen3-30b/expert_sets_90/expert_sets_90_union.json --l0 8 --front-full \
+  --layer-times qwen3-30b/layer_bench_wash1_1105.json --mem-prefill-tokens 512 \
+  --measured-mem --mem-margin-gb 0 --kv-reserve-gb 2 --endpoint-w 0 \
+  --front-max-nodes 1 --fill-idle --save-plan qwen3-30b/plan_1105_doc_fill.json
+```
+
+两份都是 15 台全上岗、5 条前段 × 5 条后段，补位段不在公共带内（清单里记为警告）。
+
+`plan_1105_vllm_fill.json`：配额 {gsm8k 2, mbpp 2, no_robots 1}，公共带凑不够、Step 4 降掉 mbpp、gsm8k 各一条 →
+主流程每个 task 1 条；补位再给 gsm8k、no_robots 各加一条。
+
+| 段 | 节点（层） | 段时延 | 组合 p50（接 5 条前段） |
+|---|---|---|---|
+| 前段 | N05、N03、N06（A30）；补位 N13、N14（T4） | 1.7ms / 25.6ms | |
+| gsm8k | N08(9–34)+N02(35–48) | 10.1ms | 13.1–64.0ms |
+| gsm8k（补位） | N10(9–33)+N12(34–48)（RTX） | 72.3ms | 80.2–130.1ms |
+| mbpp | N07(9–33)+N09(34–48) | 8.3ms | 10.1–62.3ms |
+| no_robots | N01(9–37)+N04(38–48) | 7.8ms | 9.6–61.6ms |
+| no_robots（补位） | N11(9–39)+N15(40–48)（RTX+T4） | 101.4ms | 120.2–143.1ms |
+
+核心 3×3（A30 前段 × 主流程后段）9.6–13.1ms，终审 19.1%（未过 15%：组合只有 10ms 上下，3ms 的绝对差就超了）。
+
+`plan_1105_doc_fill.json`：配额 {gsm8k 2, mbpp 2, no_robots 1}，Step 4 降掉 gsm8k 一条 → 主流程 gsm8k 1、mbpp 2、
+no_robots 1；补位给 no_robots 加一条。
+
+| 段 | 节点（层） | 段时延 | 组合 p50 |
+|---|---|---|---|
+| 前段 | N02、N03（A30）、N11、N12（RTX）；补位 N10（RTX） | 19.1–22.5ms | |
+| gsm8k | N04(9–36)+N01(37–48) | 94.4ms | 113.6–123.1ms |
+| mbpp | N09(9–37)+N06(38–48)、N05(9–36)+N13(37–48) | 96.4 / 101.5ms | 118.0–127.1ms |
+| no_robots | N07(9–33)+N08(34–48) | 89.9ms | 111.5–118.9ms |
+| no_robots（补位） | N14(9–28)+N15(29–48)（T4×2） | 105.7ms | 152.9–160.3ms |
+
+核心 4×4 终审 7.4%（通过）；全网格 39.4%（补位段的已知代价）。
+
+上面「原始模型路径」那几份（`plan_1105_*_eq_raw*.json`）留作对照，不再用。
+
+**4. 部署**：`ADVERTISE` 现在是 **192.168.3.2**（wash1 = N10）。`~/.bashrc` 里写过 `export ADVERTISE=192.168.3.4`
+的要改掉 —— 那个地址现在是 wash3（N12）。
+
+```bash
+HOSTS=task/hosts.txt bash ./deploy_15.sh stop
+source qwen3-30b/use_plan.sh qwen3-30b/plan_1105_vllm_fill.json     # 或 plan_1105_doc_fill.json
+bash ./deploy_15.sh sync && REPLACE=1 bash ./deploy_15.sh fetch && bash ./deploy_15.sh verify
+bash ./deploy_15.sh start && bash ./deploy_15.sh status
+```
 
 ## 6. 参考数值（用来判断复现是否正常）
 

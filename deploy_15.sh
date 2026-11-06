@@ -87,7 +87,7 @@ if [ "$(dirname "$WEIGHTS")" = "/" ] && case "$(basename "$WEIGHTS")" in weights
 fi
 # 节点上跑 torch 的那个解释器。**和控制机的 PY 是两回事** —— 控制机不装 torch。
 # torch 在 conda 环境里的话，这里要填**绝对路径**，不能只写 python3：
-#     NODE_PY=/home/ubuntu/miniconda3/envs/moe/bin/python
+#     NODE_PY=/home/ubuntu/miniforge3/envs/moe/bin/python
 # ssh 非交互 shell 不会执行 conda init，`conda activate` 和裸 `python3` 都找不到它。
 # 不知道路径就跑 ./deploy_15.sh doctor —— 它会在各节点上找出来并告诉你填什么。
 NODE_PY=${NODE_PY:-python3}
@@ -406,7 +406,7 @@ print(\"ok\", numpy.__version__, torch.__version__)'" \
     *) echo "    这个解释器里缺依赖。换一个，或在它里面装：" ;;
   esac
   echo
-  echo "        export NODE_PY=/home/ubuntu/anaconda3/envs/${CONDA_ENV:-moe}/bin/python"
+  echo "        export NODE_PY=/home/ubuntu/miniforge3/envs/${CONDA_ENV:-moe}/bin/python"
   echo
   echo "    不确定路径：bash ./deploy_15.sh doctor —— 它会在各节点上找出来。"
   return 1
@@ -484,7 +484,7 @@ PYEOF
           python3|python) echo "    这是系统 python，看不见 conda 环境里的包。" ;;
         esac
         echo "    torch 在 conda 环境里的话要填**绝对路径**："
-        echo "        export NODE_PY=/home/ubuntu/anaconda3/envs/${CONDA_ENV:-moe}/bin/python"
+        echo "        export NODE_PY=/home/ubuntu/miniforge3/envs/${CONDA_ENV:-moe}/bin/python"
         echo "    不确定路径就跑：bash ./deploy_15.sh doctor" ;;
     esac
     return 1
@@ -829,7 +829,7 @@ printf 'torch    %-12s ' ''
   || echo "✗ \$NP 里没有 torch"
 # torch 不在当前解释器里的话，去 conda 环境里找一遍 —— 找到就直接给出该填的值
 if ! "\$NP" -c 'import torch' >/dev/null 2>&1; then
-  for B in "\$HOME/miniconda3" "\$HOME/anaconda3" "\$HOME/miniforge3" "\$HOME/mambaforge" /opt/conda "\$(conda info --base 2>/dev/null)"; do
+  for B in "\$HOME/miniforge3" "\$HOME/mambaforge" "\$HOME/miniconda3" "\$HOME/anaconda3" /opt/conda "\$(conda info --base 2>/dev/null)"; do
     [ -n "\$B" ] || continue
     for E in "\$CE" base; do
       C="\$B/envs/\$E/bin/python"; [ "\$E" = base ] && C="\$B/bin/python"

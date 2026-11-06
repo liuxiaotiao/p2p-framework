@@ -74,6 +74,7 @@ def make_front_spec(
     l0: int,
     *,
     tail_allowed: frozenset[str] | None = None,
+    max_nodes: int | None = None,
 ) -> SegmentSpec:
     return SegmentSpec(
         kind="front",
@@ -84,6 +85,7 @@ def make_front_spec(
         kv_gb_per_layer=model.kv_gb_per_layer,
         tail_allowed=tail_allowed,
         head_extra_gb=getattr(model, "embed_gb", 0.0),
+        max_nodes=max_nodes,
     )
 
 

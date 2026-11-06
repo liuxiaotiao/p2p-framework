@@ -25,7 +25,7 @@ if [ ! -f "$_up_plan" ]; then
 fi
 
 source qwen3-30b/env.sh >/dev/null
-export ADVERTISE=${ADVERTISE:-192.168.3.4}
+export ADVERTISE=${ADVERTISE:-192.168.3.2}         # wash1（2026-11-05 起是 N10 = 192.168.3.2）
 export PLAN=$_up_plan
 export HOSTS_ALL=task/hosts.txt                  # 停 agent 时用全部 15 台：HOSTS=$HOSTS_ALL bash ./deploy_15.sh stop
 export HOSTS=task/hosts_${_up_tag}.txt
@@ -48,7 +48,7 @@ PYEOF
 _up_ok=1
 _up_chk() { if [ "$2" = "$3" ]; then echo "  ✓ $1=$2"; else echo "  ✗ $1=$2（应为 $3）"; _up_ok=0; fi; }
 _up_chk WORKDIR "$WORKDIR" /home/ubuntu/p2p-framework
-_up_chk NODE_PY "$NODE_PY" /home/ubuntu/anaconda3/envs/moe/bin/python
+_up_chk NODE_PY "$NODE_PY" /home/ubuntu/miniforge3/envs/moe/bin/python
 _up_chk REPO    "$REPO"    Qwen/Qwen3-30B-A3B
 _up_chk WEIGHTS "$WEIGHTS" /home/ubuntu/p2p-framework/weights-q3-30b
 echo "  PLAN=$PLAN  HOSTS=$HOSTS  ADVERTISE=$ADVERTISE"

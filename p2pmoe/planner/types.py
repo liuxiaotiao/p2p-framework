@@ -171,6 +171,9 @@ class SegmentSpec:
     """承载本段第一层的那台额外要装的（前段：词嵌入）。"""
     tail_extra_gb: float = 0.0
     """承载本段最后一层的那台额外要装的（后段：输出头 + 最终 norm）。"""
+    max_nodes: int | None = None
+    """本段最多用几台节点。None = 只受链长上限（hop_slack）约束；前段设 1 即「前段必须单节点」
+    （PlannerConfig.front_max_nodes / task_deploy --front-max-nodes）。"""
 
     @property
     def n_layers(self) -> int:
@@ -408,6 +411,10 @@ class PlannerConfig:
     """Step 3 按轮次交错建段：每个池先各建第 1 条，再各建第 2 条……（池的先后仍按 build_order）。
     默认关 = 一个池建满配额再建下一个。打开后配额多的池的第 2 条不会抢在别的池第 1 条之前挑节点
     （task_deploy --build-interleave）。"""
+    front_max_nodes: int | None = None
+    """前段最多几台节点（None = 不另设，只受 max_hops_slack 约束）。1 = 前段一律单节点：
+    doc I.2.2 说单节点成段是首选、多节点段仅在内存不足时被迫使用 —— 前段 L₀ 层装得进
+    单台时，这一项把「为了让出口落进公共带而拆到两台」的解排除掉。"""
     fill_lookahead: bool = True
     """补位配前段时向前看一步：最快的前段会让剩下的节点凑不出下一条通道时，改用能留出
     下一条通道的、显存最小的单台前段（planner/fill.py 的 pick_front）。2026-10-27 之前没有这一步

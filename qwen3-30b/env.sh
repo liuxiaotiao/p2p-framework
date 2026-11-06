@@ -6,7 +6,7 @@
 # 终端里没有 —— 在终端里写 $WORKDIR/... 会展开成 /...（已经踩过两次）。
 
 export WORKDIR=/home/ubuntu/p2p-framework                 # 控制机与 15 台节点上的代码目录
-export NODE_PY=/home/ubuntu/anaconda3/envs/moe/bin/python  # 节点上跑 torch 的解释器（绝对路径）
+export NODE_PY=/home/ubuntu/miniforge3/envs/moe/bin/python  # 节点上跑 torch 的解释器（绝对路径；2026-11 起 conda 换成 miniforge3）
 export REPO=Qwen/Qwen3-30B-A3B
 export WEIGHTS=$WORKDIR/weights-q3-30b                    # 与 Qwen3-Next 的权重分开放
 export PLAN=qwen3-30b/plan_es90_fill.json                 # 15 台全上、5 条通道

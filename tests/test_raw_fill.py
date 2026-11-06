@@ -180,3 +180,48 @@ def test_fill_idle_and_raw_fill_are_exclusive(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["task_deploy", "--fill-idle", "--raw-fill"])
     with pytest.raises(SystemExit, match="二选一"):
         td.main()
+
+
+# --------------------------------------------------------------------------- #
+# 4. 前段最多几台（--front-max-nodes）
+# --------------------------------------------------------------------------- #
+def test_max_nodes_caps_deploy_path_and_exact_path():
+    import dataclasses
+
+    from p2pmoe.planner.solver import deploy_path
+
+    nm, net, spec = _instance(1, 6, 4, small=True)
+    obj = Objective()
+    free = exact_path(spec, sorted(nm), nm, net, obj, hop_slack=2)
+    assert free is not None and len(free.nodes) >= 2          # 这个实例单台装不下
+    one = dataclasses.replace(spec, max_nodes=1)
+    assert exact_path(one, sorted(nm), nm, net, obj, hop_slack=2) is None
+    assert deploy_path(one, sorted(nm), nm, net, obj, hop_slack=2) is None
+    two = dataclasses.replace(spec, max_nodes=len(free.nodes))
+    s = deploy_path(two, sorted(nm), nm, net, obj, hop_slack=2)
+    assert s is None or len(s.nodes) <= len(free.nodes)
+
+
+def test_front_max_nodes_1_gives_single_node_fronts(tmp_path, monkeypatch):
+    lb = ROOT / "qwen3-30b" / "layer_bench_vllm_1105.json"
+    es = ROOT / "qwen3-30b" / "expert_sets_90" / "expert_sets_90_union.json"
+    if not (lb.exists() and es.exists() and (ROOT / "task4").exists()):
+        pytest.skip("缺 qwen3-30b/ 或 task4/ 数据")
+    sys.path.insert(0, str(ROOT))
+    import examples.task_deploy as td
+
+    base = ["task_deploy", "--data", str(ROOT / "task4"), "--config", "qwen3-30b-a3b",
+            "--phase", "prefill", "--tasks", "gsm8k=1,mbpp=1,no_robots=1", "--expert-sets", str(es),
+            "--l0", "8", "--front-full", "--layer-times", str(lb), "--layer-time-key", "req@p512g512",
+            "--measured-mem", "--mem-margin-gb", "0", "--kv-reserve-gb", "2", "--endpoint-w", "0",
+            "--quota-equal", "--raw-fill"]
+
+    def fronts(extra):
+        out = tmp_path / "p.json"
+        monkeypatch.setattr(sys, "argv", base + extra + ["--save-plan", str(out)])
+        assert td.main() == 0
+        segs = json.loads(out.read_text())["segments"]
+        return [v["nodes"] for v in segs.values() if v["role"].startswith("front")]
+
+    assert any(len(n) == 2 for n in fronts([]))               # 不限：A30 7 层 + RTX 1 层
+    assert all(len(n) == 1 for n in fronts(["--front-max-nodes", "1"]))

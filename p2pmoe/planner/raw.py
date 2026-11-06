@@ -88,7 +88,7 @@ def fill_raw(
     spec = make_back_spec(model, TaskProfile(name=RAW_POOL, lam=0.0,
                                              experts_per_layer=model.n_experts,
                                              placement=plc), l0)
-    front_spec = make_front_spec(model, front_experts, l0)
+    front_spec = make_front_spec(model, front_experts, l0, max_nodes=cfg.front_max_nodes)
     obj = Objective(mu_ms=cfg.mu_ms, jitter_w=cfg.jitter_w)
     res = RawFillResult(fronts=fronts, standby=[], backs=backs, placement=plc)
     log = res.log

@@ -114,7 +114,8 @@ def fill_idle(
         f"备胎 {len(standby_q)} 条，空闲 {len(idle)} 台 {sorted(idle)}"
     )
 
-    front_spec = make_front_spec(model, union_experts, l0)  # 不限出口：补位不过公共带
+    front_spec = make_front_spec(model, union_experts, l0,  # 不限出口：补位不过公共带
+                                 max_nodes=cfg.front_max_nodes)
     back_specs = {t.name: make_back_spec(model, t, l0) for t in tasks}
     lam = {t.name: t.lam for t in tasks}
     obj = Objective(mu_ms=cfg.mu_ms, jitter_w=cfg.jitter_w)

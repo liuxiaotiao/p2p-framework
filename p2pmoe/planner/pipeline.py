@@ -341,7 +341,7 @@ def plan(
         f"加权总跳数 {l0c.total_hops_weighted:.2f}，前段单节点合格 {l0c.front_single_node_count} 台）"
     )
 
-    front_spec_free = make_front_spec(model, union_experts, l0)
+    front_spec_free = make_front_spec(model, union_experts, l0, max_nodes=cfg.front_max_nodes)
     back_specs = {t.name: make_back_spec(model, t, l0) for t in tasks}
 
     # ---------------- Step 1：分档估上限 -----------------------------------
@@ -723,7 +723,8 @@ def plan(
     # ---------------- Step 5：建前段 + 平衡（故意超建） ---------------------
     q_out = frozenset(band_res.exits)
     n_f_build = min(len(q_out), n_f_build_target)
-    front_spec = make_front_spec(model, union_experts, l0, tail_allowed=q_out)
+    front_spec = make_front_spec(model, union_experts, l0, tail_allowed=q_out,
+                                 max_nodes=cfg.front_max_nodes)
     fronts: list[Segment] = []
     pool = set(free)
     front_obj = Objective(mu_ms=cfg.mu_ms, jitter_w=cfg.jitter_w)

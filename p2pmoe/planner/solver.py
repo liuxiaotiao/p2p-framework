@@ -221,6 +221,8 @@ def deploy_path(
         node_cap = max(1, ceil(gb(1, n_layers) / max_cap - 1e-9)) + max(0, hop_slack)
     else:
         node_cap = None
+    if spec.max_nodes is not None:
+        node_cap = spec.max_nodes if node_cap is None else min(node_cap, spec.max_nodes)
 
     def within_cap(n_nodes: int, placed: int) -> bool:
         if node_cap is None:

@@ -201,6 +201,8 @@ def main() -> int:
     ap.add_argument("--fill-greedy", action="store_true",
                     help="补位配前段时不向前看（2026-10-27 之前的行为）：总取最快的前段，"
                          "哪怕它让剩下的节点凑不出下一条通道")
+    ap.add_argument("--front-max-nodes", type=int, default=None,
+                    help="前段最多几台节点；1 = 前段一律单节点（默认不另设，只受 --hop-slack 约束）")
     ap.add_argument("--quota-equal", action="store_true",
                     help="Step 2 按 task 均分：每个 task ⌊N_work / task 数⌋ 条（不按 λ）；"
                          "之后照原算法建段、盲绑任意组合")
@@ -386,6 +388,7 @@ def main() -> int:
                         kappa_over=0.3, n_standby=0, seed=args.seed,
                         fill_idle=args.fill_idle,
                         quota_equal=args.quota_equal,
+                        front_max_nodes=args.front_max_nodes,
                         raw_fill=args.raw_fill,
                         exhaustive_short=args.exhaustive_short,
                         beam_legacy=args.beam_legacy,

@@ -60,6 +60,8 @@ def exact_path(
     cap_n = n_min + (2 if hop_slack is None else max(0, hop_slack))
     if max_nodes is not None:
         cap_n = min(cap_n, max_nodes)
+    if spec.max_nodes is not None:
+        cap_n = min(cap_n, spec.max_nodes)
     cap_n = min(cap_n, len(avail), n)
     scale = spec.ms_per_layer_scale
     INF = float("inf")

@@ -1031,6 +1031,40 @@ no_robots 1；补位给 no_robots 加一条。
 
 上面「原始模型路径」那几份（`plan_1105_*_eq_raw*.json`）留作对照，不再用。
 
+**只跑主流程的 3 条、不跑补位**：用 `qwen3-30b/plan_1105_vllm.json`（同一条 vLLM 命令去掉 `--fill-idle`）。
+它的 9 台节点、层区间、专家与 `plan_1105_vllm_fill.json` 的核心部分逐项相同（`tests/test_plan_1105.py` 校验），
+所以**不用重新拉权重**，换清单即可；补位的 6 台（N10–N15）不起 agent：
+
+```bash
+HOSTS=task/hosts.txt bash ./deploy_15.sh stop                     # 先把 15 台都停掉
+source qwen3-30b/use_plan.sh qwen3-30b/plan_1105_vllm.json        # HOSTS 只剩 9 台
+bash ./deploy_15.sh sync && bash ./deploy_15.sh verify            # verify 应 9 台都 ✓（权重是现成的）
+bash ./deploy_15.sh start && bash ./deploy_15.sh status
+```
+
+**只按 decode 规划（对照）**：上面的 vLLM 方案用 `req@p512g512`（一次 512 token prefill 摊到 512 个生成 token
+上，加进每层耗时）。换成 `--layer-time-key decode@p512g512` 就只按 decode（上下文 512→1023 的平均）规划：
+
+```bash
+python3 examples/task_deploy.py --data task4 --config qwen3-30b-a3b --phase prefill \
+  --tasks gsm8k=1,mbpp=1,no_robots=1 \
+  --expert-sets qwen3-30b/expert_sets_90/expert_sets_90_union.json --l0 8 --front-full \
+  --layer-times qwen3-30b/layer_bench_vllm_1105.json --layer-time-key decode@p512g512 --rho-w 1 \
+  --measured-mem --mem-margin-gb 0 --kv-reserve-gb 2 --endpoint-w 0 \
+  --front-max-nodes 1 --save-plan qwen3-30b/plan_1105_vllm_dec.json        # 加 --fill-idle → plan_1105_vllm_dec_fill.json
+```
+
+节点与通道和 req 版完全相同，只有两条后段的切层点不同（两台都是 A30、每层耗时只差几个百分点，切在哪层
+段时延只差零点几毫秒；换了计时口径，求解器在几乎打平的切法里选了另一个）：
+
+| 段 | req@p512g512（`plan_1105_vllm*.json`） | decode@p512g512（`plan_1105_vllm_dec*.json`） |
+|---|---|---|
+| no_robots | N01(9–37)+N04(38–48) | N01(9–25)+N04(26–48) |
+| gsm8k | N08(9–34)+N02(35–48) | N08(9–35)+N02(36–48) |
+| 其余（前段 N05/N03/N06、mbpp N07+N09、补位段） | 同 | 同 |
+
+两份之间切换时 `REPLACE=1 bash ./deploy_15.sh fetch` 只会重拉 N01、N02、N04、N08 四台，其余跳过。
+
 **4. 部署**：`ADVERTISE` 现在是 **192.168.3.2**（wash1 = N10）。`~/.bashrc` 里写过 `export ADVERTISE=192.168.3.4`
 的要改掉 —— 那个地址现在是 wash3（N12）。
 

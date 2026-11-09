@@ -1,0 +1,35 @@
+{
+  "model": {"layers": 48, "block_gib": 1.3, "fixed_gib": 1.786},
+  "constants": {"hop_ms": 28.0, "t_layer_a30_ms": 0.375, "client_ms": 107.0},
+  "chains": {
+    "A": {"client": "N06", "servers": [
+      {"node": "N06", "gpu": "A30", "layers": "0:8", "n_layers": 8, "max_layers": 8, "mem_gib": 12.2, "one_way_delay_ms": 0.0, "bandwidth_mbps": null, "hop_ms": 31.0},
+      {"node": "N01", "gpu": "A30", "layers": "8:16", "n_layers": 8, "max_layers": 8, "mem_gib": 12.2, "one_way_delay_ms": 1.2268, "bandwidth_mbps": 13150.5, "hop_ms": 33.46},
+      {"node": "N07", "gpu": "A30", "layers": "16:24", "n_layers": 8, "max_layers": 8, "mem_gib": 12.2, "one_way_delay_ms": 0.0355, "bandwidth_mbps": 16339.0, "hop_ms": 31.08},
+      {"node": "N08", "gpu": "A30", "layers": "24:32", "n_layers": 8, "max_layers": 8, "mem_gib": 12.2, "one_way_delay_ms": 0.0445, "bandwidth_mbps": 17438.0, "hop_ms": 31.09},
+      {"node": "N09", "gpu": "A30", "layers": "32:40", "n_layers": 8, "max_layers": 8, "mem_gib": 12.2, "one_way_delay_ms": 0.036, "bandwidth_mbps": 24301.0, "hop_ms": 31.07},
+      {"node": "N10", "gpu": "RTX6000", "layers": "40:48", "n_layers": 8, "max_layers": 8, "mem_gib": 12.2, "one_way_delay_ms": 3.2395, "bandwidth_mbps": 13768.0, "hop_ms": 38.28}],
+      "tpot_ms": 303.0, "network_ms": 9.16},
+    "B": {"client": "N02", "servers": [
+      {"node": "N02", "gpu": "A30", "layers": "0:8", "n_layers": 8, "max_layers": 8, "mem_gib": 12.2, "one_way_delay_ms": 0.0, "bandwidth_mbps": null, "hop_ms": 31.0},
+      {"node": "N03", "gpu": "A30", "layers": "8:16", "n_layers": 8, "max_layers": 8, "mem_gib": 12.2, "one_way_delay_ms": 0.037, "bandwidth_mbps": 23045.0, "hop_ms": 31.08},
+      {"node": "N04", "gpu": "A30", "layers": "16:24", "n_layers": 8, "max_layers": 8, "mem_gib": 12.2, "one_way_delay_ms": 0.0413, "bandwidth_mbps": 27687.0, "hop_ms": 31.08},
+      {"node": "N05", "gpu": "A30", "layers": "24:32", "n_layers": 8, "max_layers": 8, "mem_gib": 12.2, "one_way_delay_ms": 0.0432, "bandwidth_mbps": 26315.5, "hop_ms": 31.09},
+      {"node": "N11", "gpu": "RTX6000", "layers": "32:40", "n_layers": 8, "max_layers": 8, "mem_gib": 12.2, "one_way_delay_ms": 3.0752, "bandwidth_mbps": 12179.5, "hop_ms": 37.95},
+      {"node": "N12", "gpu": "RTX6000", "layers": "40:48", "n_layers": 8, "max_layers": 8, "mem_gib": 12.2, "one_way_delay_ms": 3.0717, "bandwidth_mbps": 11723.0, "hop_ms": 37.94}],
+      "tpot_ms": 307.1, "network_ms": 12.54}
+  },
+  "idle": ["N13", "N14", "N15"],
+  "baseline": [
+    {"chain": "A", "client": "N01", "nodes": ["N01", "N05", "N03", "N07", "N02", "N06"], "tpot_ms": 298.2, "network_ms": 5.15},
+    {"chain": "B", "client": "N11", "nodes": ["N11", "N08", "N09", "N13", "N04", "N10"], "tpot_ms": 318.4, "network_ms": 19.2}
+  ],
+  "CHAINS": "A:N06,N01,N07,N08,N09,N10 B:N02,N03,N04,N05,N11,N12",
+  "hosts_blocks": [
+    "N06  blocks=0:8  # A30 | chain A", "N01  blocks=8:16  # A30 | chain A", "N07  blocks=16:24  # A30 | chain A",
+    "N08  blocks=24:32  # A30 | chain A", "N09  blocks=32:40  # A30 | chain A", "N10  blocks=40:48  # RTX6000 | chain A",
+    "N02  blocks=0:8  # A30 | chain B", "N03  blocks=8:16  # A30 | chain B", "N04  blocks=16:24  # A30 | chain B",
+    "N05  blocks=24:32  # A30 | chain B", "N11  blocks=32:40  # RTX6000 | chain B", "N12  blocks=40:48  # RTX6000 | chain B",
+    "N13  blocks=8  # T4 | spare, not in a chain", "N14  blocks=8  # T4 | spare, not in a chain", "N15  blocks=8  # T4 | spare, not in a chain"
+  ]
+}

@@ -1075,6 +1075,42 @@ bash ./deploy_15.sh sync && REPLACE=1 bash ./deploy_15.sh fetch && bash ./deploy
 bash ./deploy_15.sh start && bash ./deploy_15.sh status
 ```
 
+### 5.14 Petals 的分配直接拿来部署（`qwen3-30b/plan_petals_cap8.json`）
+
+Petals 给的分配（`qwen3-30b/petals/plan_cap8_petals.json`）：两条链，每台 8 层、完整模型，层号是 0-based 切片
+（`0:8` = 第 1–8 层）。转成本框架的清单（与 5.11 同一条路：手写布局 → `manual_plan.py`）：
+
+```bash
+python3 examples/petals_to_layout.py qwen3-30b/petals/plan_cap8_petals.json --out qwen3-30b/layout_petals_cap8.json
+python3 examples/manual_plan.py qwen3-30b/layout_petals_cap8.json --out qwen3-30b/plan_petals_cap8.json \
+  --layer-times qwen3-30b/layer_bench_wash1_1105.json --kv-reserve-gb 2 --topo task4/topo_fabric_mbps.json
+```
+
+| 层 | 链 A | 链 B |
+|---|---|---|
+| 1–8（前段） | N06 | N02 |
+| 9–16 | N01 | N03 |
+| 17–24 | N07 | N04 |
+| 25–32 | N08 | N05 |
+| 33–40 | N09 | N11 |
+| 41–48 | N10 | N12 |
+
+* 前段 = 第 1–8 层那台（L₀ = 8），后段 = 其余 5 台，标 `back:any` 进共享池（同 5.11）；专家全装；
+* 每台要 ≤ 10.6GB（8 层 9.97GB + 首尾表 0.62GB），留 2GB KV 后可用 21.3–22.9GB，都装得下；
+* 按 PyTorch 实测估的组合 p50：123.7–128.3ms（盲绑，前段 × 后段任意组合）；
+* Petals 的 `client`（N06 / N02）不进清单，控制器仍在 wash1（N10）；N13–N15 不用。
+
+```bash
+HOSTS=task/hosts.txt bash ./deploy_15.sh stop
+source qwen3-30b/use_plan.sh qwen3-30b/plan_petals_cap8.json     # HOSTS 只含这 12 台
+bash ./deploy_15.sh sync
+REPLACE=1 bash ./deploy_15.sh fetch                              # 各节点删掉旧方案的层、拉自己这 8 层（全部专家）
+bash ./deploy_15.sh verify && bash ./deploy_15.sh start && bash ./deploy_15.sh status
+RESULTS=results/run_petals_cap8.json bash ./deploy_15.sh continuous
+```
+
+以后 Petals 出了新的分配，换掉第一条命令的输入文件、给新的 `--out` 名字即可。
+
 ## 6. 参考数值（用来判断复现是否正常）
 
 | 实验 | 指标 | 历史值 |

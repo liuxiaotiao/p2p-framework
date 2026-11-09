@@ -1,0 +1,106 @@
+{
+  "_note": "由 examples/petals_to_layout.py 从 Petals 分配转来：完整模型（专家全装），原表层号是 0-based 切片（0:8 = 第 1–8 层）；task=any → 共享后段池。",
+  "l0": 8,
+  "channels": [
+    {
+      "task": "any",
+      "chain": "A",
+      "front": [
+        {
+          "node": "N06",
+          "layers": [
+            1,
+            8
+          ]
+        }
+      ],
+      "back": [
+        {
+          "node": "N01",
+          "layers": [
+            9,
+            16
+          ]
+        },
+        {
+          "node": "N07",
+          "layers": [
+            17,
+            24
+          ]
+        },
+        {
+          "node": "N08",
+          "layers": [
+            25,
+            32
+          ]
+        },
+        {
+          "node": "N09",
+          "layers": [
+            33,
+            40
+          ]
+        },
+        {
+          "node": "N10",
+          "layers": [
+            41,
+            48
+          ]
+        }
+      ]
+    },
+    {
+      "task": "any",
+      "chain": "B",
+      "front": [
+        {
+          "node": "N02",
+          "layers": [
+            1,
+            8
+          ]
+        }
+      ],
+      "back": [
+        {
+          "node": "N03",
+          "layers": [
+            9,
+            16
+          ]
+        },
+        {
+          "node": "N04",
+          "layers": [
+            17,
+            24
+          ]
+        },
+        {
+          "node": "N05",
+          "layers": [
+            25,
+            32
+          ]
+        },
+        {
+          "node": "N11",
+          "layers": [
+            33,
+            40
+          ]
+        },
+        {
+          "node": "N12",
+          "layers": [
+            41,
+            48
+          ]
+        }
+      ]
+    }
+  ]
+}

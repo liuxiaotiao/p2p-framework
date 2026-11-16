@@ -201,6 +201,14 @@ def main() -> int:
     ap.add_argument("--fill-greedy", action="store_true",
                     help="补位配前段时不向前看（2026-10-27 之前的行为）：总取最快的前段，"
                          "哪怕它让剩下的节点凑不出下一条通道")
+    ap.add_argument("--balance-by-round", action="store_true",
+                    help="后段按轮次分组收紧：所有 task 的第 1 条一起平衡、第 2 条一起平衡……；"
+                         "--single-front 时自动打开")
+    ap.add_argument("--tighten-exact", action="store_true",
+                    help="两轮筛收紧时用精确放置重建段（planner/exact.py），不用 beam；--single-front 时自动打开")
+    ap.add_argument("--single-front", action="store_true",
+                    help="只建一条前段、放一台节点，所有请求共用；后段照旧建并收紧均衡，"
+                         "不做公共带 / 超建 / 回环裁剪（PlannerConfig.single_front）")
     ap.add_argument("--front-max-nodes", type=int, default=None,
                     help="前段最多几台节点；1 = 前段一律单节点（默认不另设，只受 --hop-slack 约束）")
     ap.add_argument("--quota-equal", action="store_true",
@@ -389,6 +397,9 @@ def main() -> int:
                         fill_idle=args.fill_idle,
                         quota_equal=args.quota_equal,
                         front_max_nodes=args.front_max_nodes,
+                        single_front=args.single_front,
+                        tighten_exact=args.tighten_exact,
+                        balance_by_round=args.balance_by_round,
                         raw_fill=args.raw_fill,
                         exhaustive_short=args.exhaustive_short,
                         beam_legacy=args.beam_legacy,
@@ -411,6 +422,10 @@ def main() -> int:
         if args.min_l0 and args.l0 < args.min_l0:
             raise SystemExit(f"--l0 {args.l0} < --min-l0 {args.min_l0}")
         p_curve = {args.l0: p_curve[args.l0]}
+        if p_curve[args.l0] < 0.80:
+            # 切点是人给定的：识别率低于 0.8 只报出来，不拦（拦了就没法按指定切点规划）
+            print(f"  ⚠ L₀ = {args.l0} 时按激活直方图的可识别率只有 {p_curve[args.l0]:.1%}"
+                  f"（< 80%）—— 前段出口靠前 {args.l0} 层判 task，误判会多")
     elif args.min_l0:
         p_curve = {l: v for l, v in p_curve.items() if l >= args.min_l0}
         print(f"  切点下限 L₀ ≥ {args.min_l0}（前段出口的识别器要看前 {args.min_l0} 层）")
@@ -420,7 +435,8 @@ def main() -> int:
         front_plc = full_placement(L, info.n_experts)
         print(f"  前段装全部 {info.n_experts} 个专家/层（--front-full），不用并集")
     try:
-        res = plan(topo.nodes, spec, tasks, front_plc, net, cfg, p_curve, p_min=0.80,
+        res = plan(topo.nodes, spec, tasks, front_plc, net, cfg, p_curve,
+                   p_min=0.0 if args.l0 else 0.80,
                    rent_policy=args.rent_policy)
     except PlanningError as e:
         for line in e.log:

@@ -184,6 +184,9 @@ bash ./deploy_15.sh status                                                # 不�
 | 调链长上限 | 规划命令加 `--hop-slack N`：每条段的跳数 ≤ 整数下界 hops_min（按段驻留量 ÷ 最大单机可用算）+ N，默认 1；`--hop-slack -1` 不限。求解器搜索时就剪掉超长前缀，防止 beam 交出吃光节点的长链（`--beam-legacy` 下不生效）。用现在的部署参数重出方案，开不开它结果逐字节相同 |
 | 每个 task 均分 + 原始模型路径 | 规划命令加 `--quota-equal --raw-fill`：Step 2 每个 task ⌊N_work / task 数⌋ 条、照原算法建段并盲绑任意组合；剩下的节点（含备胎）建全专家的原始模型路径，专属后段全忙时溢出过去，例见 5.12 |
 | 前段限定单节点 | 规划命令加 `--front-max-nodes 1`：前段（第 1–L₀ 层）只能放在一台上（doc I.2.2「单节点成段是首选」），补位与原始模型路径的前段同样适用；默认不限，只受 `--hop-slack` 约束。例见 5.13 |
+| 单前段 | 规划命令加 `--single-front`（配 `--l0 2`）：只建一条前段、放一台，所有请求共用；后段照旧建并收紧，不做公共带 / 超建 / 回环裁剪，例见 5.15 |
+| 按轮次分组收紧 | 规划命令加 `--balance-by-round`：所有 task 的第 1 条后段一起收紧、第 2 条一起收紧……（`--single-front` 时自动打开），例见 5.15 |
+| 收紧用精确放置 | 规划命令加 `--tighten-exact`：两轮筛重建段时用 `planner/exact.py` 代替 beam（`--single-front` 时自动打开），例见 5.15 |
 | 给 no_robots 两条通道 | 重新规划（`examples/task_deploy.py … --tasks gsm8k=1,mbpp=1,no_robots=2`），换 `PLAN` 后从第 3 步的 `fetch`/`verify` 重来 |
 
 ### 5.5 对照组：严格按文档规划的方案（`qwen3-30b/plan_doc_l8.json`）
@@ -1110,6 +1113,72 @@ RESULTS=results/run_petals_cap8.json bash ./deploy_15.sh continuous
 ```
 
 以后 Petals 出了新的分配，换掉第一条命令的输入文件、给新的 `--out` 名字即可。
+
+### 5.15 单前段：一台节点放第 1–2 层，所有请求共用（`qwen3-30b/plan_1105_*_1f.json`）
+
+算法改动（`--single-front`，`PlannerConfig.single_front`）：
+
+* **后段不变**：Step 1 分档估上限（前段只算一次，不再每条通道各算一条）、Step 2 按 λ 最大余额配额、
+  Step 3 建后段（按轮次交错，见下）+ 间隙检测 + 字典序收紧 —— 后段之间照旧要均衡；
+* **前段只有一条、只放一台**：不再有「多条前段 × 各条后段组合时延一致」的要求，所以 Step 4（公共中值域）、
+  Step 5（超建前段）、Step 6（回环裁剪）都不做。后段建完之后，从剩下的节点里按同一个目标函数（计算 +
+  稳定性 + 抖动 + 端点项）挑一台放第 1..L₀ 层，端点项取它到全体后段的正向 / 回环的平均实测代价；
+* **在线**：清单里这条前段记 `slots = 后段条数`，协调器在空闲队列里放这么多个它的名额 —— 同时在途的请求数
+  = 后段条数，每条请求在前段上的 KV 分开存；节点上的前向串行执行（`node.py` 的 `_fwd_lock`）。
+
+```bash
+# vLLM
+python3 examples/task_deploy.py --data task4 --config qwen3-30b-a3b --phase prefill \
+  --tasks gsm8k=1,mbpp=1,no_robots=1 \
+  --expert-sets qwen3-30b/expert_sets_90/expert_sets_90_union.json --l0 2 --front-full \
+  --layer-times qwen3-30b/layer_bench_vllm_1105.json --layer-time-key req@p512g512 \
+  --measured-mem --mem-margin-gb 0 --kv-reserve-gb 2 --endpoint-w 0 \
+  --single-front --save-plan qwen3-30b/plan_1105_vllm_1f.json
+# PyTorch：把 --layer-times 换成 qwen3-30b/layer_bench_wash1_1105.json --mem-prefill-tokens 512（去掉 --layer-time-key），
+#          --save-plan qwen3-30b/plan_1105_doc_1f.json
+```
+
+**后段建段顺序**：单前段一律**按轮次交错**——每个 task 先各建一条，再各建第二条…；每一轮里按
+公平比从低到高（瓶颈池先）。λ 相同时多出的那 1 条配额给了 gsm8k，它公平比最高，所以**每一轮都排最后**：
+`mbpp0 → no_robots0 → gsm8k0 → mbpp1 → no_robots1 → gsm8k1 → gsm8k2`。另外单前段自动给前段预留一台
+（影子租金 smallest_sufficient），不然后段可能把节点吃光（PyTorch 实测 6 条后段用掉全部 15 台）。
+
+**收紧用精确放置**：单前段时两轮筛的重建自动改用 `planner/exact.py`（`--tighten-exact` 可在其他模式下打开）。
+beam 在收紧的小池子上会交出「一台 RTX 只放 1 层却占着两台 RTX」的链，下一条段无处可放、整轮回退 ——
+vLLM 下 gsm8k 两条 9.8 / 83.5ms 原样没动；改用精确放置后拆成「A30 + RTX」各一条，43.2 / 43.4ms。
+
+**按轮次分组收紧**（单前段时自动打开；其他模式 `--balance-by-round`）：两轮筛不再按 task 分组，而是按轮次 ——
+所有 task 的第 1 条后段（第 1 轮建的）一组收紧，第 2 条一组收紧……；组内是不同 task 的段，各用各的驻留集重建，
+目标区间取组内中位 ± β。同一 task 的第 1 条与第 2 条不要求一样快。日志的 `[终审·按组]` 报每组的组合极差。
+
+Step 1 给出 7 条（配额 gsm8k 3、mbpp 2、no_robots 2），gsm8k 第 3 条放不下 → 每个 task 2 条，共 6 条后段。
+组合 p50 = 前段 + 正向 + 后段 + 回环（每 token）：
+
+| | vLLM（`plan_1105_vllm_1f.json`，13 台） | PyTorch（`plan_1105_doc_1f.json`，14 台） |
+|---|---|---|
+| 前段 | N13（T4，第 1–2 层，6.4ms） | N13（T4，5.2ms） |
+| 第 1 组 | mbpp N01+N04 21.6、no_robots N07+N09 22.4、gsm8k N05+N03 22.4ms | mbpp N07+N08 115.0、no_robots N04+N01 119.9、gsm8k N02+N03 121.4ms |
+| 第 2 组 | mbpp N06+N12 53.1、no_robots N02+N10 48.2、gsm8k N08+N11 53.5ms | mbpp N09+N06 122.8、no_robots N05+N12 126.0、gsm8k N14+N15+N11 161.3ms |
+| 组内相对极差 | 第 1 组 3.4%、第 2 组 9.9% | 第 1 组 5.3%、第 2 组 30.6% |
+| 空闲 | N14、N15 | N10 |
+
+* vLLM 第 2 组收紧前是 mbpp 两台 A30（10.0ms）、no_robots A30+RTX（38.7ms）、gsm8k 两台 RTX（83.5ms）：
+  拆掉偏快的 mbpp 和偏慢的 gsm8k，重配成 A30+RTX 各一条 —— 三条都落在 38–44ms；
+* PyTorch 第 2 组的 gsm8k（两台 MICH 的 T4 + RTX，140ms）仍在组内中位 ±30%（β = 1.3）以内，收紧不触发；
+  要按 15% 拉得把 β 调到约 1.15。
+
+**识别**：L₀ = 2 时按激活直方图的可识别率只有 53.5%（规划日志开头有警告）。task 选择器
+`selector/selector_body_L8` 要前 8 层，L₀ = 2 时装不上 —— 跑之前 `export LR_MODEL=`（清空），
+控制器就退回用 `PROFILE` 的前 2 层直方图识别；要更准得另训一个只看前 2 层的选择器。
+
+```bash
+HOSTS=task/hosts.txt bash ./deploy_15.sh stop
+source qwen3-30b/use_plan.sh qwen3-30b/plan_1105_vllm_1f.json    # 或 plan_1105_doc_1f.json
+export LR_MODEL=                                                 # 选择器是 8 层的，L₀=2 用不了
+bash ./deploy_15.sh sync && REPLACE=1 bash ./deploy_15.sh fetch && bash ./deploy_15.sh verify
+bash ./deploy_15.sh start && bash ./deploy_15.sh status
+RESULTS=results/run_1105_vllm_1f.json bash ./deploy_15.sh continuous
+```
 
 ## 6. 参考数值（用来判断复现是否正常）
 

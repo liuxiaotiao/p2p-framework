@@ -411,6 +411,24 @@ class PlannerConfig:
     """Step 3 按轮次交错建段：每个池先各建第 1 条，再各建第 2 条……（池的先后仍按 build_order）。
     默认关 = 一个池建满配额再建下一个。打开后配额多的池的第 2 条不会抢在别的池第 1 条之前挑节点
     （task_deploy --build-interleave）。"""
+    balance_by_round: bool = False
+    """两轮筛按「轮次」分组，不按 task 分组：所有 task 的第 1 条后段一起收紧，第 2 条一起收紧 ……
+    （第 k 条 = 按轮次交错建段时第 k 轮建的那条）。同一组里是不同 task 的段，各用各的驻留集重建。
+    single_front 时自动打开（task_deploy --balance-by-round）。"""
+    tighten_exact: bool = False
+    """两轮筛收紧（tighten_lex）重建段时用精确放置（planner/exact.py：枚举节点链 + 逐链 DP 切层，
+    目标函数与 deploy_path 相同），不用 beam。收紧时的候选池很小（区间外的段 + 空闲节点），
+    精确解几秒内；beam 在这种池子上会交出「一台 RTX 只放 1 层却占着」的链，害得下一条段
+    无处可放、整轮回退（vLLM 单前段方案里 gsm8k 两条 9.8 / 83.5ms 因此没拉平）。
+    single_front 时自动打开；默认关 —— 打开会改变已有方案（task_deploy --tighten-exact）。"""
+    single_front: bool = False
+    """只建**一条**前段、放在**一台**节点上，所有请求共用（task_deploy --single-front）。
+
+    后段照旧（Step 1–3：分档估上限、按 λ 配额、建段 + 两轮筛收紧，后段之间仍要均衡）；
+    Step 4–6（公共中值域、超建前段、回环裁剪）不再需要 —— 只有一条前段，就不存在「多条前段
+    与各条后段的组合时延要一致」这个要求。那一条前段在后段建完之后，从剩下的节点里按同一个
+    目标函数挑：计算 + 稳定性 + 抖动，外加它到全体后段的正向 / 回环接口的平均代价（端点项）。
+    清单里这条前段记 slots = 后段条数：协调器允许它同时服务这么多条请求（各自的 KV 分开）。"""
     front_max_nodes: int | None = None
     """前段最多几台节点（None = 不另设，只受 max_hops_slack 约束）。1 = 前段一律单节点：
     doc I.2.2 说单节点成段是首选、多节点段仅在内存不足时被迫使用 —— 前段 L₀ 层装得进

@@ -189,8 +189,12 @@ def estimate_capacity_by_tier(
     tasks: Sequence[TaskProfile],
     *,
     max_nodes: int = 4,
+    n_fronts: int | None = None,
 ) -> CapacityEstimate:
     """II.7.1 Step 1：分档估上限。
+
+    n_fronts=None：每条通道各有一条前段（文档主线）。给定整数（单前段模式为 1）：
+    前段条数固定，不随通道数增长 —— 只从供给里扣掉它，按后段需求估条数。
 
     朴素做法「全网总内存 ÷ 单通道驻留量」会系统性高估，因为节点排他 + 层区间
     连续切分导致废料不可回收，且整档机器可能一台都用不上却仍被计入总量。
@@ -213,11 +217,15 @@ def estimate_capacity_by_tier(
     total = active + zeroed
 
     lam = {t.name: t.lam for t in tasks}
-    demand = front_spec.total_gb() + sum(
-        lam[u] * s.total_gb() for u, s in back_specs.items()
-    )
-
-    n_mem = int(floor(active / demand)) if demand > 0 else 0
+    if n_fronts is None:
+        demand = front_spec.total_gb() + sum(
+            lam[u] * s.total_gb() for u, s in back_specs.items()
+        )
+        n_mem = int(floor(active / demand)) if demand > 0 else 0
+    else:
+        demand = sum(lam[u] * s.total_gb() for u, s in back_specs.items())
+        rest = active - n_fronts * front_spec.total_gb()
+        n_mem = int(floor(rest / demand)) if demand > 0 and rest > 0 else 0
 
     # 形态耦合封顶：若某 task 的每条后段都必须占用某个稀缺档的位，则该 task
     # 的条数受该档台数限制，进而通过 λ 配额反向封住总条数。
@@ -250,7 +258,7 @@ def estimate_capacity_by_tier(
                 )
 
     n_max = max(0, n_coupled)
-    n_slots = _exact_slot_packing(reports, forms, tasks, n_max)
+    n_slots = _exact_slot_packing(reports, forms, tasks, n_max, n_fronts=n_fronts)
 
     if n_slots < n_max:
         notes.append(
@@ -277,6 +285,8 @@ def _exact_slot_packing(
     forms: Mapping[str, list[tuple[str, ...]]],
     tasks: Sequence[TaskProfile],
     n_upper: int,
+    *,
+    n_fronts: int | None = None,
 ) -> int:
     """精确整数配平：能否用现有节点位真的建出 N 个通道（N 前段 + 按配额的后段）。
 
@@ -291,7 +301,7 @@ def _exact_slot_packing(
         if n <= 0:
             return True
         quota = largest_remainder([t.lam for t in tasks], n)
-        need: list[str] = ["front"] * n
+        need: list[str] = ["front"] * (n if n_fronts is None else n_fronts)
         for t, q in zip(tasks, quota):
             need += [f"back:{t.name}"] * q
         # 稀缺优先：可行形态少的段先安排

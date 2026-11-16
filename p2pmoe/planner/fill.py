@@ -179,6 +179,17 @@ def fill_idle(
         fair = fair_ratios({u: len(backs[u]) for u in lam}, lam)
         order = sorted(lam, key=lambda u: (fair[u], -lam[u]))   # 最堵的池排最前
 
+        if cfg.single_front:
+            # 单前段：前段只有那一条、所有请求共用，补位只加后段
+            got = next(((u, b) for u in order if (b := build_back(u, idle))), None)
+            if got is None:
+                log.append(f"[补位] 空闲 {sorted(idle)} 凑不出任何一条后段 —— 停止加后段")
+                break
+            u, b = got
+            backs[u].append(b); idle -= set(b.nodes); res.origin[b] = "fill"
+            _note(b, f"新建后段（{u} 公平比 {fair[u]:.2f}，当前最堵；单前段模式只加后段）")
+            continue
+
         if nf < nb:                       # 后段多出来 → 只缺前段
             f = build_front(idle)
             if f is None:

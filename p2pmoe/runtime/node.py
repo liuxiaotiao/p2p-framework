@@ -268,6 +268,10 @@ class NodeServer:
         self._released: "OrderedDict[str, None]" = OrderedDict()
         self.n_dropped_stale = 0
         self._lock = threading.Lock()
+        self._fwd_lock = threading.Lock()
+        """前向串行化。排他段上一次只有一条请求，这把锁不会被争用；单前段方案里一条前段
+        同时服务多条请求（每个对端一条连接、各自一个线程），它让这些前向一个接一个地跑，
+        各请求的 KV 分开存（model.forward 按 req 分）。"""
         self._stop = threading.Event()
         self.compute_ms = 0.0
         self.n_msgs = 0
@@ -605,17 +609,18 @@ class NodeServer:
                  cmask: list | None = None, *,
                  decode: bool = False) -> tuple[np.ndarray, MoEStats]:
         st_ = self._state(req)
-        t0 = time.perf_counter()
-        if not st_.first_seen:
-            st_.first_seen = t0
-        if cmask is None and decode and getattr(self.model, "fast_decode", False):
-            # decode 快路径：每层只同步一次，不产出逐层统计（decode 本来就不捎带）
-            h, st = self.model.forward(req, x, decode=True)
-        elif cmask is None:
-            h, st = self.model.forward(req, x)
-        else:
-            h, st = self.model.forward(req, x, count_mask=_ranges_to_mask(cmask, len(x)))
-        dt = (time.perf_counter() - t0) * 1000
+        with self._fwd_lock:
+            t0 = time.perf_counter()
+            if not st_.first_seen:
+                st_.first_seen = t0
+            if cmask is None and decode and getattr(self.model, "fast_decode", False):
+                # decode 快路径：每层只同步一次，不产出逐层统计（decode 本来就不捎带）
+                h, st = self.model.forward(req, x, decode=True)
+            elif cmask is None:
+                h, st = self.model.forward(req, x)
+            else:
+                h, st = self.model.forward(req, x, count_mask=_ranges_to_mask(cmask, len(x)))
+            dt = (time.perf_counter() - t0) * 1000
         self.compute_ms += dt
         st_.compute_ms += dt
         st_.n_forward += 1

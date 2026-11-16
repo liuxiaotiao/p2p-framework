@@ -211,9 +211,14 @@ class Coordinator:
         self._alarm_announced: set[str] = set()
 
         # 空闲队列：盲绑就是从这里 pop
+        # 一条前段默认一次只服务一条请求（排他，I.2.4）。单前段方案（规划器
+        # single_front）在段记录里写 slots = N：这条前段同时服务 N 条请求（各自的 KV
+        # 分开），于是空闲队列里放 N 个它的名额，归还一个放回一个。
+        _fids = sorted({p.segment for p in manifest.nodes if p.role == "front"})
+        _slots = {f: max(1, int((manifest.segments.get(f) or {}).get("slots", 1)))
+                  for f in _fids}
         self.free_fronts: deque[str] = deque(
-            sorted({p.segment for p in manifest.nodes if p.role == "front"})
-        )
+            f for k in range(max(_slots.values(), default=0)) for f in _fids if k < _slots[f])
         self.free_backs: dict[str, deque[str]] = {}
         for p in manifest.nodes:
             if p.role.startswith("back:"):

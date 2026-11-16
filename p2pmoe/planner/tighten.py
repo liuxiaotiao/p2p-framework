@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from statistics import mean, median, pstdev
 from typing import Mapping, Sequence
 
+from .exact import exact_path
 from .network import MeasurementCache
 from .solver import deploy_path
 from .types import Node, Objective, PlannerConfig, Segment, SegmentSpec
@@ -143,7 +144,7 @@ class TightenResult:
 
 def tighten_lex(
     segments: Sequence[Segment],
-    spec: SegmentSpec,
+    spec: "SegmentSpec | Sequence[SegmentSpec]",
     band: tuple[float, float],
     free_nodes: set[str],
     nodes: Mapping[str, Node],
@@ -166,6 +167,10 @@ def tighten_lex(
     """
     a, b = band
     segs = list(segments)
+    # spec 可以逐段给（按轮次分组收紧时，一组里是不同 task 的段，各有各的驻留集）
+    specs = (list(spec) if isinstance(spec, (list, tuple)) else [spec] * len(segs))
+    if len(specs) != len(segs):
+        raise ValueError(f"spec 给了 {len(specs)} 个，段有 {len(segs)} 条")
     free = set(free_nodes)
     if good_nodes is None:
         top = max((n.usable_gb for n in nodes.values()), default=0.0)
@@ -195,13 +200,17 @@ def tighten_lex(
             **还都在 pool 里**才能退回。同一轮里先重建的段可能已经拿走了它的节点
             （拆掉的段的节点都进了 pool），这时退回原段等于一台节点进两条段。
             返回 None 表示这一轮作废（整轮回退）。"""
-            got = deploy_path(
-                spec, sorted(pool), nodes, net, obj,
-                beam_width=cfg.beam_width, prune_topk=cfg.prune_topk,
-                exhaustive_short=cfg.exhaustive_short,
-                legacy_beam=cfg.beam_legacy,
-                hop_slack=cfg.max_hops_slack,
-            )
+            if cfg.tighten_exact or cfg.single_front:
+                got = exact_path(specs[i], sorted(pool), nodes, net, obj,
+                                 hop_slack=cfg.max_hops_slack)
+            else:
+                got = deploy_path(
+                    specs[i], sorted(pool), nodes, net, obj,
+                    beam_width=cfg.beam_width, prune_topk=cfg.prune_topk,
+                    exhaustive_short=cfg.exhaustive_short,
+                    legacy_beam=cfg.beam_legacy,
+                    hop_slack=cfg.max_hops_slack,
+                )
             if got is not None:
                 return got
             return segs[i] if set(segs[i].nodes) <= pool else None

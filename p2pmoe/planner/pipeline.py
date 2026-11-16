@@ -294,7 +294,8 @@ class PlanResult:
     fronts_build: list[Segment]
     fronts_final: list[Segment]
     standby: list[Segment]
-    trim: TrimResult
+    trim: TrimResult | None
+    """单前段模式（cfg.single_front）下没有回环裁剪，为 None。"""
     audit: AuditReport
     manifest: DeploymentManifest | None = None
     """逐节点逐层的部署清单 + 前后段组合矩阵。仅当 task 带专家身份
@@ -305,9 +306,9 @@ class PlanResult:
     fill: FillResult | None = None
     """开了 cfg.fill_idle 时的补位记录。fronts_final / standby / backs 已是补位后的。"""
     audit_core: AuditReport | None = None
+    """补位前、只含核心段的终审。开补位时 audit 是全网格的，这里留着核心那份做对照。"""
     raw: RawFillResult | None = None
     """开了 cfg.raw_fill 时的原始模型路径记录。fronts_final / backs 已含它们（backs["any"]）。"""
-    """补位前、只含核心段的终审。开补位时 audit 是全网格的，这里留着核心那份做对照。"""
 
     @property
     def n_back_total(self) -> int:
@@ -341,11 +342,13 @@ def plan(
         f"加权总跳数 {l0c.total_hops_weighted:.2f}，前段单节点合格 {l0c.front_single_node_count} 台）"
     )
 
-    front_spec_free = make_front_spec(model, union_experts, l0, max_nodes=cfg.front_max_nodes)
+    front_spec_free = make_front_spec(
+        model, union_experts, l0, max_nodes=1 if cfg.single_front else cfg.front_max_nodes)
     back_specs = {t.name: make_back_spec(model, t, l0) for t in tasks}
 
     # ---------------- Step 1：分档估上限 -----------------------------------
-    cap = estimate_capacity_by_tier(nodes, front_spec_free, back_specs, tasks)
+    cap = estimate_capacity_by_tier(nodes, front_spec_free, back_specs, tasks,
+                                    n_fronts=1 if cfg.single_front else None)
     log.append(
         f"[Step 1] 分档估算：活跃供给 {cap.active_supply_gb:.0f}GB，"
         f"归零档 {cap.zeroed_supply_gb:.0f}GB（废料率 {cap.waste_ratio * 100:.0f}%），"
@@ -397,8 +400,14 @@ def plan(
     n_f_build_target = ceil((1 + cfg.kappa_over) * n_back_total)
     # R_F 只预留**最终**所需的前段条数，不预留超建量：超建（κ_over）是机会性的，
     # 它的目的是给 Step 6 的回环裁剪一个选择池，不值得为它饿死后段。
+    if cfg.single_front and rent_policy == "none":
+        # 单前段在后段建完之后才挑，不给它留位的话后段可能把节点吃光（PyTorch 实测：
+        # 6 条后段用掉全部 15 台，前段无处可放）。按文档的影子租金给它留一台够装的最小节点。
+        rent_policy = "smallest_sufficient"
+        log.append("[单前段] 影子租金自动改为 smallest_sufficient：给唯一的前段预留 1 台")
     rent = select_rent_nodes(
-        nodes, front_spec_free, n_back_total + cfg.n_standby, policy=rent_policy
+        nodes, front_spec_free, 1 if cfg.single_front else n_back_total + cfg.n_standby,
+        policy=rent_policy,
     )
     log.append(f"[租金] R_F（policy={rent_policy}，预留 {len(rent)} 台）= {sorted(rent)}")
 
@@ -446,7 +455,9 @@ def plan(
     # 建段序列：默认按池逐个建满配额（gsm8k 0、gsm8k 1、mbpp 0 …）；
     # cfg.build_interleave 时按轮次交错（每个池先各建第 1 条，再各建第 2 条 …），
     # 这样配额多的池的第 2 条不会抢在别的池的第 1 条之前挑节点。
-    if cfg.build_interleave:
+    if cfg.build_interleave or cfg.single_front:
+        # 单前段一律按轮次交错：每个 task 先各建一条，再各建第二条 …（池的先后仍按
+        # build_order），免得先建的 task 把快节点一次性占满、最后那个 task 两条全是慢的
         seq = [t for k in range(max((quota[t.name] for t in order), default=0))
                for t in order if k < quota[t.name]]
         log.append("[Step 3] 按轮次交错建段: " + " → ".join(
@@ -501,7 +512,38 @@ def plan(
         backs[t.name] = built[t.name]
 
     # 两轮筛：先间隙检测去慢尾，再字典序收紧
-    for t in tasks:
+    by_round = cfg.balance_by_round or cfg.single_front
+    if by_round:
+        # 按轮次分组：第 k 组 = 每个 task 的第 k 条后段（按轮次交错建段时第 k 轮建的那条）。
+        # 组内各段属于不同 task、驻留集不同，重建时各用各的 spec；目标区间取组内中位 ± β。
+        names = [t.name for t in order]
+        for k in range(max((len(backs[u]) for u in names), default=0)):
+            members = [u for u in names if len(backs[u]) > k]
+            segs = [backs[u][k] for u in members]
+            if len(segs) < 2:
+                continue
+            gap = detect_gap_robust([s.delay_ms for s in segs], theta1=cfg.gap_theta1, k=cfg.gap_k)
+            if gap.tail:
+                for line in blame_slow_tail(segs, gap, net):
+                    log.append(f"[Step 3·间隙] 第 {k + 1} 组 慢尾诊断 — {line}")
+            band = band_from_median([s.delay_ms for s in segs], cfg.beta)
+            res = tighten_lex(
+                segs, [back_specs[u] for u in members], band, free, node_map, net, cfg,
+                rent_nodes=frozenset().union(*(task_rent[u] for u in members)),
+                head_cost=head_cost,
+                tail_cost=tail_cost,
+            )
+            for u, s in zip(members, res.segments):
+                backs[u][k] = s
+            free = res.free_nodes
+            log.append(
+                f"[Step 3·收紧] 第 {k + 1} 组（" + "、".join(f"{u}{k}" for u in members)
+                + f"）目标区间 [{band[0]:.1f},{band[1]:.1f}]ms，"
+                f"{res.committed} 轮提交 / {res.rolled_back} 轮回退，"
+                f"(D_max,D_Σ): {res.history[0][0]:.1f}→{res.history[-1][0]:.1f}；"
+                + "、".join(f"{s.label()} {s.delay_ms:.1f}ms" for s in res.segments)
+            )
+    for t in ([] if by_round else tasks):
         segs = backs[t.name]
         if len(segs) < 2:
             continue
@@ -549,250 +591,313 @@ def plan(
             + "、".join(f"{u}={v:.2f}" for u, v in fair.items())
         )
 
-    # ---------------- w_cap 定标 -------------------------------------------
-    typical = net.typical_hop_p50([n.id for n in nodes])
-    w_cap = cfg.w_cap_ms if cfg.w_cap_ms is not None else cfg.rho_w * typical
-    w_cap95 = cfg.w_cap95_ms if cfg.w_cap95_ms is not None else w_cap + cfg.j_cap_ms
-    if cfg.w_cap_ms is not None:
-        log.append(
-            f"[w_cap] 直接给定 w_cap = {w_cap:.1f}ms（典型跳 p50 = {typical:.1f}ms，"
-            f"相当于 ρ_w = {w_cap / typical if typical else float('inf'):.2f}），w_cap95 = {w_cap95:.1f}ms"
-        )
-    else:
-        log.append(
-            f"[w_cap] 典型跳 p50 = {typical:.1f}ms → w_cap = ρ_w×典型跳 = "
-            f"{cfg.rho_w}×{typical:.1f} = {w_cap:.1f}ms，w_cap95 = {w_cap95:.1f}ms"
-        )
-
-    # ---------------- Step 4：公共中值域（含反馈口） ------------------------
-    band_res: BandResult | None = None
-    curve: list[tuple[float, BandResult]] = []
-    probes: dict[str, ExitProbe] = {}
-
-    # 反馈口也用「整轮回退制」：每轮记录状态，最后回到最好的一轮。
-    # 没有这一条，诊断→重建会震荡（拆掉一条好后段换成三跳的，下一轮再换回来）。
-    n_f_final_target = n_back_total + cfg.n_standby
-    tried: set[str] = set()
-    shortfall: dict[str, int] = {}
-    best: tuple[tuple, dict[str, list[Segment]], list[str], BandResult, list] | None = None
-
-    def state_key(pop: int, bks: Mapping[str, list[Segment]]) -> tuple:
-        worst = max((s.delay_ms for v in bks.values() for s in v), default=0.0)
-        return (min(pop, n_f_final_target), pop, -worst)
-
-    for attempt in range(max_feedback + 1):
-        cands = sorted(v for v in free if node_map[v].usable_gb >= front_spec_free.total_gb())
-        if not cands:
-            raise PlanningError("没有空闲节点能承载前段 —— 提高影子租金或降低条数", log)
-        probes = probe_exits(cands, entries, net, cfg, w_cap95=w_cap95)
-        n_dropped = sum(1 for p in probes.values() if p.dropped)
-
-        med_t = median([s.delay_ms for s in all_backs]) + 2 * typical + l0 * min(
-            n.ms_per_layer for n in nodes
-        )
-        w_max = cfg.eta * med_t
-        grid = [round(x, 2) for x in _linspace(0.4 * w_max, 1.5 * w_max, 12)]
-        curve = sweep_bandwidth(probes, entries, w_cap, grid)
-        band_res, why = pick_bandwidth(curve, n_f_build_target, w_max)
-        log.append(
-            f"[Step 4] 候选出口 {len(cands)} 台，闸门剔除 {n_dropped} 台；"
-            f"median T50 估计 {med_t:.0f}ms → W 上限 {w_max:.1f}ms；{why}；"
-            f"带 [{band_res.w_lo:.1f},{band_res.w_hi:.1f}]，Q_F^out={band_res.exits}"
-        )
-        log.append(
-            "[Step 4] 人口曲线 (W, |S|): "
-            + ", ".join(f"{W:.1f}→{r.population}" for W, r in curve if W <= w_max + 1e-9)
-        )
-
-        key = state_key(band_res.population, backs)
-        if best is None or key > best[0]:
-            best = (key, {u: list(v) for u, v in backs.items()}, list(entries), band_res, curve)
-
-        if band_res.population >= n_f_build_target or attempt == max_feedback:
-            break
-
-        # --- 反馈动作一：异类入口 → 回炉重建该后段换入口（II.3.3） ---------
-        diag = diagnose_outlier_entries(probes, entries, band_res.W, w_cap)
-        pick = pick_outlier(diag, exclude=tried)
-        if pick is not None:
-            outlier, pop_after, jump = pick
-            tried.add(outlier)
-            log.append(
-                f"[Step 4→3 反馈] 异类入口诊断：剔除 {outlier} 后人口 "
-                f"{band_res.population}→{pop_after}（+{jump}，第二名 "
-                f"+{max((d[2] for d in diag[1:]), default=0)}）→ 回炉重建该后段换入口"
-            )
-            if _rebuild_entry(
-                outlier, backs, back_specs, free, node_map, net, cfg, task_rent,
-                head_cost, tail_cost, log,
-            ):
-                all_backs = [s for v in backs.values() for s in v]
-                free = {n.id for n in nodes} - {v for s in all_backs for v in s.nodes}
-                entries = sorted({s.head for s in all_backs})
-                continue
-            log.append(f"[Step 4→3 反馈] {outlier} 所在后段重建失败")
-        else:
-            log.append(
-                "[Step 4] 异类入口诊断无显著跃升（"
-                + "、".join(f"{v}:+{j}" for v, _, j in diag)
-                + "）—— 人口不足不是某个坏入口造成的"
-            )
-
-        # --- 反馈动作二：降条数并记入公平比缺口（II.4「迭代」） -------------
-        # 每条后段都往公共带上加一个约束（它的入口要被所有候选出口同时看齐），
-        # 所以入口少一个，带就宽松一分。人口凑不够时的正确动作不是先放宽 η，
-        # 而是先降条数 —— 这正是文档「某池建不出目标条数 → 回 Step 2 调配额
-        # 或降该池条数并记入公平比缺口」。降谁：公平比最高（最不委屈）的池，
-        # 且优先降它入口接入质量最差的那一条。
-        if band_res.population >= n_back_total:
-            break
-        cur_fair = fair_ratios(
-            {u: len(v) for u, v in backs.items()}, {t.name: t.lam for t in tasks}
-        )
-        donors = sorted((u for u, v in backs.items() if len(v) > 1), key=lambda u: -cur_fair[u])
-        if not donors:
-            break
-        donor = donors[0]
-        victim = max(
-            range(len(backs[donor])), key=lambda i: head_cost.get(backs[donor][i].head, 0.0)
-        )
-        dropped = backs[donor].pop(victim)
-        shortfall[donor] = shortfall.get(donor, 0) + 1
-        n_back_total -= 1
-        n_f_build_target = ceil((1 + cfg.kappa_over) * n_back_total)
-        n_f_final_target = n_back_total + cfg.n_standby
-        best = None  # 条数变了，之前记下的最优状态不可比
-        log.append(
-            f"[Step 4→2 反馈] 人口 {band_res.population} < 后段条数 {n_back_total + 1}："
-            f"降 {donor} 池一条（{dropped.label()}，入口接入代价 "
-            f"{head_cost.get(dropped.head, 0):.0f}ms 为该池最差），记入公平比缺口；"
-            f"新总条数 {n_back_total}"
-        )
+    if cfg.single_front:
+        # ---------------- 单前段：只建一条、放一台，不做 Step 4–6 ----------------
+        # 只有一条前段，就没有「多条前段 × 各条后段组合时延一致」这回事：公共中值域、
+        # 超建、回环裁剪都不需要。前段按同一个目标函数（计算 + 稳定性 + 抖动 + 端点项）
+        # 从后段剩下的节点里挑，端点项取它到全体后段的正向与回环的平均实测代价。
         all_backs = [s for v in backs.values() for s in v]
-        free = {n.id for n in nodes} - {v for s in all_backs for v in s.nodes}
+        if not all_backs:
+            raise PlanningError("Step 3 未能建出任何后段", log)
         entries = sorted({s.head for s in all_backs})
-
-    assert band_res is not None and best is not None
-
-    # 回到最好的一轮
-    if state_key(band_res.population, backs) < best[0]:
-        _, backs, entries, band_res, curve = best
-        all_backs = [s for v in backs.values() for s in v]
-        free = {n.id for n in nodes} - {v for s in all_backs for v in s.nodes}
-        log.append(
-            f"[Step 4] 反馈整轮回退 —— 采用人口最优的一轮：|Q_F^out|={band_res.population}，H={entries}"
-        )
-    if band_res.population < n_back_total:
-        raise PlanningError(
-            f"公共中值域人口 {band_res.population} < 后段条数 {n_back_total}。"
-            f"在 W ≤ η·median 内凑不够，异类入口诊断与降条数都已用尽。三条出路"
-            f"（II.3.3 / II.6）：\n"
-            f"  ① 放宽 w_cap 或 η —— 代价是绝对延迟上升，须核 β 政策；\n"
-            f"  ② 降低条数（回 Step 2 调配额，把缺口记入公平比）；\n"
-            f"  ③ 若逐个剔除入口后 |S| 始终无改善，说明节点池天然分属互联不佳的\n"
-            f"     多个域 —— 正确处置是按域各建一套完整前后段独立部署，"
-            f"而不是跨域拉一条链。\n"
-            f"  当前带 [{band_res.w_lo:.1f},{band_res.w_hi:.1f}]，W={band_res.W:.1f}ms，"
-            f"H={entries}",
-            log,
-        )
-
-    if shortfall or shortfall_build:
-        quota = {u: len(v) for u, v in backs.items()}
-        fair = fair_ratios(quota, {t.name: t.lam for t in tasks})
-        log.append(
-            "[公平比缺口] "
-            + "、".join(
-                f"{u} 少建 {shortfall.get(u, 0) + shortfall_build.get(u, 0)} 条"
-                for u in sorted(set(shortfall) | set(shortfall_build))
-            )
-            + " → 修正后配额 "
-            + str(quota)
-            + "，公平比 "
-            + "、".join(f"{u}={v:.2f}" for u, v in fair.items())
-            + f"（瓶颈池 {min(fair, key=fair.get)}，扩容第一条加给它）"
-        )
-
-    if band_res.population < n_back_total + cfg.n_standby:
-        log.append(
-            f"[预警] 公共带人口 {band_res.population} 只够 {n_back_total} 条主用 + "
-            f"{band_res.population - n_back_total} 条备胎（目标 {cfg.n_standby} 条）——"
-            f"churn 时无热备可即刻顶替，须走 II.6 即时层重构，恢复时延变长"
-        )
-
-    # ---------------- Step 5：建前段 + 平衡（故意超建） ---------------------
-    q_out = frozenset(band_res.exits)
-    n_f_build = min(len(q_out), n_f_build_target)
-    front_spec = make_front_spec(model, union_experts, l0, tail_allowed=q_out,
-                                 max_nodes=cfg.front_max_nodes)
-    fronts: list[Segment] = []
-    pool = set(free)
-    front_obj = Objective(mu_ms=cfg.mu_ms, jitter_w=cfg.jitter_w)
-    for _ in range(n_f_build):
-        s = deploy_path(
-            front_spec, sorted(pool), node_map, net, front_obj,
+        cand = sorted(free)
+        if not cand:
+            raise PlanningError("后段用完了全部节点，没有地方放前段", log)
+        nb = len(all_backs)
+        f_head = {v: sum(net.p50(b.tail, v) for b in all_backs) / nb for v in cand}
+        f_tail = {v: sum(net.p50(v, b.head) for b in all_backs) / nb for v in cand}
+        front_spec = make_front_spec(model, union_experts, l0, max_nodes=1)
+        f = deploy_path(
+            front_spec, cand, node_map, net,
+            Objective(mu_ms=cfg.mu_ms, jitter_w=cfg.jitter_w, endpoint_w=1.0,
+                      head_cost=f_head, tail_cost=f_tail),
             beam_width=cfg.beam_width_front, prune_topk=cfg.prune_topk,
-            exhaustive_short=cfg.exhaustive_short,
-            legacy_beam=cfg.beam_legacy,
+            exhaustive_short=cfg.exhaustive_short, legacy_beam=cfg.beam_legacy,
             hop_slack=cfg.max_hops_slack,
         )
-        if s is None:
-            break
-        fronts.append(s)
-        pool -= set(s.nodes)
-    log.append(
-        f"[Step 5] 超建目标 {n_f_build_target} 条（κ_over={cfg.kappa_over}），"
-        f"受 |Q_F^out|={len(q_out)} 封顶为 {n_f_build}，实建 {len(fronts)} 条，"
-        f"全部 {max((s.hops for s in fronts), default=0)} 跳"
-    )
-
-    if len(fronts) >= 2:
-        fband = band_from_median([s.delay_ms for s in fronts], cfg.beta)
-        fres = tighten_lex(fronts, front_spec, fband, pool, node_map, net, cfg)
-        fronts, pool = fres.segments, fres.free_nodes
+        if f is None:
+            raise PlanningError(
+                f"剩下的 {cand} 里没有一台装得下前段（第 1–{l0} 层，"
+                f"{front_spec.total_gb():.1f}GB）", log)
+        fronts = fronts_final = [f]
+        standby = []
+        free = free - set(f.nodes)
+        ws = [net.get(f.tail, b.head, cfg.k_audit).p50 for b in all_backs]
+        w_cap = max(ws)
+        band_res = BandResult(exits=[f.tail], w_lo=min(ws), w_hi=max(ws), W=max(ws) - min(ws))
+        curve = []
+        trim = None
         log.append(
-            f"[Step 5·收紧] 前段目标区间 [{fband[0]:.1f},{fband[1]:.1f}]ms，"
-            f"{fres.committed} 轮提交，前段极差 "
-            f"{max(s.delay_ms for s in fronts) - min(s.delay_ms for s in fronts):.1f}ms"
+            f"[单前段] 不做 Step 4–6（公共带 / 超建 / 回环裁剪）。前段 {f.label()}："
+            f"计算 {f.delay_ms:.1f}ms，到 {nb} 条后段的正向平均 {f_tail[f.head]:.2f}ms、"
+            f"回环平均 {f_head[f.head]:.2f}ms；候选 {len(cand)} 台中按同一目标函数最优；"
+            f"同时服务 {nb} 条请求（每条请求的 KV 分开）"
         )
-
-    # ---------------- Step 6：回环裁剪 + 终审 ------------------------------
-    profs = loop_profile(fronts, all_backs, net, k=cfg.k_probe, j_cap_ms=cfg.j_cap_ms)
-    gated = [p for p in profs if p.gated]
-    if gated:
+        audit = _audit(fronts_final, backs, net, cfg, [t.name for t in tasks])
         log.append(
-            "[Step 6·抖动闸] 出局 "
-            + "、".join(f"{p.front_label}({p.gated})" for p in gated)
+            f"[终审] {len(audit.pairs)} 组（1 前段 × {nb} 后段），每组 k={cfg.k_audit}；"
+            f"同 task 后段间最坏相对极差 {audit.worst_rel_spread * 100:.1f}% vs η={cfg.eta * 100:.0f}% → "
+            + ("通过" if audit.passed else "未通过：" + "；".join(audit.reasons))
         )
-    n_live = sum(1 for p in profs if p.gated is None)
-    n_f_final = min(n_live, n_back_total + cfg.n_standby)
-    if n_live < n_back_total:
-        raise PlanningError(
-            f"回环抖动闸过后只剩 {n_live} 条前段可用，少于后段条数 {n_back_total}。"
-            f"回环是 decode 每 token 必付的一跳，抖动超限的链路不能用。"
-            f"出路：放宽 J_cap（须核 p95 尾闸）、或换接入更稳的节点做前段入口",
-            log,
-        )
-    trim = trim_by_loop(profs, n_f_final)
-    fronts_final = [fronts[i] for i in trim.kept]
-    standby = [fronts[i] for i in trim.standby]
-    log.append(
-        "[Step 6] 回环画像 D(f): "
-        + ", ".join(f"{p.front_label}={p.D:.1f}" for p in trim.profiles)
-    )
-    log.append(
-        f"[Step 6] 升序取前 {n_f_final} 条 → 最坏回环 {trim.worst_D:.1f}ms；"
-        f"保留集极差 {trim.spread_kept:.1f}ms ≤ 全集极差 {trim.spread_all:.1f}ms"
-        f"（命题 III.8.3 的副产品）；备胎 {len(standby)} 条"
-    )
+        if by_round:
+            # 按轮次分组收紧时，均衡的对象是「每组之内」—— 同一 task 的第 1 条与第 2 条本来就
+            # 不要求一样快，所以这里另报每组的组合时延极差（相对组内中位）
+            def t50(b):
+                return (f.delay_ms + net.get(f.tail, b.head, cfg.k_audit).p50 + b.delay_ms
+                        + net.get(b.tail, f.head, cfg.k_audit).p50)
+            names = [t.name for t in order]
+            parts = []
+            for k in range(max((len(backs[u]) for u in names), default=0)):
+                ts = [t50(backs[u][k]) for u in names if len(backs[u]) > k]
+                med_k = median(ts)
+                parts.append(f"第 {k + 1} 组 {min(ts):.1f}–{max(ts):.1f}ms"
+                             f"（相对极差 {(max(ts) - min(ts)) / med_k * 100 if med_k else 0:.1f}%）")
+            log.append("[终审·按组] " + "；".join(parts) + f"，η={cfg.eta * 100:.0f}%")
+    else:
+        # ---------------- w_cap 定标 -------------------------------------------
+        typical = net.typical_hop_p50([n.id for n in nodes])
+        w_cap = cfg.w_cap_ms if cfg.w_cap_ms is not None else cfg.rho_w * typical
+        w_cap95 = cfg.w_cap95_ms if cfg.w_cap95_ms is not None else w_cap + cfg.j_cap_ms
+        if cfg.w_cap_ms is not None:
+            log.append(
+                f"[w_cap] 直接给定 w_cap = {w_cap:.1f}ms（典型跳 p50 = {typical:.1f}ms，"
+                f"相当于 ρ_w = {w_cap / typical if typical else float('inf'):.2f}），w_cap95 = {w_cap95:.1f}ms"
+            )
+        else:
+            log.append(
+                f"[w_cap] 典型跳 p50 = {typical:.1f}ms → w_cap = ρ_w×典型跳 = "
+                f"{cfg.rho_w}×{typical:.1f} = {w_cap:.1f}ms，w_cap95 = {w_cap95:.1f}ms"
+            )
 
-    audit = _audit(fronts_final, backs, net, cfg, [t.name for t in tasks])
-    log.append(
-        f"[终审] 网格 {len(fronts_final)}×{sum(len(v) for v in backs.values())} = "
-        f"{len(audit.pairs)} 组，每组 k={cfg.k_audit}；"
-        f"最坏相对极差 {audit.worst_rel_spread * 100:.1f}% vs η={cfg.eta * 100:.0f}% → "
-        + ("通过" if audit.passed else "未通过：" + "；".join(audit.reasons))
-    )
+        # ---------------- Step 4：公共中值域（含反馈口） ------------------------
+        band_res: BandResult | None = None
+        curve: list[tuple[float, BandResult]] = []
+        probes: dict[str, ExitProbe] = {}
+
+        # 反馈口也用「整轮回退制」：每轮记录状态，最后回到最好的一轮。
+        # 没有这一条，诊断→重建会震荡（拆掉一条好后段换成三跳的，下一轮再换回来）。
+        n_f_final_target = n_back_total + cfg.n_standby
+        tried: set[str] = set()
+        shortfall: dict[str, int] = {}
+        best: tuple[tuple, dict[str, list[Segment]], list[str], BandResult, list] | None = None
+
+        def state_key(pop: int, bks: Mapping[str, list[Segment]]) -> tuple:
+            worst = max((s.delay_ms for v in bks.values() for s in v), default=0.0)
+            return (min(pop, n_f_final_target), pop, -worst)
+
+        for attempt in range(max_feedback + 1):
+            cands = sorted(v for v in free if node_map[v].usable_gb >= front_spec_free.total_gb())
+            if not cands:
+                raise PlanningError("没有空闲节点能承载前段 —— 提高影子租金或降低条数", log)
+            probes = probe_exits(cands, entries, net, cfg, w_cap95=w_cap95)
+            n_dropped = sum(1 for p in probes.values() if p.dropped)
+
+            med_t = median([s.delay_ms for s in all_backs]) + 2 * typical + l0 * min(
+                n.ms_per_layer for n in nodes
+            )
+            w_max = cfg.eta * med_t
+            grid = [round(x, 2) for x in _linspace(0.4 * w_max, 1.5 * w_max, 12)]
+            curve = sweep_bandwidth(probes, entries, w_cap, grid)
+            band_res, why = pick_bandwidth(curve, n_f_build_target, w_max)
+            log.append(
+                f"[Step 4] 候选出口 {len(cands)} 台，闸门剔除 {n_dropped} 台；"
+                f"median T50 估计 {med_t:.0f}ms → W 上限 {w_max:.1f}ms；{why}；"
+                f"带 [{band_res.w_lo:.1f},{band_res.w_hi:.1f}]，Q_F^out={band_res.exits}"
+            )
+            log.append(
+                "[Step 4] 人口曲线 (W, |S|): "
+                + ", ".join(f"{W:.1f}→{r.population}" for W, r in curve if W <= w_max + 1e-9)
+            )
+
+            key = state_key(band_res.population, backs)
+            if best is None or key > best[0]:
+                best = (key, {u: list(v) for u, v in backs.items()}, list(entries), band_res, curve)
+
+            if band_res.population >= n_f_build_target or attempt == max_feedback:
+                break
+
+            # --- 反馈动作一：异类入口 → 回炉重建该后段换入口（II.3.3） ---------
+            diag = diagnose_outlier_entries(probes, entries, band_res.W, w_cap)
+            pick = pick_outlier(diag, exclude=tried)
+            if pick is not None:
+                outlier, pop_after, jump = pick
+                tried.add(outlier)
+                log.append(
+                    f"[Step 4→3 反馈] 异类入口诊断：剔除 {outlier} 后人口 "
+                    f"{band_res.population}→{pop_after}（+{jump}，第二名 "
+                    f"+{max((d[2] for d in diag[1:]), default=0)}）→ 回炉重建该后段换入口"
+                )
+                if _rebuild_entry(
+                    outlier, backs, back_specs, free, node_map, net, cfg, task_rent,
+                    head_cost, tail_cost, log,
+                ):
+                    all_backs = [s for v in backs.values() for s in v]
+                    free = {n.id for n in nodes} - {v for s in all_backs for v in s.nodes}
+                    entries = sorted({s.head for s in all_backs})
+                    continue
+                log.append(f"[Step 4→3 反馈] {outlier} 所在后段重建失败")
+            else:
+                log.append(
+                    "[Step 4] 异类入口诊断无显著跃升（"
+                    + "、".join(f"{v}:+{j}" for v, _, j in diag)
+                    + "）—— 人口不足不是某个坏入口造成的"
+                )
+
+            # --- 反馈动作二：降条数并记入公平比缺口（II.4「迭代」） -------------
+            # 每条后段都往公共带上加一个约束（它的入口要被所有候选出口同时看齐），
+            # 所以入口少一个，带就宽松一分。人口凑不够时的正确动作不是先放宽 η，
+            # 而是先降条数 —— 这正是文档「某池建不出目标条数 → 回 Step 2 调配额
+            # 或降该池条数并记入公平比缺口」。降谁：公平比最高（最不委屈）的池，
+            # 且优先降它入口接入质量最差的那一条。
+            if band_res.population >= n_back_total:
+                break
+            cur_fair = fair_ratios(
+                {u: len(v) for u, v in backs.items()}, {t.name: t.lam for t in tasks}
+            )
+            donors = sorted((u for u, v in backs.items() if len(v) > 1), key=lambda u: -cur_fair[u])
+            if not donors:
+                break
+            donor = donors[0]
+            victim = max(
+                range(len(backs[donor])), key=lambda i: head_cost.get(backs[donor][i].head, 0.0)
+            )
+            dropped = backs[donor].pop(victim)
+            shortfall[donor] = shortfall.get(donor, 0) + 1
+            n_back_total -= 1
+            n_f_build_target = ceil((1 + cfg.kappa_over) * n_back_total)
+            n_f_final_target = n_back_total + cfg.n_standby
+            best = None  # 条数变了，之前记下的最优状态不可比
+            log.append(
+                f"[Step 4→2 反馈] 人口 {band_res.population} < 后段条数 {n_back_total + 1}："
+                f"降 {donor} 池一条（{dropped.label()}，入口接入代价 "
+                f"{head_cost.get(dropped.head, 0):.0f}ms 为该池最差），记入公平比缺口；"
+                f"新总条数 {n_back_total}"
+            )
+            all_backs = [s for v in backs.values() for s in v]
+            free = {n.id for n in nodes} - {v for s in all_backs for v in s.nodes}
+            entries = sorted({s.head for s in all_backs})
+
+        assert band_res is not None and best is not None
+
+        # 回到最好的一轮
+        if state_key(band_res.population, backs) < best[0]:
+            _, backs, entries, band_res, curve = best
+            all_backs = [s for v in backs.values() for s in v]
+            free = {n.id for n in nodes} - {v for s in all_backs for v in s.nodes}
+            log.append(
+                f"[Step 4] 反馈整轮回退 —— 采用人口最优的一轮：|Q_F^out|={band_res.population}，H={entries}"
+            )
+        if band_res.population < n_back_total:
+            raise PlanningError(
+                f"公共中值域人口 {band_res.population} < 后段条数 {n_back_total}。"
+                f"在 W ≤ η·median 内凑不够，异类入口诊断与降条数都已用尽。三条出路"
+                f"（II.3.3 / II.6）：\n"
+                f"  ① 放宽 w_cap 或 η —— 代价是绝对延迟上升，须核 β 政策；\n"
+                f"  ② 降低条数（回 Step 2 调配额，把缺口记入公平比）；\n"
+                f"  ③ 若逐个剔除入口后 |S| 始终无改善，说明节点池天然分属互联不佳的\n"
+                f"     多个域 —— 正确处置是按域各建一套完整前后段独立部署，"
+                f"而不是跨域拉一条链。\n"
+                f"  当前带 [{band_res.w_lo:.1f},{band_res.w_hi:.1f}]，W={band_res.W:.1f}ms，"
+                f"H={entries}",
+                log,
+            )
+
+        if shortfall or shortfall_build:
+            quota = {u: len(v) for u, v in backs.items()}
+            fair = fair_ratios(quota, {t.name: t.lam for t in tasks})
+            log.append(
+                "[公平比缺口] "
+                + "、".join(
+                    f"{u} 少建 {shortfall.get(u, 0) + shortfall_build.get(u, 0)} 条"
+                    for u in sorted(set(shortfall) | set(shortfall_build))
+                )
+                + " → 修正后配额 "
+                + str(quota)
+                + "，公平比 "
+                + "、".join(f"{u}={v:.2f}" for u, v in fair.items())
+                + f"（瓶颈池 {min(fair, key=fair.get)}，扩容第一条加给它）"
+            )
+
+        if band_res.population < n_back_total + cfg.n_standby:
+            log.append(
+                f"[预警] 公共带人口 {band_res.population} 只够 {n_back_total} 条主用 + "
+                f"{band_res.population - n_back_total} 条备胎（目标 {cfg.n_standby} 条）——"
+                f"churn 时无热备可即刻顶替，须走 II.6 即时层重构，恢复时延变长"
+            )
+
+        # ---------------- Step 5：建前段 + 平衡（故意超建） ---------------------
+        q_out = frozenset(band_res.exits)
+        n_f_build = min(len(q_out), n_f_build_target)
+        front_spec = make_front_spec(model, union_experts, l0, tail_allowed=q_out,
+                                     max_nodes=cfg.front_max_nodes)
+        fronts: list[Segment] = []
+        pool = set(free)
+        front_obj = Objective(mu_ms=cfg.mu_ms, jitter_w=cfg.jitter_w)
+        for _ in range(n_f_build):
+            s = deploy_path(
+                front_spec, sorted(pool), node_map, net, front_obj,
+                beam_width=cfg.beam_width_front, prune_topk=cfg.prune_topk,
+                exhaustive_short=cfg.exhaustive_short,
+                legacy_beam=cfg.beam_legacy,
+                hop_slack=cfg.max_hops_slack,
+            )
+            if s is None:
+                break
+            fronts.append(s)
+            pool -= set(s.nodes)
+        log.append(
+            f"[Step 5] 超建目标 {n_f_build_target} 条（κ_over={cfg.kappa_over}），"
+            f"受 |Q_F^out|={len(q_out)} 封顶为 {n_f_build}，实建 {len(fronts)} 条，"
+            f"全部 {max((s.hops for s in fronts), default=0)} 跳"
+        )
+
+        if len(fronts) >= 2:
+            fband = band_from_median([s.delay_ms for s in fronts], cfg.beta)
+            fres = tighten_lex(fronts, front_spec, fband, pool, node_map, net, cfg)
+            fronts, pool = fres.segments, fres.free_nodes
+            log.append(
+                f"[Step 5·收紧] 前段目标区间 [{fband[0]:.1f},{fband[1]:.1f}]ms，"
+                f"{fres.committed} 轮提交，前段极差 "
+                f"{max(s.delay_ms for s in fronts) - min(s.delay_ms for s in fronts):.1f}ms"
+            )
+
+        # ---------------- Step 6：回环裁剪 + 终审 ------------------------------
+        profs = loop_profile(fronts, all_backs, net, k=cfg.k_probe, j_cap_ms=cfg.j_cap_ms)
+        gated = [p for p in profs if p.gated]
+        if gated:
+            log.append(
+                "[Step 6·抖动闸] 出局 "
+                + "、".join(f"{p.front_label}({p.gated})" for p in gated)
+            )
+        n_live = sum(1 for p in profs if p.gated is None)
+        n_f_final = min(n_live, n_back_total + cfg.n_standby)
+        if n_live < n_back_total:
+            raise PlanningError(
+                f"回环抖动闸过后只剩 {n_live} 条前段可用，少于后段条数 {n_back_total}。"
+                f"回环是 decode 每 token 必付的一跳，抖动超限的链路不能用。"
+                f"出路：放宽 J_cap（须核 p95 尾闸）、或换接入更稳的节点做前段入口",
+                log,
+            )
+        trim = trim_by_loop(profs, n_f_final)
+        fronts_final = [fronts[i] for i in trim.kept]
+        standby = [fronts[i] for i in trim.standby]
+        log.append(
+            "[Step 6] 回环画像 D(f): "
+            + ", ".join(f"{p.front_label}={p.D:.1f}" for p in trim.profiles)
+        )
+        log.append(
+            f"[Step 6] 升序取前 {n_f_final} 条 → 最坏回环 {trim.worst_D:.1f}ms；"
+            f"保留集极差 {trim.spread_kept:.1f}ms ≤ 全集极差 {trim.spread_all:.1f}ms"
+            f"（命题 III.8.3 的副产品）；备胎 {len(standby)} 条"
+        )
+
+        audit = _audit(fronts_final, backs, net, cfg, [t.name for t in tasks])
+        log.append(
+            f"[终审] 网格 {len(fronts_final)}×{sum(len(v) for v in backs.values())} = "
+            f"{len(audit.pairs)} 组，每组 k={cfg.k_audit}；"
+            f"最坏相对极差 {audit.worst_rel_spread * 100:.1f}% vs η={cfg.eta * 100:.0f}% → "
+            + ("通过" if audit.passed else "未通过：" + "；".join(audit.reasons))
+        )
 
     # ---------------- 补位（可选）：把空着的节点全部用上 --------------------
     fill: FillResult | None = None
@@ -800,6 +905,8 @@ def plan(
     audit_core: AuditReport | None = None
     if cfg.fill_idle and cfg.raw_fill:
         raise ValueError("fill_idle 与 raw_fill 二选一")
+    if cfg.single_front and cfg.raw_fill:
+        raise ValueError("single_front 下不支持 raw_fill（原始模型路径要自带前段）")
     if cfg.raw_fill:
         raw = fill_raw(
             fronts=fronts_final, standby=standby, backs=backs, model=model,
@@ -862,6 +969,9 @@ def plan(
                 origin=raw.origin, relaxed=raw.relaxed, idle=raw.still_idle,
             )),
         )
+        if cfg.single_front:
+            # 唯一的前段要同时服务全部后段条数的请求（协调器按 slots 放进空闲队列）
+            manifest.segments["F0"]["slots"] = n_back_total
         n_pairs = len(manifest.pairings)
         log.append(
             f"[清单] {len(manifest.nodes)} 个节点分配，组合矩阵 {n_pairs} 组"

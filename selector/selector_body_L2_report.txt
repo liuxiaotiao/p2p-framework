@@ -1,0 +1,36 @@
+训练样本（20% 参考集）：{'gsm8k': 264, 'math': 1000, 'mbpp': 100, 'humaneval': 33, 'no_robots': 89}
+
+1) 20% 内部 5 折交叉验证（平衡准确率）
+/sessions/rcw-013h4bkpz3d6hxmnhtgpwyj2/.local/lib/python3.10/site-packages/sklearn/metrics/_classification.py:2801: UserWarning: y_pred contains classes not in y_true
+  warnings.warn("y_pred contains classes not in y_true")
+/sessions/rcw-013h4bkpz3d6hxmnhtgpwyj2/.local/lib/python3.10/site-packages/sklearn/metrics/_classification.py:2801: UserWarning: y_pred contains classes not in y_true
+  warnings.warn("y_pred contains classes not in y_true")
+  前 1 层（128 维）  0.9596   各类召回 gsm8k 0.905 math 0.970 mbpp 0.990 humaneval 1.000 no_robots 0.933
+  前 2 层（256 维）  0.9690   各类召回 gsm8k 0.928 math 0.973 mbpp 1.000 humaneval 1.000 no_robots 0.944   ← 本次训练
+  前 8 层（1024 维）  0.9755   各类召回 gsm8k 0.928 math 0.972 mbpp 1.000 humaneval 1.000 no_robots 0.978
+
+已保存 Delta_30B/probe_30b_ref20/selector_body_L2.joblib
+       Delta_30B/probe_30b_ref20/selector_body_L2_params.npz（纯 numpy 版，和 joblib 概率最大差 3.7e-08）
+训练集准确率 1.0000（必然偏高）
+
+2) 80% 样本外（OSC 全量采集，模型没见过；no_robots 没有样本外 body 数据）
+
+  [L2]  样本外 5586 条   平衡准确率 0.9692   总准确率 0.9714
+  gsm8k 召回 0.938(n=1055) math 召回 0.979(n=4000) mbpp 召回 0.983(n=400) humaneval 召回 0.977(n=131)
+  混淆矩阵（行 = 真实，列 = 预测）     gsm8k      math      mbpp humaneval no_robots
+  gsm8k                                990        60         0         0         5
+  math                                  81      3915         1         0         3
+  mbpp                                   5         1       393         0         1
+  humaneval                              0         0         3       128         0
+  最大概率 ≥ 0.9：94.5% 的样本被判定（其余记 unknown、不裁剪），其中准确率 0.9873
+  最大概率 ≥ 0.99：86.2% 的样本被判定（其余记 unknown、不裁剪），其中准确率 0.9931
+
+  [L8（已有）]  样本外 5586 条   平衡准确率 0.9795   总准确率 0.9758
+  gsm8k 召回 0.951(n=1055) math 召回 0.980(n=4000) mbpp 召回 0.995(n=400) humaneval 召回 0.992(n=131)
+  混淆矩阵（行 = 真实，列 = 预测）     gsm8k      math      mbpp humaneval no_robots
+  gsm8k                               1003        52         0         0         0
+  math                                  79      3920         1         0         0
+  mbpp                                   0         2       398         0         0
+  humaneval                              0         0         1       130         0
+  最大概率 ≥ 0.9：95.8% 的样本被判定（其余记 unknown、不裁剪），其中准确率 0.9892
+  最大概率 ≥ 0.99：89.6% 的样本被判定（其余记 unknown、不裁剪），其中准确率 0.9962

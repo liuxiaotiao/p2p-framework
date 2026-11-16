@@ -1167,14 +1167,15 @@ Step 1 给出 7 条（配额 gsm8k 3、mbpp 2、no_robots 2），gsm8k 第 3 条
 * PyTorch 第 2 组的 gsm8k（两台 MICH 的 T4 + RTX，140ms）仍在组内中位 ±30%（β = 1.3）以内，收紧不触发；
   要按 15% 拉得把 β 调到约 1.15。
 
-**识别**：L₀ = 2 时按激活直方图的可识别率只有 53.5%（规划日志开头有警告）。task 选择器
-`selector/selector_body_L8` 要前 8 层，L₀ = 2 时装不上 —— 跑之前 `export LR_MODEL=`（清空），
-控制器就退回用 `PROFILE` 的前 2 层直方图识别；要更准得另训一个只看前 2 层的选择器。
+**识别**：主用 `selector/selector_body_L2_cmw_params.npz`（2026-11-16 在 `verify/` 里用同一批 20% 参考样本训练，
+`verify/train_selector_L2.py --layers 2 --feature counts+meanw`；报告见 `selector/selector_body_L2_cmw_report.txt`）：
+前 2 层，每层拼「选中次数份额 + 平均门控权重（wsum/count）」，512 维。样本外平衡准确率 98.4%（只用份额的 L2 是 96.9%，
+原来 8 层的是 98.0%），最大概率 ≥ 0.9 的 95.8% 样本里准确率 99.0%。特征口径与 `verify/task_selector.py` 逐位一致
+（`tests/test_selector_cmw.py`）。`env.sh` 默认已改成它；它只用前 2 层，L₀ ≥ 2 的方案都能用：
 
 ```bash
 HOSTS=task/hosts.txt bash ./deploy_15.sh stop
 source qwen3-30b/use_plan.sh qwen3-30b/plan_1105_vllm_1f.json    # 或 plan_1105_doc_1f.json
-export LR_MODEL=                                                 # 选择器是 8 层的，L₀=2 用不了
 bash ./deploy_15.sh sync && REPLACE=1 bash ./deploy_15.sh fetch && bash ./deploy_15.sh verify
 bash ./deploy_15.sh start && bash ./deploy_15.sh status
 RESULTS=results/run_1105_vllm_1f.json bash ./deploy_15.sh continuous

@@ -255,6 +255,11 @@ _SELECTOR_FEATURES = {
     # 每层单独归一成分布再展平（层优先）。
     "prefill_counts_body": dict(stats=["count"], normalize="per_layer", tokens="body"),
     "prefill_counts_full": dict(stats=["count"], normalize="per_layer", tokens="all"),
+    # verify/train_selector_L2.py --feature counts+meanw（selector_body_L2_cmw）：每层拼
+    # [选中次数份额 (E), 平均门控权重 wsum/count (E)]，再按层展平。权重是 top-k 归一后的门控值，
+    # 与节点捎带的 LayerStat.mass（只数 body token 时是 lmass）同一口径。
+    "prefill_counts_body+meanw": dict(stats=["count", "mean_weight"], normalize="per_layer",
+                                      tokens="body", layout="layer_major"),
 }
 
 

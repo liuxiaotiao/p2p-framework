@@ -12,7 +12,7 @@ export WEIGHTS=$WORKDIR/weights-q3-30b                    # 与 Qwen3-Next 的�
 export PLAN=qwen3-30b/plan_es90_fill.json                 # 15 台全上、5 条通道
 export PROFILE=qwen3-30b/profile_es90.json                # 后段驻留集（expert_sets_90 并集）
 export TASKS=gsm8k=1,mbpp=1,no_robots=1
-export LR_MODEL=selector/selector_body_L8_params.npz      # task 选择器（前 8 层，body token）
+export LR_MODEL=selector/selector_body_L2_cmw_params.npz  # task 选择器：前 2 层，counts 份额 + 平均门控权重（2026-11-16 起主用；原来的是 selector_body_L8_params.npz）
 export PROMPTS=qwen3-30b/sel_cases.jsonl                  # 训练样本抽的测试集，带样本编号
 export DUMP_FRONT=results/sel_front.jsonl                 # 前段逐层计数落盘，给 lr_tool check
 export PROBE=Delta_30B/probe_30b_ref20/prefill_Qwen3-30B-A3B   # 解压 Delta_30B/delta_30b.tgz 得到

@@ -1,0 +1,34 @@
+特征：counts+meanw，前 2 层
+
+训练样本（20% 参考集）：{'gsm8k': 264, 'math': 1000, 'mbpp': 100, 'humaneval': 33, 'no_robots': 89}
+
+1) 20% 内部 5 折交叉验证（平衡准确率）
+  前 1 层（128 维）  0.9692   各类召回 gsm8k 0.928 math 0.974 mbpp 1.000 humaneval 1.000 no_robots 0.944
+  前 2 层（256 维）  0.9815   各类召回 gsm8k 0.951 math 0.979 mbpp 1.000 humaneval 1.000 no_robots 0.978   ← 本次训练
+  前 8 层（1024 维）  0.9888   各类召回 gsm8k 0.977 math 0.978 mbpp 1.000 humaneval 1.000 no_robots 0.989
+
+已保存 Delta_30B/probe_30b_ref20/selector_body_L2_cmw.joblib
+       Delta_30B/probe_30b_ref20/selector_body_L2_cmw_params.npz（纯 numpy 版，和 joblib 概率最大差 0.0e+00）
+训练集准确率 1.0000（必然偏高）
+
+2) 80% 样本外（OSC 全量采集，模型没见过；no_robots 没有样本外 body 数据）
+
+  [L2 counts+meanw]  样本外 5586 条   平衡准确率 0.9838   总准确率 0.9803
+  gsm8k 召回 0.959(n=1055) math 召回 0.984(n=4000) mbpp 召回 1.000(n=400) humaneval 召回 0.992(n=131)
+  混淆矩阵（行 = 真实，列 = 预测）     gsm8k      math      mbpp humaneval no_robots
+  gsm8k                               1012        41         0         0         2
+  math                                  64      3934         0         0         2
+  mbpp                                   0         0       400         0         0
+  humaneval                              0         0         1       130         0
+  最大概率 ≥ 0.9：95.8% 的样本被判定（其余记 unknown、不裁剪），其中准确率 0.9903
+  最大概率 ≥ 0.99：88.6% 的样本被判定（其余记 unknown、不裁剪），其中准确率 0.9962
+
+  [L8 counts（已有）]  样本外 5586 条   平衡准确率 0.9795   总准确率 0.9758
+  gsm8k 召回 0.951(n=1055) math 召回 0.980(n=4000) mbpp 召回 0.995(n=400) humaneval 召回 0.992(n=131)
+  混淆矩阵（行 = 真实，列 = 预测）     gsm8k      math      mbpp humaneval no_robots
+  gsm8k                               1003        52         0         0         0
+  math                                  79      3920         1         0         0
+  mbpp                                   0         2       398         0         0
+  humaneval                              0         0         1       130         0
+  最大概率 ≥ 0.9：95.8% 的样本被判定（其余记 unknown、不裁剪），其中准确率 0.9892
+  最大概率 ≥ 0.99：89.6% 的样本被判定（其余记 unknown、不裁剪），其中准确率 0.9962

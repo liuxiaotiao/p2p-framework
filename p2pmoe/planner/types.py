@@ -411,6 +411,19 @@ class PlannerConfig:
     """Step 3 按轮次交错建段：每个池先各建第 1 条，再各建第 2 条……（池的先后仍按 build_order）。
     默认关 = 一个池建满配额再建下一个。打开后配额多的池的第 2 条不会抢在别的池第 1 条之前挑节点
     （task_deploy --build-interleave）。"""
+    front_first: bool = False
+    """单前段的「先定前段」版本（task_deploy --front-first，隐含 single_front）：
+
+    1. 先按计算定唯一的前段：能单台装下第 1..L₀ 层的节点里，前段计算时延最小的那台
+       （并列时取到全体节点单向时延均值最小的）；
+    2. 围绕这台前段按轮次（组）选后段首节点：第 1 轮各 task 各选一个、第 2 轮各选一个 ……，
+       取前段出口 → 首节点的正向时延最小的空闲节点（并列时内存大、每层快的优先）；
+    3. 再按轮次从每个首节点往下建链：deploy_path（beam）固定首节点，目标函数照旧，
+       端点项只计链尾 → 前段入口的回环；
+    4. 之后照原来的流程：按组收紧（再平衡）、终审。"""
+    chain_beam: bool = False
+    """front_first 从首节点建链时用 beam（deploy_path）。默认 False = 精确放置（planner/exact.py，
+    同一目标函数）：首节点固定后候选链不多，beam 会漏掉可行解（task_deploy --chain-beam）。"""
     balance_by_round: bool = False
     """两轮筛按「轮次」分组，不按 task 分组：所有 task 的第 1 条后段一起收紧，第 2 条一起收紧 ……
     （第 k 条 = 按轮次交错建段时第 k 轮建的那条）。同一组里是不同 task 的段，各用各的驻留集重建。

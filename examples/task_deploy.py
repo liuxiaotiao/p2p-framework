@@ -201,6 +201,11 @@ def main() -> int:
     ap.add_argument("--fill-greedy", action="store_true",
                     help="补位配前段时不向前看（2026-10-27 之前的行为）：总取最快的前段，"
                          "哪怕它让剩下的节点凑不出下一条通道")
+    ap.add_argument("--front-first", action="store_true",
+                    help="单前段的「先定前段」版本：先按计算定前段，围绕它按轮次选后段首节点、"
+                         "再按轮次从首节点建链，之后照常按组收紧（隐含 --single-front）")
+    ap.add_argument("--chain-beam", action="store_true",
+                    help="--front-first 从首节点建链时用 beam（默认用精确放置）")
     ap.add_argument("--balance-by-round", action="store_true",
                     help="后段按轮次分组收紧：所有 task 的第 1 条一起平衡、第 2 条一起平衡……；"
                          "--single-front 时自动打开")
@@ -400,6 +405,8 @@ def main() -> int:
                         single_front=args.single_front,
                         tighten_exact=args.tighten_exact,
                         balance_by_round=args.balance_by_round,
+                        front_first=args.front_first,
+                        chain_beam=args.chain_beam,
                         raw_fill=args.raw_fill,
                         exhaustive_short=args.exhaustive_short,
                         beam_legacy=args.beam_legacy,

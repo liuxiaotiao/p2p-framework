@@ -187,6 +187,7 @@ bash ./deploy_15.sh status                                                # 不�
 | 单前段 | 规划命令加 `--single-front`（配 `--l0 2`）：只建一条前段、放一台，所有请求共用；后段照旧建并收紧，不做公共带 / 超建 / 回环裁剪，例见 5.15 |
 | 按轮次分组收紧 | 规划命令加 `--balance-by-round`：所有 task 的第 1 条后段一起收紧、第 2 条一起收紧……（`--single-front` 时自动打开），例见 5.15 |
 | 收紧用精确放置 | 规划命令加 `--tighten-exact`：两轮筛重建段时用 `planner/exact.py` 代替 beam（`--single-front` 时自动打开），例见 5.15 |
+| 先定前段 | 规划命令加 `--front-first`（配 `--l0 2`，隐含 `--single-front`）：先按计算定前段，围绕它按组选后段首节点、按组从首节点建链，再按组收紧，例见 5.16；建链默认用精确放置，`--chain-beam` 改回 beam |
 | 给 no_robots 两条通道 | 重新规划（`examples/task_deploy.py … --tasks gsm8k=1,mbpp=1,no_robots=2`），换 `PLAN` 后从第 3 步的 `fetch`/`verify` 重来 |
 
 ### 5.5 对照组：严格按文档规划的方案（`qwen3-30b/plan_doc_l8.json`）
@@ -1180,6 +1181,46 @@ bash ./deploy_15.sh sync && REPLACE=1 bash ./deploy_15.sh fetch && bash ./deploy
 bash ./deploy_15.sh start && bash ./deploy_15.sh status
 RESULTS=results/run_1105_vllm_1f.json bash ./deploy_15.sh continuous
 ```
+
+### 5.16 先定前段：按计算定前段，再围绕它按组找后段（`qwen3-30b/plan_1105_*_ff*.json`）
+
+单前段（5.15）是先建后段、再从剩下的节点里挑前段 —— A30 都被后段占了，前段落到 T4 上，而这台要同时服务
+全部请求。`--front-first` 把顺序倒过来：
+
+1. **先定前段（按计算）**：能单台装下第 1–2 层的节点里，第 1–2 层计算时延最小的那台（并列时取到全体节点单向
+   时延均值最小的）；
+2. **按组选后段首节点**：第 1 组每个 task 各选一个，取前段 → 首节点的正向时延最小的空闲节点（按 0.1ms 取整比，
+   同站点内算并列，并列时内存大、每层快的优先）；
+3. **按组从首节点建链**：首节点固定，目标函数照旧（计算 + 段内跳 + 稳定性 + 抖动），端点项只计链尾 → 前段的回环；
+   默认精确放置（beam 在这里会漏解：vLLM 第 2 组 gsm8k 从 N12 起 beam 建不出链），`--chain-beam` 改回 beam；
+   第 1 组建完再选第 2 组的首节点、建第 2 组的链 ……；
+4. 之后照原来：按组收紧（精确放置重建）、终审。
+
+```bash
+python3 examples/task_deploy.py --data task4 --config qwen3-30b-a3b --phase prefill \
+  --tasks gsm8k=1,mbpp=1,no_robots=1 \
+  --expert-sets qwen3-30b/expert_sets_90/expert_sets_90_union.json --l0 2 --front-full \
+  --layer-times qwen3-30b/layer_bench_vllm_1105.json --layer-time-key req@p512g512 \
+  --measured-mem --mem-margin-gb 0 --kv-reserve-gb 2 --endpoint-w 0 \
+  --front-first --save-plan qwen3-30b/plan_1105_vllm_ff.json
+# 加 --avail 0.95 → plan_1105_vllm_ff_a95.json；PyTorch 换 --layer-times qwen3-30b/layer_bench_wash1_1105.json
+#   --mem-prefill-tokens 512（去掉 --layer-time-key）→ plan_1105_doc_ff.json / plan_1105_doc_ff_a95.json
+```
+
+**`--avail 0.95`**：可用率 r_v < 1 时目标函数里的稳定性项 μ·Σ(−log r_v) 每多用一台节点罚约 2ms。r_v = 1（默认）
+时这一项为 0，求解器会为省 0.3ms 多占一台 A30（例如第 1 组 gsm8k 成了 N02 只放 1 层 + N09 + N06），第 2 组就缺节点：
+PyTorch 版 gsm8k 第 2 条建不出来。
+
+| | 前段 | 第 1 组（组合 p50） | 第 2 组 | 台数 |
+|---|---|---|---|---|
+| `plan_1105_vllm_ff.json` | N01（A30，0.39ms） | mbpp N04+N05 9.9、no_robots N03+N07 12.3、gsm8k N02+N09+N06 12.7ms | mbpp N11+N08 50.1、no_robots N10+N13 110.5、gsm8k N12+N14+N15 146.3ms | 15 |
+| `plan_1105_vllm_ff_a95.json` | N01 | 9.9 / 12.3 / gsm8k N02+N09 12.9ms | mbpp N06+N12 48.1、no_robots N08+N11 37.3、gsm8k N10+N13+N14 146.0ms | 14 |
+| `plan_1105_doc_ff.json` | N07（A30，4.4ms） | 114.7 / 116.5 / 117.0ms | mbpp 125.9、no_robots N12+N14+N15 159.8ms；gsm8k 第 2 条建不出 | 14 |
+| `plan_1105_doc_ff_a95.json` | N07 | 114.7 / 116.5 / 117.9ms | mbpp 125.4、no_robots N05+N10 126.7、gsm8k N12+N14+N15 160.5ms | 15 |
+
+第 1 组都贴着前段（同站点 0.05ms），组内相对极差 vLLM 约 23%、PyTorch 约 2–3%；第 2 组每轮排最后的 task 只剩
+RTX / MICH 的 T4，最慢。前段现在是 A30，但它同时服务全部请求时的真实代价（排队、prefill 插队）规划里还没算 ——
+要另测前段在 c 条并发下的单步耗时与 2 层 prefill 耗时，才能放进前段的计算项。
 
 ## 6. 参考数值（用来判断复现是否正常）
 

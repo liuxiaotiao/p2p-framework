@@ -41,7 +41,8 @@ from .loop_trim import TrimResult, loop_profile, trim_by_loop
 from .manifest import DeploymentManifest, build_manifest
 from .memory import L0Candidate, choose_l0, hops_min, make_back_spec, make_front_spec
 from .network import MeasurementCache
-from .solver import deploy_path
+from .exact import exact_path
+from .solver import deploy_path, segment_from_nodes
 from .tighten import band_from_median, detect_gap_robust, blame_slow_tail, tighten_lex
 from .types import ModelSpec, Node, Objective, PlannerConfig, Segment, SegmentSpec, TaskProfile
 
@@ -331,6 +332,9 @@ def plan(
     rent_policy: str = "smallest_sufficient",
     max_feedback: int = 4,
 ) -> PlanResult:
+    if cfg.front_first and not cfg.single_front:
+        import dataclasses as _dc
+        cfg = _dc.replace(cfg, single_front=True)
     node_map = {n.id: n for n in nodes}
     log: list[str] = []
 
@@ -400,7 +404,7 @@ def plan(
     n_f_build_target = ceil((1 + cfg.kappa_over) * n_back_total)
     # R_F 只预留**最终**所需的前段条数，不预留超建量：超建（κ_over）是机会性的，
     # 它的目的是给 Step 6 的回环裁剪一个选择池，不值得为它饿死后段。
-    if cfg.single_front and rent_policy == "none":
+    if cfg.single_front and not cfg.front_first and rent_policy == "none":
         # 单前段在后段建完之后才挑，不给它留位的话后段可能把节点吃光（PyTorch 实测：
         # 6 条后段用掉全部 15 台，前段无处可放）。按文档的影子租金给它留一台够装的最小节点。
         rent_policy = "smallest_sufficient"
@@ -466,7 +470,85 @@ def plan(
         seq = [t for t in order for _ in range(quota[t.name])]
     built: dict[str, list[Segment]] = {t.name: [] for t in order}
     stopped: set[str] = set()
-    for t in seq:
+    f_fixed: Segment | None = None
+    if cfg.front_first:
+        # ---------- 先定前段（按计算），再围绕它按轮次选后段首节点、按轮次建链 ----------
+        fspec1 = make_front_spec(model, union_experts, l0, max_nodes=1)
+        fit = [v for v in sorted(free) if fspec1.total_gb() <= node_map[v].usable_gb + 1e-9]
+        if not fit:
+            raise PlanningError(f"没有一台装得下前段（第 1–{l0} 层，{fspec1.total_gb():.1f}GB）", log)
+        others = {v: [u for u in node_map if u != v] for v in fit}
+        centr = {v: sum(net.p50(v, u) for u in others[v]) / max(len(others[v]), 1) for v in fit}
+
+        def f_comp(v: str) -> float:
+            return fspec1.n_layers * node_map[v].ms_per_layer * fspec1.ms_per_layer_scale
+
+        fv = min(fit, key=lambda v: (round(f_comp(v), 6), round(centr[v], 6), v))
+        f_fixed = segment_from_nodes(fspec1, [fv], [(1, l0)], node_map, net)
+        free -= {fv}
+        log.append(
+            f"[先定前段] 按计算取 {fv}（{node_map[fv].tier}）：第 1–{l0} 层计算 {f_comp(fv):.2f}ms，"
+            f"到全体节点单向时延均值 {centr[fv]:.2f}ms；候选 "
+            + "、".join(f"{v} {f_comp(v):.2f}" for v in sorted(fit, key=f_comp)[:5]) + " …")
+
+        n_rounds = max((quota[t.name] for t in order), default=0)
+        loop_cost = {v: net.p50(v, fv) for v in node_map}
+        import dataclasses as _dc
+        for k in range(n_rounds):
+            # 本轮（第 k+1 组）先给每个 task 选首节点：离前段出口最近的空闲节点
+            heads: dict[str, str] = {}
+            for t in order:
+                if k >= quota[t.name] or t.name in stopped:
+                    continue
+                spec = back_specs[t.name]
+                lo = spec.layer_lo
+                cands = [v for v in free if spec.resident_gb(lo, lo) <= node_map[v].usable_gb + 1e-9]
+                if not cands:
+                    continue
+                # 正向时延按 0.1ms 取整再比 —— 同一站点内的几台（差零点零几 ms）算并列，
+                # 并列时内存大的优先（能多装层、少一跳），再比每层快慢
+                h = min(cands, key=lambda v: (round(net.p50(fv, v), 1), -node_map[v].usable_gb,
+                                              node_map[v].ms_per_layer, v))
+                heads[t.name] = h
+                free -= {h}
+            log.append(f"[首节点] 第 {k + 1} 组（围绕前段 {fv}，正向时延最小优先）："
+                       + "、".join(f"{u}→{h}({net.p50(fv, h):.2f}ms)" for u, h in heads.items()))
+            # 再从这些首节点往下建链（beam，目标函数照旧，端点项只计链尾 → 前段入口的回环）
+            for t in order:
+                h = heads.get(t.name)
+                if h is None:
+                    continue
+                spec_h = _dc.replace(back_specs[t.name], head_allowed=frozenset({h}))
+                obj = Objective(
+                    mu_ms=cfg.mu_ms, jitter_w=cfg.jitter_w,
+                    rent_nu_ms=cfg.rent_nu_ms, rent_nodes=task_rent[t.name],
+                    tail_cost=loop_cost, endpoint_w=1.0,
+                )
+                if cfg.chain_beam:
+                    s = deploy_path(
+                        spec_h, sorted(free | {h}), node_map, net, obj,
+                        beam_width=cfg.beam_width, prune_topk=cfg.prune_topk,
+                        exhaustive_short=cfg.exhaustive_short,
+                        legacy_beam=cfg.beam_legacy,
+                        hop_slack=cfg.max_hops_slack,
+                    )
+                else:
+                    # 首节点定了之后池子不大，精确放置（同一目标函数）。beam 在这里会漏解：
+                    # vLLM 实测第 2 组 gsm8k 从 N12 起 beam 建不出链，精确放置建得出
+                    s = exact_path(spec_h, sorted(free | {h}), node_map, net, obj,
+                                   hop_slack=cfg.max_hops_slack)
+                if s is None:
+                    log.append(f"[建链] {t.name} 第 {k + 1} 组从首节点 {h} 建不出链（无可行放置）"
+                               f"—— 只建出 {len(built[t.name])}/{quota[t.name]} 条，记入公平比缺口")
+                    free |= {h}
+                    stopped.add(t.name)
+                    continue
+                built[t.name].append(s)
+                free -= set(s.nodes)
+            log.append(f"[建链] 第 {k + 1} 组：" + "、".join(
+                f"{built[u][k].label()} {built[u][k].delay_ms:.1f}ms"
+                for u in heads if len(built[u]) > k))
+    for t in ([] if cfg.front_first else seq):
         if t.name in stopped:
             continue
         spec = back_specs[t.name]
@@ -600,21 +682,24 @@ def plan(
         if not all_backs:
             raise PlanningError("Step 3 未能建出任何后段", log)
         entries = sorted({s.head for s in all_backs})
-        cand = sorted(free)
+        cand = sorted(free) if f_fixed is None else [f_fixed.head]
         if not cand:
             raise PlanningError("后段用完了全部节点，没有地方放前段", log)
         nb = len(all_backs)
         f_head = {v: sum(net.p50(b.tail, v) for b in all_backs) / nb for v in cand}
         f_tail = {v: sum(net.p50(v, b.head) for b in all_backs) / nb for v in cand}
         front_spec = make_front_spec(model, union_experts, l0, max_nodes=1)
-        f = deploy_path(
-            front_spec, cand, node_map, net,
-            Objective(mu_ms=cfg.mu_ms, jitter_w=cfg.jitter_w, endpoint_w=1.0,
-                      head_cost=f_head, tail_cost=f_tail),
-            beam_width=cfg.beam_width_front, prune_topk=cfg.prune_topk,
-            exhaustive_short=cfg.exhaustive_short, legacy_beam=cfg.beam_legacy,
-            hop_slack=cfg.max_hops_slack,
-        )
+        if f_fixed is not None:
+            f = f_fixed                      # 先定前段：Step 3 之前已按计算定好
+        else:
+            f = deploy_path(
+                front_spec, cand, node_map, net,
+                Objective(mu_ms=cfg.mu_ms, jitter_w=cfg.jitter_w, endpoint_w=1.0,
+                          head_cost=f_head, tail_cost=f_tail),
+                beam_width=cfg.beam_width_front, prune_topk=cfg.prune_topk,
+                exhaustive_short=cfg.exhaustive_short, legacy_beam=cfg.beam_legacy,
+                hop_slack=cfg.max_hops_slack,
+            )
         if f is None:
             raise PlanningError(
                 f"剩下的 {cand} 里没有一台装得下前段（第 1–{l0} 层，"
@@ -630,7 +715,9 @@ def plan(
         log.append(
             f"[单前段] 不做 Step 4–6（公共带 / 超建 / 回环裁剪）。前段 {f.label()}："
             f"计算 {f.delay_ms:.1f}ms，到 {nb} 条后段的正向平均 {f_tail[f.head]:.2f}ms、"
-            f"回环平均 {f_head[f.head]:.2f}ms；候选 {len(cand)} 台中按同一目标函数最优；"
+            f"回环平均 {f_head[f.head]:.2f}ms；"
+            + ("Step 3 之前已按计算定好（--front-first）；" if f_fixed is not None
+               else f"候选 {len(cand)} 台中按同一目标函数最优；") +
             f"同时服务 {nb} 条请求（每条请求的 KV 分开）"
         )
         audit = _audit(fronts_final, backs, net, cfg, [t.name for t in tasks])

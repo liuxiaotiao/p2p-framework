@@ -177,6 +177,9 @@ def main() -> int:
                          "代替拓扑 compute_capacity 推出来的相对值")
     ap.add_argument("--layer-time-key", default="decode@1024",
                     help="取实测表里哪一列：decode@<上下文长度> 或 prefill@<token 数>")
+    ap.add_argument("--theory-times", action="store_true",
+                    help="计算项用理论值（拓扑 compute_capacity 反比，A30 = 0.35ms/层）而不用 --layer-times 的实测；"
+                         "--layer-times 此时只用来取 --measured-mem 的显存实测")
     ap.add_argument("--measured-mem", action="store_true",
                     help="用 --layer-times 文件里的实测显存（整卡容量、CUDA context、激活峰值、"
                          "分配器开销比）定每台可用量，并把前段词嵌入、后段输出头算进首尾那台；"
@@ -279,10 +282,18 @@ def main() -> int:
         if not meas:
             raise SystemExit(f"{args.layer_times} 里没有 {args.layer_time_key} 这一列；"
                              f"有的是 {table.get('keys')}")
-        topo, rows = apply_layer_times(topo, meas)
-        print(f"  计算项   用逐层实测 {args.layer_times}（{args.layer_time_key}，ms/层）：")
-        for nid, tier, old_v, new_v, src in rows:
-            print(f"           {nid:<5}{tier:<9} {old_v:>7.3f} → {new_v:>7.3f}  {src}")
+        if args.theory_times:
+            print(f"  计算项   用理论值（拓扑 compute_capacity 反比；--theory-times，"
+                  f"实测 {args.layer_time_key} 只列出来对照，不参与规划），ms/层：")
+            for n in topo.nodes:
+                m = meas.get(n.id)
+                ms = f"{float(m):>7.3f}" if m is not None else "     —"
+                print(f"           {n.id:<5}{n.tier:<9} {n.ms_per_layer:>7.3f}   （实测 {ms}）")
+        else:
+            topo, rows = apply_layer_times(topo, meas)
+            print(f"  计算项   用逐层实测 {args.layer_times}（{args.layer_time_key}，ms/层）：")
+            for nid, tier, old_v, new_v, src in rows:
+                print(f"           {nid:<5}{tier:<9} {old_v:>7.3f} → {new_v:>7.3f}  {src}")
         if args.measured_mem:
             from p2pmoe.deploy.layer_bench import per_node_memory
             from p2pmoe.planner.from_data import apply_layer_memory

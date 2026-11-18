@@ -51,6 +51,11 @@ CASES = [
                            "--layer-time-key", "req@p512g512"]),
     ("plan_1105_doc_1f", ["--layer-times", "qwen3-30b/layer_bench_wash1_1105.json",
                           "--mem-prefill-tokens", "512"]),
+    # 理论计算（--theory-times：ms/层按 compute_capacity 反比，实测表只取显存）
+    ("plan_1105_vllm_1f_theory", ["--layer-times", "qwen3-30b/layer_bench_vllm_1105.json",
+                                  "--layer-time-key", "req@p512g512", "--theory-times"]),
+    ("plan_1105_doc_1f_theory", ["--layer-times", "qwen3-30b/layer_bench_wash1_1105.json",
+                                 "--mem-prefill-tokens", "512", "--theory-times"]),
 ]
 
 
@@ -133,3 +138,18 @@ def test_tighten_exact_switch(monkeypatch):
         seen.clear()
         tg.tighten_lex([s], spec, (s.delay_ms + 50, s.delay_ms + 60), set(ids[1:]), nm, net, cfg)
         assert seen and set(seen) == {want}
+
+
+def test_theory_times_keep_topology_ms_and_hold_front_node():
+    """--theory-times：方案里每台的计算按拓扑理论值；PyTorch 显存下第一次规划后段把
+    三台 T4 吃光，重规划时硬保留 N13 给前段（日志里有这一行）。"""
+    log = ROOT / "qwen3-30b" / "plan_1105_doc_1f_theory.log"
+    plan = ROOT / "qwen3-30b" / "plan_1105_doc_1f_theory.json"
+    if not (log.exists() and plan.exists()):
+        pytest.skip("缺 plan_1105_doc_1f_theory")
+    text = log.read_text(encoding="utf-8")
+    assert "--theory-times" in text and "硬保留 ['N13']" in text
+    p = json.loads(plan.read_text())
+    assert p["segments"]["F0"]["nodes"] == ["N13"]
+    # A30 两台装 46 层：理论 0.35ms/层 → 16.1ms
+    assert p["segments"]["Bmbpp0"]["compute_ms"] == pytest.approx(16.1)

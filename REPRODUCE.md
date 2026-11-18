@@ -188,6 +188,7 @@ bash ./deploy_15.sh status                                                # 不�
 | 按轮次分组收紧 | 规划命令加 `--balance-by-round`：所有 task 的第 1 条后段一起收紧、第 2 条一起收紧……（`--single-front` 时自动打开），例见 5.15 |
 | 收紧用精确放置 | 规划命令加 `--tighten-exact`：两轮筛重建段时用 `planner/exact.py` 代替 beam（`--single-front` 时自动打开），例见 5.15 |
 | 先定前段 | 规划命令加 `--front-first`（配 `--l0 2`，隐含 `--single-front`）：先按计算定前段，围绕它按组选后段首节点、按组从首节点建链，再按组收紧，例见 5.16；建链默认用精确放置，`--chain-beam` 改回 beam |
+| 理论计算耗时 | 规划命令加 `--theory-times`：ms/层用拓扑 compute_capacity 的反比（A30 0.35、RTX6000 0.443、T4 0.889），`--layer-times` 的表只用来取 `--measured-mem` 的显存，日志里把实测值列在旁边对照。例见 5.17 |
 | 给 no_robots 两条通道 | 重新规划（`examples/task_deploy.py … --tasks gsm8k=1,mbpp=1,no_robots=2`），换 `PLAN` 后从第 3 步的 `fetch`/`verify` 重来 |
 
 ### 5.5 对照组：严格按文档规划的方案（`qwen3-30b/plan_doc_l8.json`）
@@ -1221,6 +1222,49 @@ PyTorch 版 gsm8k 第 2 条建不出来。
 第 1 组都贴着前段（同站点 0.05ms），组内相对极差 vLLM 约 23%、PyTorch 约 2–3%；第 2 组每轮排最后的 task 只剩
 RTX / MICH 的 T4，最慢。前段现在是 A30，但它同时服务全部请求时的真实代价（排队、prefill 插队）规划里还没算 ——
 要另测前段在 c 条并发下的单步耗时与 2 层 prefill 耗时，才能放进前段的计算项。
+
+### 5.17 单前段 + 理论计算耗时（`qwen3-30b/plan_1105_*_1f_theory.json`）
+
+与 5.15 同一个算法（先建后段、按组收紧，最后挑一台放第 1–2 层），区别只在计算项：每台的 ms/层不用 layerbench 的实测，
+而用拓扑 `compute_capacity` 的反比（A30 165000 → 0.35，RTX6000 130500 → 0.443，T4 65000 → 0.889 ms/层）。
+显存仍用实测（`--measured-mem`，KV 留 2GB），所以 vLLM 版与 PyTorch 版只差在每台能装多少层。
+
+```bash
+# vLLM 显存
+python3 examples/task_deploy.py --data task4 --config qwen3-30b-a3b --phase prefill \
+  --tasks gsm8k=1,mbpp=1,no_robots=1 \
+  --expert-sets qwen3-30b/expert_sets_90/expert_sets_90_union.json --l0 2 --front-full \
+  --layer-times qwen3-30b/layer_bench_vllm_1105.json --layer-time-key req@p512g512 --theory-times \
+  --measured-mem --mem-margin-gb 0 --kv-reserve-gb 2 --endpoint-w 0 \
+  --single-front --save-plan qwen3-30b/plan_1105_vllm_1f_theory.json
+# PyTorch 显存：换 --layer-times qwen3-30b/layer_bench_wash1_1105.json --mem-prefill-tokens 512（去掉 --layer-time-key）
+#   → plan_1105_doc_1f_theory.json
+```
+
+**前段硬保留**：理论值下 T4 只有 0.89ms/层（实测 2.6–3.2），后段代价偏低，影子租金（软）被出价超过 ——
+PyTorch 显存下第 7 条 gsm8k 把三台 T4 全占，前段无处可放。此时规划器自动重来一次，Step 3 期间把租金那台（N13）
+**硬保留**给前段（日志：`[单前段] 第一次规划后段把节点用光 … 硬保留 ['N13']`）；第一次就成功的方案不受影响，
+5.15 的两份 1f 方案原样复现。
+
+两份方案都是 6 条后段（gsm8k 第 3 条放不下）、13 台，前段 N13（T4），N14 / N15 空闲；后段全在 A30 + RTX 上：
+
+| 第几组 | vLLM 显存（`plan_1105_vllm_1f_theory.json`） | PyTorch 显存（`plan_1105_doc_1f_theory.json`） |
+|---|---|---|
+| 第 1 组 | mbpp N02+N03、no_robots N01+N04、gsm8k N06+N09 | mbpp N02+N03、no_robots N04+N05、gsm8k N06+N09 |
+| 第 2 组 | mbpp N07+N08、no_robots N05+N11、gsm8k N10+N12 | mbpp N07+N08、no_robots N01+N11、gsm8k N10+N12 |
+
+把同一份方案的组合 p50 分别按理论值、按实测值算（前段 2 层 + 正向 + 后段 + 回环，不含稳定性项）：
+
+| 方案 | 按理论 | 按实测 |
+|---|---|---|
+| `plan_1105_vllm_1f_theory`（实测用 req@p512g512） | 22.3–25.6ms | 21.7–89.7ms（no_robots N05+N11 49.7、gsm8k N10+N12 89.7） |
+| `plan_1105_vllm_1f`（5.15，按实测规划） | — | 21.6–53.5ms |
+| `plan_1105_doc_1f_theory`（实测用 decode@1024） | 22.3–25.6ms | 116.7–132.5ms（相对极差 14%） |
+| `plan_1105_doc_1f`（5.15） | — | 115.0–161.3ms（40%，gsm8k 第 2 条走 N14+N15+N11） |
+
+理论值里 RTX6000 只比 A30 慢 1.26 倍，vLLM 实测约 8.6 倍（1.81 vs 0.21ms/层），所以 vLLM 版第 2 组把 2 台 RTX
+串成一条 gsm8k，实际最慢；PyTorch 实测 RTX 只比 A30 慢约 1.17 倍（2.76 vs 2.36），与理论接近，理论方案反而比 5.15
+更均衡（没让 T4 做后段）。
 
 ## 6. 参考数值（用来判断复现是否正常）
 

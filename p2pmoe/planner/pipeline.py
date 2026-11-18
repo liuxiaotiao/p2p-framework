@@ -319,6 +319,9 @@ class PlanResult:
 # --------------------------------------------------------------------------- #
 # 主流程
 # --------------------------------------------------------------------------- #
+_NO_FRONT_MSG = "后段用完了全部节点，没有地方放前段"
+
+
 def plan(
     nodes: Sequence[Node],
     model: ModelSpec,
@@ -331,6 +334,34 @@ def plan(
     p_min: float = 0.85,
     rent_policy: str = "smallest_sufficient",
     max_feedback: int = 4,
+) -> PlanResult:
+    """见 `_plan_once`。单前段（先后段、后挑前段）若后段把节点吃光、前段无处可放，
+    就把影子租金那一台改成 Step 3 期间**硬保留**重规划一次。软租金在后段代价偏低时会被
+    出价超过（理论计算下 T4 只有 0.89ms/层，第 7 条 gsm8k 把三台 T4 全占了）；
+    第一次就成功的方案不受影响（已有的 1f 方案原样复现）。"""
+    kw = dict(p_min=p_min, rent_policy=rent_policy, max_feedback=max_feedback)
+    try:
+        return _plan_once(nodes, model, tasks, union_experts, net, cfg, p_curve, **kw)
+    except PlanningError as e:
+        if not (cfg.single_front and not cfg.front_first and str(e) == _NO_FRONT_MSG):
+            raise
+    return _plan_once(nodes, model, tasks, union_experts, net, cfg, p_curve,
+                      _front_hold=True, **kw)
+
+
+def _plan_once(
+    nodes: Sequence[Node],
+    model: ModelSpec,
+    tasks: Sequence[TaskProfile],
+    union_experts,
+    net: MeasurementCache,
+    cfg: PlannerConfig,
+    p_curve: Mapping[int, float],
+    *,
+    p_min: float = 0.85,
+    rent_policy: str = "smallest_sufficient",
+    max_feedback: int = 4,
+    _front_hold: bool = False,
 ) -> PlanResult:
     if cfg.front_first and not cfg.single_front:
         import dataclasses as _dc
@@ -431,6 +462,13 @@ def plan(
     free = {n.id for n in nodes}
     backs: dict[str, list[Segment]] = {}
     shortfall_build: dict[str, int] = {}
+    # 单前段重试（见 plan()）：R_F 那一台硬保留到 Step 3 结束，后段不占
+    front_hold: set[str] = set()
+    if _front_hold:
+        front_hold = set(rent)
+        free -= front_hold
+        log.append(f"[单前段] 第一次规划后段把节点用光、前段无处可放 → 重规划，"
+                   f"Step 3 期间硬保留 {sorted(front_hold)} 给前段")
 
     # 建段顺序（PlannerConfig.build_order）：
     #   bottleneck  —— 公平比最低的池先建（并列时形态少的先、λ 大的先）；
@@ -682,9 +720,10 @@ def plan(
         if not all_backs:
             raise PlanningError("Step 3 未能建出任何后段", log)
         entries = sorted({s.head for s in all_backs})
+        free |= front_hold
         cand = sorted(free) if f_fixed is None else [f_fixed.head]
         if not cand:
-            raise PlanningError("后段用完了全部节点，没有地方放前段", log)
+            raise PlanningError(_NO_FRONT_MSG, log)
         nb = len(all_backs)
         f_head = {v: sum(net.p50(b.tail, v) for b in all_backs) / nb for v in cand}
         f_tail = {v: sum(net.p50(v, b.head) for b in all_backs) / nb for v in cand}

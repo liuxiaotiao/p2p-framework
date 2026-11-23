@@ -74,3 +74,12 @@ def test_busy_directory_is_not_deleted(pool):
     assert "有进程开着里面的文件" in out and "先 bash ./deploy_15.sh stop" in out
     assert "已删" not in out                                   # 有一台不行就一台都不删
     assert (pool / "n1" / "weights-q3-30b").exists()
+
+
+def test_unreachable_node_shows_the_ssh_error(pool):
+    stub = pool / "ssh"
+    stub.write_text(stub.read_text().replace(
+        "exec bash", 'case "$host" in n2) echo "ssh: connect to host n2 port 22: No route to host" >&2; exit 255 ;; esac\nexec bash'))
+    out = _run(pool, "purge-weights", "/W/weights-q3-30b", CONFIRM="1")
+    assert "n2  ✗ ssh 连不上 n2：ssh: connect to host n2 port 22: No route to host" in out
+    assert "已删" not in out

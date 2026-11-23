@@ -600,6 +600,10 @@ _purge_weights() {
   for f in "$tmp"/*; do
     id=$(basename "$f"); line=$(grep -E '^(LIST|DEL|SKIP|ERR)' "$f" | head -1)
     [ -n "$line" ] || line="ERR $(tail -1 "$f")"
+    if [ "$line" = "ERR 退出码 255" ]; then
+      # ssh 自己没连上（不是远端脚本报的错）：把 ssh 的原话带出来
+      line="ERR ssh 连不上 $(awk -v n="$id" '{sub(/#.*/,"")} $1==n {split($2,a,":"); print a[1]}' "$HOSTS")：$(grep -v '^ERR' "$f" | tail -1)"
+    fi
     case "$line" in
       LIST*) echo "    $id  有  ${line#LIST }" ;;
       DEL*)  echo "    $id  ✓ 已删  ${line#DEL }" ;;

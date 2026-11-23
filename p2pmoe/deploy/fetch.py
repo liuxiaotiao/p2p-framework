@@ -847,6 +847,10 @@ def keys_for_node(manifest: DeploymentManifest, node: str, *,
 
     arch = str(cfg.get("model_type", "")).lower()
     archs = [str(a).lower() for a in cfg.get("architectures", [])]
+    from p2pmoe.runtime.glm4_moe_lite import GlmModelConfig, glm_keys, is_glm4_moe_lite
+
+    if is_glm4_moe_lite(cfg):
+        return glm_keys(plan, GlmModelConfig.from_hf(cfg))
     if arch == "qwen3_next" or any("qwen3next" in a for a in archs):
         from p2pmoe.runtime.qwen3_next import NextModelConfig
         from p2pmoe.runtime.weights import qwen3_next_keys

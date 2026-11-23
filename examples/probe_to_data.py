@@ -15,6 +15,12 @@
   （`{"tasks": {u: {"n_tokens", "layers": {1-based 层: 归一化质量}}}}`），
   动态模式的后段驻留集从这里取。
 * 给了 `--topo` 就把拓扑也拷过去，`--data` 一个目录就齐了。
+* 给了 `--decode-dir`（`eval_benchmarks.py` 的输出目录，`{task}_decode_routing.npz`）就把
+  模型自己生成的 token（answer + think）的路由写进 decode 两列，此时 `--phase decode` 也能用。
+
+非全 MoE 的模型（如 GLM-4.7-Flash：第 0 层 dense，第 1–46 层 MoE）：npz 只有 MoE 层，
+CSV 的 `layer` 列是 **MoE 层的 0-based 序号**，对应的模型层号见 npz 的 `layer_ids`，
+写进 `profile_prefill.json` 的 `layer_ids` 和 `--out` 下的 `layer_ids.json`。
 
 口径
 ----
@@ -66,16 +72,37 @@ def load_probe(d: Path, task: str, variant: str) -> tuple[np.ndarray, np.ndarray
     return c, w, n, meta
 
 
-def write_csv(path: Path, c: np.ndarray, w: np.ndarray) -> None:
+def load_decode(d: Path, task: str, sample_idx: np.ndarray | None) -> tuple[np.ndarray, np.ndarray, int]:
+    """eval_benchmarks.py 的 {task}_decode_routing.npz → (counts[L,E], wsum[L,E], 生成 token 数)。
+
+    decode = 模型自己生成的部分（answer + think）；counts_prompt 是 prompt 的 prefill，不算。"""
+    f = d / f"{task}_decode_routing.npz"
+    if not f.exists():
+        raise SystemExit(f"找不到 {f}")
+    with np.load(f) as z:
+        if sample_idx is not None and not np.array_equal(z["sample_idx"], sample_idx):
+            raise SystemExit(f"{f} 的样本与 prefill 的对不上")
+        c = sum(z[f"counts_{p}"].astype(np.int64) for p in ("answer", "think")).sum(0)
+        w = sum(z[f"wsum_{p}"].astype(np.float64) for p in ("answer", "think")).sum(0)
+    return c, w
+
+
+def write_csv(path: Path, c: np.ndarray, w: np.ndarray,
+              dc: np.ndarray | None = None, dw: np.ndarray | None = None) -> None:
     L, E = c.shape
     mean = np.divide(w, c, out=np.zeros_like(w), where=c > 0)
+    if dc is None:
+        dc, dmean = np.zeros_like(c), np.zeros_like(w)
+    else:
+        dmean = np.divide(dw, dc, out=np.zeros_like(dw), where=dc > 0)
     with path.open("w", newline="", encoding="utf-8") as f:
         wr = csv.writer(f)
         wr.writerow(["layer", "expert", "prefill_count", "decode_count",
                      "prefill_mean_weight", "decode_mean_weight"])
         for l in range(L):
             for e in range(E):
-                wr.writerow([l, e, int(c[l, e]), 0, f"{mean[l, e]:.6f}", "0.000000"])
+                wr.writerow([l, e, int(c[l, e]), int(dc[l, e]),
+                             f"{mean[l, e]:.6f}", f"{dmean[l, e]:.6f}"])
 
 
 def main(argv=None) -> int:
@@ -88,6 +115,8 @@ def main(argv=None) -> int:
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--topo", type=Path, default=None, help="拓扑 JSON，拷进 --out")
     ap.add_argument("--model-name", default=None)
+    ap.add_argument("--decode-dir", type=Path, default=None,
+                    help="eval_benchmarks.py 的输出目录（{task}_decode_routing.npz）：填 decode 两列")
     a = ap.parse_args(argv)
 
     tasks = a.tasks or sorted(p.name.removesuffix("_prefill_persample.npz")
@@ -97,12 +126,24 @@ def main(argv=None) -> int:
     a.out.mkdir(parents=True, exist_ok=True)
     prof = {"tasks": {}}
     shape = None
+    layer_ids = None
     for u in tasks:
         c, w, n, meta = load_probe(a.probe_dir, u, a.variant)
+        with np.load(a.probe_dir / f"{u}_prefill_persample.npz") as z:
+            ids = [int(x) for x in z["layer_ids"]] if "layer_ids" in z.files else None
+            sidx = z["sample_idx"] if "sample_idx" in z.files else None
+        if layer_ids is not None and ids != layer_ids:
+            raise SystemExit(f"{u} 的 layer_ids 与前面的不同")
+        layer_ids = ids
         if shape and c.shape != shape:
             raise SystemExit(f"{u} 的形状 {c.shape} 与前面的 {shape} 不同 —— 不是同一个模型")
         shape = c.shape
-        write_csv(a.out / f"{u}_expert_activation.csv", c, w)
+        dc = dw = None
+        if a.decode_dir:
+            dc, dw = load_decode(a.decode_dir, u, sidx)
+            if dc.shape != c.shape:
+                raise SystemExit(f"{u}: decode 形状 {dc.shape} ≠ prefill {c.shape}")
+        write_csv(a.out / f"{u}_expert_activation.csv", c, w, dc, dw)
         z = w.sum(1, keepdims=True)
         mass = np.divide(w, z, out=np.zeros_like(w), where=z > 0)
         prof["tasks"][u] = {
@@ -110,12 +151,22 @@ def main(argv=None) -> int:
             "layers": {str(l + 1): [round(float(x), 8) for x in mass[l]]
                        for l in range(c.shape[0])},
         }
-        print(f"  {u:<10} {meta.get('n_samples', '?'):>5} 条  {n:>7} 个 {a.variant} token"
+        dec = f"  decode {int(dc.sum()) // int(meta.get('top_k') or 1) // c.shape[0]:>8} 个生成 token" \
+            if dc is not None else ""
+        print(f"  {u:<10} {meta.get('n_samples', '?'):>5} 条  {n:>7} 个 {a.variant} token{dec}"
               f"  {c.shape[0]} 层 × {c.shape[1]} 专家  → {u}_expert_activation.csv")
     L, E = shape
     model = a.model_name or Path(str(meta.get("model", "model"))).name
     prof.update(model=model, n_layers=L, n_experts=E, phase="prefill",
                 variant=a.variant, source=str(a.probe_dir))
+    if layer_ids is not None and layer_ids != list(range(L)):
+        # 不是每层都有 MoE：CSV 的第 k 行层 = 模型的第 layer_ids[k] 层
+        prof["layer_ids"] = layer_ids
+        (a.out / "layer_ids.json").write_text(json.dumps(
+            {"model": model, "csv_layer_to_model_layer": layer_ids,
+             "note": "CSV 的 layer 列是 MoE 层的 0-based 序号；模型层号见此表（dense 层不在 CSV 里）"},
+            ensure_ascii=False, indent=1), encoding="utf-8")
+        print(f"  层号     CSV 第 0..{L - 1} 层 = 模型第 {layer_ids[0]}..{layer_ids[-1]} 层 → layer_ids.json")
     (a.out / "profile_prefill.json").write_text(
         json.dumps(prof, ensure_ascii=False), encoding="utf-8")
     print(f"  画像 → {a.out / 'profile_prefill.json'}（{model}，{L} 层 × {E} 专家，prefill 相）")

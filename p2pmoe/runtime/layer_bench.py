@@ -153,7 +153,9 @@ def _header(cfg, device: str, node: str | None, setup: dict) -> dict:
             "model": {"d_model": cfg.d_model, "n_experts": cfg.n_experts, "top_k": cfg.top_k,
                       "moe_intermediate": cfg.moe_intermediate, "n_heads": cfg.n_heads,
                       "n_kv_heads": cfg.n_kv_heads, "head_dim": cfg.head_dim,
-                      "dtype": cfg.dtype},
+                      "dtype": cfg.dtype,
+                      "arch": ("glm4_moe_lite" if type(cfg).__name__ == "GlmModelConfig"
+                               else "qwen3_moe")},
             "setup": {**setup, "fast_decode": os.environ.get("P2P_FAST_DECODE", "1") != "0"},
             "variants": {}}
 
@@ -261,9 +263,12 @@ def run_bench(hf_cfg: Mapping, *, device: str = "cuda", n_layers: int = 4,
     """随机权重：在本机建 n_layers 层同形状的模型来量。时间一律是**每层**的毫秒数。"""
     import torch
 
+    from .glm4_moe_lite import (GlmModelConfig, GlmSegmentModel, glm_layer_bytes,
+                                glm_synth_weights, is_glm4_moe_lite)
     from .torch_model import TorchModelConfig, TorchSegmentModel
 
-    cfg = TorchModelConfig.from_hf(hf_cfg)
+    glm = is_glm4_moe_lite(hf_cfg)
+    cfg = GlmModelConfig.from_hf(hf_cfg) if glm else TorchModelConfig.from_hf(hf_cfg)
     if dtype:
         import dataclasses
 
@@ -271,6 +276,11 @@ def run_bench(hf_cfg: Mapping, *, device: str = "cuda", n_layers: int = 4,
     tdt = cfg.torch_dtype
     dbytes = torch.tensor([], dtype=tdt).element_size()
     layers = list(range(1, n_layers + 1))
+    if glm:
+        # GLM 第 1 层（checkpoint 第 0 层）是 dense，不代表其余 46 层 —— 从第一个 MoE 层起量
+        f = cfg.first_sparse
+        layers = list(range(f, min(cfg.n_layers, f + n_layers - 1) + 1))
+        n_layers = len(layers)
     out = _header(cfg, device, node, {"source": "synthetic", "n_layers": n_layers,
                                       "decode_steps": decode_steps, "warmup": warmup,
                                       "repeats": repeats, "miss_policy": miss_policy})
@@ -278,7 +288,8 @@ def run_bench(hf_cfg: Mapping, *, device: str = "cuda", n_layers: int = 4,
     free = out["gpu"].get("free_gib")
     for res in resident:
         n_res = cfg.n_experts if res is None else max(cfg.top_k, min(int(res), cfg.n_experts))
-        need = n_layers * _layer_bytes(cfg, n_res, dbytes)
+        need = n_layers * (glm_layer_bytes(cfg, n_res, dbytes) if glm
+                           else _layer_bytes(cfg, n_res, dbytes))
         if free is not None and need / 2**30 * 1.3 + 0.5 > free:
             raise BenchError(
                 f"显存不够：{n_layers} 层 × {n_res} 个专家约 {need / 2**30:.1f}GiB，"
@@ -289,11 +300,12 @@ def run_bench(hf_cfg: Mapping, *, device: str = "cuda", n_layers: int = 4,
         if device.startswith("cuda"):
             torch.cuda.empty_cache()   # 进程里先前缓存的块不还掉，新权重会复用它们，开销比就算小了
         a0 = _alloc(device)
-        w = synth_weights(cfg, layers, experts, device=device, dtype=tdt, seed=seed)
+        synth = glm_synth_weights if glm else synth_weights
+        w = synth(cfg, layers, experts, device=device, dtype=tdt, seed=seed)
         _sync(device)
         a1 = _alloc(device)
-        model = TorchSegmentModel(cfg, {l: experts for l in layers}, w, device=device,
-                                  miss_policy=miss_policy)
+        Seg = GlmSegmentModel if glm else TorchSegmentModel
+        model = Seg(cfg, {l: experts for l in layers}, w, device=device, miss_policy=miss_policy)
         v = _measure(model, cfg, device, ctx=ctx, prefill=prefill, decode_steps=decode_steps,
                      warmup=warmup, repeats=repeats, seed=seed)
         v["resident"] = n_res

@@ -1,0 +1,200 @@
+{
+  "model": {
+    "layers": 47,
+    "layer_gb_bf16": 1.271,
+    "layer_params_m": 635.3,
+    "active_params_m": 69.1,
+    "kv_bytes_per_token_layer": 20480,
+    "cache_tokens": 16384,
+    "block_gib": 1.508,
+    "fixed_gib": 1.786,
+    "kv_gib_per_layer": 0.312,
+    "active_ratio_vs_qwen3": 1.21,
+    "t_layer_a30_ms": 0.455,
+    "client_ms": 108.0,
+    "quant": "none"
+  },
+  "limits": {
+    "max_layers": 8,
+    "disk_layers": null,
+    "max_disk_gb": 30.0,
+    "disk_free_gb": null
+  },
+  "constants": {
+    "hop_ms": 28.0,
+    "t_layer_a30_ms": 0.45539258262528803,
+    "client_ms": 108.03664700926707
+  },
+  "chains": {
+    "A": {
+      "client": "N06",
+      "servers": [
+        {
+          "node": "N06",
+          "gpu": "A30",
+          "layers": "0:8",
+          "n_layers": 8,
+          "max_layers": 8,
+          "mem_gib": 13.8,
+          "one_way_delay_ms": 0.0,
+          "bandwidth_mbps": null,
+          "hop_ms": 31.64
+        },
+        {
+          "node": "N05",
+          "gpu": "A30",
+          "layers": "8:16",
+          "n_layers": 8,
+          "max_layers": 8,
+          "mem_gib": 13.8,
+          "one_way_delay_ms": 1.2072,
+          "bandwidth_mbps": 12017.5,
+          "hop_ms": 34.06
+        },
+        {
+          "node": "N07",
+          "gpu": "A30",
+          "layers": "16:24",
+          "n_layers": 8,
+          "max_layers": 8,
+          "mem_gib": 13.8,
+          "one_way_delay_ms": 0.0355,
+          "bandwidth_mbps": 16339.0,
+          "hop_ms": 31.72
+        },
+        {
+          "node": "N08",
+          "gpu": "A30",
+          "layers": "24:32",
+          "n_layers": 8,
+          "max_layers": 8,
+          "mem_gib": 13.8,
+          "one_way_delay_ms": 0.0445,
+          "bandwidth_mbps": 17438.0,
+          "hop_ms": 31.74
+        },
+        {
+          "node": "N09",
+          "gpu": "A30",
+          "layers": "32:40",
+          "n_layers": 8,
+          "max_layers": 8,
+          "mem_gib": 13.8,
+          "one_way_delay_ms": 0.036,
+          "bandwidth_mbps": 24301.0,
+          "hop_ms": 31.72
+        },
+        {
+          "node": "N10",
+          "gpu": "RTX6000",
+          "layers": "40:47",
+          "n_layers": 7,
+          "max_layers": 8,
+          "mem_gib": 12.3,
+          "one_way_delay_ms": 3.2395,
+          "bandwidth_mbps": 13768.0,
+          "hop_ms": 38.51
+        }
+      ],
+      "tpot_ms": 307.4,
+      "network_ms": 9.13
+    },
+    "B": {
+      "client": "N01",
+      "servers": [
+        {
+          "node": "N01",
+          "gpu": "A30",
+          "layers": "0:8",
+          "n_layers": 8,
+          "max_layers": 8,
+          "mem_gib": 13.8,
+          "one_way_delay_ms": 0.0,
+          "bandwidth_mbps": null,
+          "hop_ms": 31.64
+        },
+        {
+          "node": "N02",
+          "gpu": "A30",
+          "layers": "8:16",
+          "n_layers": 8,
+          "max_layers": 8,
+          "mem_gib": 13.8,
+          "one_way_delay_ms": 0.0385,
+          "bandwidth_mbps": 22597.0,
+          "hop_ms": 31.72
+        },
+        {
+          "node": "N03",
+          "gpu": "A30",
+          "layers": "16:24",
+          "n_layers": 8,
+          "max_layers": 8,
+          "mem_gib": 13.8,
+          "one_way_delay_ms": 0.0467,
+          "bandwidth_mbps": 20157.5,
+          "hop_ms": 31.74
+        },
+        {
+          "node": "N04",
+          "gpu": "A30",
+          "layers": "24:32",
+          "n_layers": 8,
+          "max_layers": 8,
+          "mem_gib": 13.8,
+          "one_way_delay_ms": 0.0452,
+          "bandwidth_mbps": 21061.5,
+          "hop_ms": 31.74
+        },
+        {
+          "node": "N11",
+          "gpu": "RTX6000",
+          "layers": "32:40",
+          "n_layers": 8,
+          "max_layers": 8,
+          "mem_gib": 13.8,
+          "one_way_delay_ms": 3.0753,
+          "bandwidth_mbps": 14276.5,
+          "hop_ms": 38.76
+        },
+        {
+          "node": "N12",
+          "gpu": "RTX6000",
+          "layers": "40:47",
+          "n_layers": 7,
+          "max_layers": 8,
+          "mem_gib": 12.3,
+          "one_way_delay_ms": 3.083,
+          "bandwidth_mbps": 11947.0,
+          "hop_ms": 38.2
+        }
+      ],
+      "tpot_ms": 311.8,
+      "network_ms": 12.58
+    }
+  },
+  "idle": [
+    "N13",
+    "N14",
+    "N15"
+  ],
+  "baseline": [],
+  "CHAINS": "A:N06,N05,N07,N08,N09,N10 B:N01,N02,N03,N04,N11,N12",
+  "hosts_blocks": [
+    "N06  blocks=0:8  # A30 | chain A",
+    "N05  blocks=8:16  # A30 | chain A",
+    "N07  blocks=16:24  # A30 | chain A",
+    "N08  blocks=24:32  # A30 | chain A",
+    "N09  blocks=32:40  # A30 | chain A",
+    "N10  blocks=40:47  # RTX6000 | chain A",
+    "N01  blocks=0:8  # A30 | chain B",
+    "N02  blocks=8:16  # A30 | chain B",
+    "N03  blocks=16:24  # A30 | chain B",
+    "N04  blocks=24:32  # A30 | chain B",
+    "N11  blocks=32:40  # RTX6000 | chain B",
+    "N12  blocks=40:47  # RTX6000 | chain B",
+    "N13  blocks=8  # T4 | spare, not in a chain",
+    "N14  blocks=8  # T4 | spare, not in a chain",
+    "N15  blocks=8  # T4 | spare, not in a chain"
+  ]
+}

@@ -1,0 +1,726 @@
+{
+  "nodes": [
+    {
+      "id": "N01",
+      "compute_capacity": 165000.0,
+      "memory_capacity": 24,
+      "role": "A30"
+    },
+    {
+      "id": "N02",
+      "compute_capacity": 165000.0,
+      "memory_capacity": 24,
+      "role": "A30"
+    },
+    {
+      "id": "N03",
+      "compute_capacity": 165000.0,
+      "memory_capacity": 24,
+      "role": "A30"
+    },
+    {
+      "id": "N04",
+      "compute_capacity": 165000.0,
+      "memory_capacity": 24,
+      "role": "A30"
+    },
+    {
+      "id": "N05",
+      "compute_capacity": 165000.0,
+      "memory_capacity": 24,
+      "role": "A30"
+    },
+    {
+      "id": "N06",
+      "compute_capacity": 165000.0,
+      "memory_capacity": 24,
+      "role": "A30"
+    },
+    {
+      "id": "N07",
+      "compute_capacity": 165000.0,
+      "memory_capacity": 24,
+      "role": "A30"
+    },
+    {
+      "id": "N08",
+      "compute_capacity": 165000.0,
+      "memory_capacity": 24,
+      "role": "A30"
+    },
+    {
+      "id": "N09",
+      "compute_capacity": 165000.0,
+      "memory_capacity": 24,
+      "role": "A30"
+    },
+    {
+      "id": "N10",
+      "compute_capacity": 130500.0,
+      "memory_capacity": 24,
+      "role": "RTX6000"
+    },
+    {
+      "id": "N11",
+      "compute_capacity": 130500.0,
+      "memory_capacity": 24,
+      "role": "RTX6000"
+    },
+    {
+      "id": "N12",
+      "compute_capacity": 130500.0,
+      "memory_capacity": 24,
+      "role": "RTX6000"
+    },
+    {
+      "id": "N13",
+      "compute_capacity": 65000.0,
+      "memory_capacity": 16,
+      "role": "T4"
+    },
+    {
+      "id": "N14",
+      "compute_capacity": 65000.0,
+      "memory_capacity": 16,
+      "role": "T4"
+    },
+    {
+      "id": "N15",
+      "compute_capacity": 65000.0,
+      "memory_capacity": 16,
+      "role": "T4"
+    }
+  ],
+  "edges": [
+    {
+      "u": "N01",
+      "v": "N02",
+      "bandwidth": 22597.0,
+      "propagation_delay": 0.0385
+    },
+    {
+      "u": "N01",
+      "v": "N03",
+      "bandwidth": 20157.5,
+      "propagation_delay": 0.0467
+    },
+    {
+      "u": "N01",
+      "v": "N04",
+      "bandwidth": 21061.5,
+      "propagation_delay": 0.0452
+    },
+    {
+      "u": "N01",
+      "v": "N05",
+      "bandwidth": 17314.5,
+      "propagation_delay": 0.0508
+    },
+    {
+      "u": "N01",
+      "v": "N06",
+      "bandwidth": 13150.5,
+      "propagation_delay": 1.2268
+    },
+    {
+      "u": "N01",
+      "v": "N07",
+      "bandwidth": 13935.5,
+      "propagation_delay": 1.2125
+    },
+    {
+      "u": "N01",
+      "v": "N08",
+      "bandwidth": 15175.0,
+      "propagation_delay": 1.2005
+    },
+    {
+      "u": "N01",
+      "v": "N09",
+      "bandwidth": 15737.5,
+      "propagation_delay": 1.2188
+    },
+    {
+      "u": "N01",
+      "v": "N10",
+      "bandwidth": 12650.5,
+      "propagation_delay": 3.0857
+    },
+    {
+      "u": "N01",
+      "v": "N11",
+      "bandwidth": 14276.5,
+      "propagation_delay": 3.0753
+    },
+    {
+      "u": "N01",
+      "v": "N12",
+      "bandwidth": 11947.0,
+      "propagation_delay": 3.083
+    },
+    {
+      "u": "N01",
+      "v": "N13",
+      "bandwidth": 13123.0,
+      "propagation_delay": 3.0775
+    },
+    {
+      "u": "N01",
+      "v": "N14",
+      "bandwidth": 4981.5,
+      "propagation_delay": 14.0237
+    },
+    {
+      "u": "N01",
+      "v": "N15",
+      "bandwidth": 4936.5,
+      "propagation_delay": 14.0165
+    },
+    {
+      "u": "N02",
+      "v": "N03",
+      "bandwidth": 23045.0,
+      "propagation_delay": 0.037
+    },
+    {
+      "u": "N02",
+      "v": "N04",
+      "bandwidth": 27687.0,
+      "propagation_delay": 0.0413
+    },
+    {
+      "u": "N02",
+      "v": "N05",
+      "bandwidth": 26315.5,
+      "propagation_delay": 0.0432
+    },
+    {
+      "u": "N02",
+      "v": "N06",
+      "bandwidth": 17048.5,
+      "propagation_delay": 1.2215
+    },
+    {
+      "u": "N02",
+      "v": "N07",
+      "bandwidth": 15348.0,
+      "propagation_delay": 1.2063
+    },
+    {
+      "u": "N02",
+      "v": "N08",
+      "bandwidth": 13919.0,
+      "propagation_delay": 1.1957
+    },
+    {
+      "u": "N02",
+      "v": "N09",
+      "bandwidth": 13775.5,
+      "propagation_delay": 1.21
+    },
+    {
+      "u": "N02",
+      "v": "N10",
+      "bandwidth": 10959.0,
+      "propagation_delay": 3.0842
+    },
+    {
+      "u": "N02",
+      "v": "N11",
+      "bandwidth": 12179.5,
+      "propagation_delay": 3.0752
+    },
+    {
+      "u": "N02",
+      "v": "N12",
+      "bandwidth": 11723.0,
+      "propagation_delay": 3.0717
+    },
+    {
+      "u": "N02",
+      "v": "N13",
+      "bandwidth": 13547.0,
+      "propagation_delay": 3.0873
+    },
+    {
+      "u": "N02",
+      "v": "N14",
+      "bandwidth": 4625.0,
+      "propagation_delay": 14.016
+    },
+    {
+      "u": "N02",
+      "v": "N15",
+      "bandwidth": 6111.0,
+      "propagation_delay": 14.0207
+    },
+    {
+      "u": "N03",
+      "v": "N04",
+      "bandwidth": 21319.0,
+      "propagation_delay": 0.044
+    },
+    {
+      "u": "N03",
+      "v": "N05",
+      "bandwidth": 20332.0,
+      "propagation_delay": 0.0425
+    },
+    {
+      "u": "N03",
+      "v": "N06",
+      "bandwidth": 15682.0,
+      "propagation_delay": 1.2275
+    },
+    {
+      "u": "N03",
+      "v": "N07",
+      "bandwidth": 14147.5,
+      "propagation_delay": 1.2135
+    },
+    {
+      "u": "N03",
+      "v": "N08",
+      "bandwidth": 12005.0,
+      "propagation_delay": 1.2085
+    },
+    {
+      "u": "N03",
+      "v": "N09",
+      "bandwidth": 18904.5,
+      "propagation_delay": 1.2288
+    },
+    {
+      "u": "N03",
+      "v": "N10",
+      "bandwidth": 11799.0,
+      "propagation_delay": 3.0747
+    },
+    {
+      "u": "N03",
+      "v": "N11",
+      "bandwidth": 12398.0,
+      "propagation_delay": 3.0773
+    },
+    {
+      "u": "N03",
+      "v": "N12",
+      "bandwidth": 13058.5,
+      "propagation_delay": 3.0812
+    },
+    {
+      "u": "N03",
+      "v": "N13",
+      "bandwidth": 12176.5,
+      "propagation_delay": 3.088
+    },
+    {
+      "u": "N03",
+      "v": "N14",
+      "bandwidth": 3642.5,
+      "propagation_delay": 14.0213
+    },
+    {
+      "u": "N03",
+      "v": "N15",
+      "bandwidth": 4247.5,
+      "propagation_delay": 14.0135
+    },
+    {
+      "u": "N04",
+      "v": "N05",
+      "bandwidth": 19796.5,
+      "propagation_delay": 0.0432
+    },
+    {
+      "u": "N04",
+      "v": "N06",
+      "bandwidth": 15874.0,
+      "propagation_delay": 1.2152
+    },
+    {
+      "u": "N04",
+      "v": "N07",
+      "bandwidth": 14491.0,
+      "propagation_delay": 1.2132
+    },
+    {
+      "u": "N04",
+      "v": "N08",
+      "bandwidth": 13206.5,
+      "propagation_delay": 1.211
+    },
+    {
+      "u": "N04",
+      "v": "N09",
+      "bandwidth": 12273.5,
+      "propagation_delay": 1.2155
+    },
+    {
+      "u": "N04",
+      "v": "N10",
+      "bandwidth": 8245.5,
+      "propagation_delay": 3.0862
+    },
+    {
+      "u": "N04",
+      "v": "N11",
+      "bandwidth": 11565.0,
+      "propagation_delay": 3.0753
+    },
+    {
+      "u": "N04",
+      "v": "N12",
+      "bandwidth": 11026.5,
+      "propagation_delay": 3.0877
+    },
+    {
+      "u": "N04",
+      "v": "N13",
+      "bandwidth": 12050.0,
+      "propagation_delay": 3.0805
+    },
+    {
+      "u": "N04",
+      "v": "N14",
+      "bandwidth": 3862.5,
+      "propagation_delay": 14.0168
+    },
+    {
+      "u": "N04",
+      "v": "N15",
+      "bandwidth": 4948.0,
+      "propagation_delay": 14.0237
+    },
+    {
+      "u": "N05",
+      "v": "N06",
+      "bandwidth": 12017.5,
+      "propagation_delay": 1.2072
+    },
+    {
+      "u": "N05",
+      "v": "N07",
+      "bandwidth": 11963.5,
+      "propagation_delay": 1.2
+    },
+    {
+      "u": "N05",
+      "v": "N08",
+      "bandwidth": 13823.0,
+      "propagation_delay": 1.214
+    },
+    {
+      "u": "N05",
+      "v": "N09",
+      "bandwidth": 13471.0,
+      "propagation_delay": 1.2178
+    },
+    {
+      "u": "N05",
+      "v": "N10",
+      "bandwidth": 8055.5,
+      "propagation_delay": 3.0842
+    },
+    {
+      "u": "N05",
+      "v": "N11",
+      "bandwidth": 7167.0,
+      "propagation_delay": 3.0743
+    },
+    {
+      "u": "N05",
+      "v": "N12",
+      "bandwidth": 8151.5,
+      "propagation_delay": 3.0842
+    },
+    {
+      "u": "N05",
+      "v": "N13",
+      "bandwidth": 10030.5,
+      "propagation_delay": 3.075
+    },
+    {
+      "u": "N05",
+      "v": "N14",
+      "bandwidth": 3398.5,
+      "propagation_delay": 14.0152
+    },
+    {
+      "u": "N05",
+      "v": "N15",
+      "bandwidth": 2138.0,
+      "propagation_delay": 14.012
+    },
+    {
+      "u": "N06",
+      "v": "N07",
+      "bandwidth": 16339.0,
+      "propagation_delay": 0.0355
+    },
+    {
+      "u": "N06",
+      "v": "N08",
+      "bandwidth": 17438.0,
+      "propagation_delay": 0.0445
+    },
+    {
+      "u": "N06",
+      "v": "N09",
+      "bandwidth": 24301.0,
+      "propagation_delay": 0.036
+    },
+    {
+      "u": "N06",
+      "v": "N10",
+      "bandwidth": 13768.0,
+      "propagation_delay": 3.2395
+    },
+    {
+      "u": "N06",
+      "v": "N11",
+      "bandwidth": 13538.5,
+      "propagation_delay": 3.235
+    },
+    {
+      "u": "N06",
+      "v": "N12",
+      "bandwidth": 12908.0,
+      "propagation_delay": 3.2403
+    },
+    {
+      "u": "N06",
+      "v": "N13",
+      "bandwidth": 13391.5,
+      "propagation_delay": 3.2313
+    },
+    {
+      "u": "N06",
+      "v": "N14",
+      "bandwidth": 6534.0,
+      "propagation_delay": 14.1683
+    },
+    {
+      "u": "N06",
+      "v": "N15",
+      "bandwidth": 6416.5,
+      "propagation_delay": 14.161
+    },
+    {
+      "u": "N07",
+      "v": "N08",
+      "bandwidth": 21616.0,
+      "propagation_delay": 0.0473
+    },
+    {
+      "u": "N07",
+      "v": "N09",
+      "bandwidth": 20716.0,
+      "propagation_delay": 0.0435
+    },
+    {
+      "u": "N07",
+      "v": "N10",
+      "bandwidth": 13286.0,
+      "propagation_delay": 3.2245
+    },
+    {
+      "u": "N07",
+      "v": "N11",
+      "bandwidth": 11886.5,
+      "propagation_delay": 3.2323
+    },
+    {
+      "u": "N07",
+      "v": "N12",
+      "bandwidth": 13683.5,
+      "propagation_delay": 3.2438
+    },
+    {
+      "u": "N07",
+      "v": "N13",
+      "bandwidth": 13810.5,
+      "propagation_delay": 3.237
+    },
+    {
+      "u": "N07",
+      "v": "N14",
+      "bandwidth": 6622.5,
+      "propagation_delay": 14.1615
+    },
+    {
+      "u": "N07",
+      "v": "N15",
+      "bandwidth": 6052.0,
+      "propagation_delay": 14.1675
+    },
+    {
+      "u": "N08",
+      "v": "N09",
+      "bandwidth": 28423.0,
+      "propagation_delay": 0.045
+    },
+    {
+      "u": "N08",
+      "v": "N10",
+      "bandwidth": 14290.0,
+      "propagation_delay": 3.233
+    },
+    {
+      "u": "N08",
+      "v": "N11",
+      "bandwidth": 15707.0,
+      "propagation_delay": 3.2285
+    },
+    {
+      "u": "N08",
+      "v": "N12",
+      "bandwidth": 15494.0,
+      "propagation_delay": 3.2295
+    },
+    {
+      "u": "N08",
+      "v": "N13",
+      "bandwidth": 14023.5,
+      "propagation_delay": 3.2302
+    },
+    {
+      "u": "N08",
+      "v": "N14",
+      "bandwidth": 6557.0,
+      "propagation_delay": 14.1705
+    },
+    {
+      "u": "N08",
+      "v": "N15",
+      "bandwidth": 6638.0,
+      "propagation_delay": 14.1603
+    },
+    {
+      "u": "N09",
+      "v": "N10",
+      "bandwidth": 13992.5,
+      "propagation_delay": 3.2317
+    },
+    {
+      "u": "N09",
+      "v": "N11",
+      "bandwidth": 12023.5,
+      "propagation_delay": 3.2277
+    },
+    {
+      "u": "N09",
+      "v": "N12",
+      "bandwidth": 13974.5,
+      "propagation_delay": 3.2268
+    },
+    {
+      "u": "N09",
+      "v": "N13",
+      "bandwidth": 13493.0,
+      "propagation_delay": 3.2308
+    },
+    {
+      "u": "N09",
+      "v": "N14",
+      "bandwidth": 6359.0,
+      "propagation_delay": 14.1725
+    },
+    {
+      "u": "N09",
+      "v": "N15",
+      "bandwidth": 6620.5,
+      "propagation_delay": 14.168
+    },
+    {
+      "u": "N10",
+      "v": "N11",
+      "bandwidth": 12731.0,
+      "propagation_delay": 0.035
+    },
+    {
+      "u": "N10",
+      "v": "N12",
+      "bandwidth": 14050.0,
+      "propagation_delay": 0.0427
+    },
+    {
+      "u": "N10",
+      "v": "N13",
+      "bandwidth": 16125.0,
+      "propagation_delay": 0.0412
+    },
+    {
+      "u": "N10",
+      "v": "N14",
+      "bandwidth": 5658.0,
+      "propagation_delay": 16.0395
+    },
+    {
+      "u": "N10",
+      "v": "N15",
+      "bandwidth": 5821.5,
+      "propagation_delay": 16.0378
+    },
+    {
+      "u": "N11",
+      "v": "N12",
+      "bandwidth": 12877.0,
+      "propagation_delay": 0.0395
+    },
+    {
+      "u": "N11",
+      "v": "N13",
+      "bandwidth": 17217.5,
+      "propagation_delay": 0.0358
+    },
+    {
+      "u": "N11",
+      "v": "N14",
+      "bandwidth": 5825.0,
+      "propagation_delay": 16.03
+    },
+    {
+      "u": "N11",
+      "v": "N15",
+      "bandwidth": 5741.5,
+      "propagation_delay": 16.029
+    },
+    {
+      "u": "N12",
+      "v": "N13",
+      "bandwidth": 17324.5,
+      "propagation_delay": 0.0398
+    },
+    {
+      "u": "N12",
+      "v": "N14",
+      "bandwidth": 5760.5,
+      "propagation_delay": 16.0295
+    },
+    {
+      "u": "N12",
+      "v": "N15",
+      "bandwidth": 4925.5,
+      "propagation_delay": 16.0373
+    },
+    {
+      "u": "N13",
+      "v": "N14",
+      "bandwidth": 5812.0,
+      "propagation_delay": 16.0315
+    },
+    {
+      "u": "N13",
+      "v": "N15",
+      "bandwidth": 5862.0,
+      "propagation_delay": 16.0343
+    },
+    {
+      "u": "N14",
+      "v": "N15",
+      "bandwidth": 20388.5,
+      "propagation_delay": 0.0407
+    }
+  ]
+}

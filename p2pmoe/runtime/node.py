@@ -381,10 +381,33 @@ class NodeServer:
         arch = str(cfg.model.get("model_type", "")).lower()
         archs = [str(a).lower() for a in cfg.model.get("architectures", [])]
         is_next = arch == "qwen3_next" or any("qwen3next" in a for a in archs)
+        from .glm4_moe_lite import is_glm4_moe_lite
+
+        is_glm = is_glm4_moe_lite(cfg.model)
 
         idx = WeightIndex(self.resolve_dir(cfg.model_dir))
         plan = KeyPlan(layer_experts=cfg.layer_experts,
                        with_embed=cfg.with_embed, with_lm_head=cfg.with_lm_head)
+        if is_glm:
+            # GLM-4.7-Flash：MLA + dense 第 0 层 + 共享专家 + sigmoid 路由（glm4_moe_lite.py）。
+            # 路由器两项要 fp32 —— 先按 checkpoint 原样读，再逐项转
+            from .glm4_moe_lite import GlmModelConfig, GlmSegmentModel, glm_keys
+
+            mcfg = GlmModelConfig.from_hf(cfg.model)
+            keys = glm_keys(plan, mcfg)
+            tensors, rep = SelectiveLoader(idx).load(keys, device=cfg.device, dtype=None)
+            if rep.missing:
+                raise KeyError(f"checkpoint 缺 {len(rep.missing)} 个 key，首个: {rep.missing[0]}")
+            self.model = GlmSegmentModel(mcfg, cfg.layer_experts, mcfg.cast(tensors),
+                                         device=cfg.device, miss_policy=cfg.miss_policy)
+            return mcfg, {
+                "loaded_gb": round(rep.bytes_loaded / 1e9, 3),
+                "ckpt_gb": round(rep.bytes_total / 1e9, 3),
+                "load_fraction": round(rep.fraction, 4),
+                "shards": f"{rep.shards_opened}/{rep.shards_total}",
+                "model_dir": self.resolve_dir(cfg.model_dir),
+                "arch": "glm4_moe_lite",
+            }
         if is_next:
             from .qwen3_next import NextModelConfig, TorchNextSegmentModel
 

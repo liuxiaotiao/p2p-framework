@@ -13,6 +13,8 @@
 #   ./deploy_15.sh verify     # 逐台核对权重齐不齐（只读文件头，几秒）
 #   ./deploy_15.sh refetch <节点>  # 清掉旧产物再单独重拉一台
 #   REPLACE=1 ./deploy_15.sh fetch   # 换方案：与新清单一致的节点跳过，其余先删旧权重再下
+#   PURGE_OLD=<旧权重目录> ./deploy_15.sh fetch   # 换模型：源站试通后，先删各台另一个模型的权重目录再下
+#   ./deploy_15.sh purge-weights <目录>  # 只删各台的某个权重目录（先列出、确认后才删；CONFIRM=1 不问）
 #   ./deploy_15.sh layerbench # 经 agent 逐台量每层耗时（不用 ssh/不停 agent）→ results/layer_bench.json
 #   ./deploy_15.sh identity   # 15 个 id 是不是落在 15 台不同机器/目录上
 #   ./deploy_15.sh whereis    # 权重在哪、内存被谁占着（目录空了但内存满时用）
@@ -505,12 +507,119 @@ PYEOF
     echo "    再下新的。删掉的旧方案权重，以后切回去要重新下。"
     echo "    某台中途失败：那台此时没有可用权重，重跑同一条命令即可（已完成的会跳过）。"
   fi
+  if [ -n "${PURGE_OLD:-}" ]; then
+    echo
+    echo "  ⚠ PURGE_OLD=$PURGE_OLD：下载前先在这 $(_n_hosts) 台上**删掉这个目录**（另一个模型的权重），"
+    echo "    给新模型腾地方。删掉的模型以后要用得重新下。各台情况先列出来："
+    _purge_weights "$PURGE_OLD" 0 || return 1
+  fi
   read -rp "  继续？[y/N] " a; [ "$a" = y ] || return 0
+  if [ -n "${PURGE_OLD:-}" ]; then
+    say "3b-0. 先删各台的 $PURGE_OLD"
+    _purge_weights "$PURGE_OLD" 1 || { echo "  ✗ 有节点没删成 —— 不往下载了（见上面那几台）"; return 1; }
+  fi
   $PY -m p2pmoe.deploy.launch fetch --hosts "$HOSTS" --plan "$PLAN" \
       --out "$WEIGHTS" --python "$NODE_PY" --workdir "$WORKDIR" \
       --mode "$MODE" --timeout "$FETCH_TIMEOUT" --transport "$TRANSPORT" \
       --progress-every "$PROGRESS_EVERY" "${REPARG[@]}" \
       "${SSHARG[@]}" "${SRCARG[@]}"
+}
+
+# --------------------------------------------------------------------------- #
+# 硬盘只装得下一个模型时，换模型前删掉各台上另一个模型的权重目录。
+#
+#   bash ./deploy_15.sh purge-weights /home/ubuntu/p2p-framework/weights-q3-30b   # 列出、问一次再删
+#   CONFIRM=1 bash ./deploy_15.sh purge-weights …                                 # 不问
+#   PURGE_OLD=… bash ./deploy_15.sh fetch                                          # 下载新模型前顺手删
+#
+# 只删**整个目录**（权重、索引、config、tokenizer 一起），护栏：
+#   · 必须是绝对路径、目录名以 weights 开头（本项目的约定；FORCE=1 才放行别的名字）；
+#   · 不能是当前的 $WEIGHTS（正要往里下的那个）；
+#   · 有进程开着里面的文件（agent 还装着它）就不删 —— 删了也不腾空间，先 stop。
+# 范围是 $HOSTS 里的节点；15 台都清：HOSTS=task/hosts.txt bash ./deploy_15.sh purge-weights …
+SSH_BIN=${SSH_BIN:-ssh}
+
+_n_hosts() { awk '{sub(/#.*/,"")} NF>=2' "$HOSTS" | wc -l | tr -d ' '; }
+
+_purge_node_script() {
+cat <<'EOS'
+set -u
+DIR=$1; KEEP=$2; DO=$3
+if [ ! -e "$DIR" ]; then echo "SKIP 没有这个目录"; exit 0; fi
+[ -d "$DIR" ] || { echo "ERR 不是目录"; exit 2; }
+real=$(cd "$DIR" && pwd -P)
+keep=$(cd "$KEEP" 2>/dev/null && pwd -P || echo "$KEEP")
+[ "$real" = "$keep" ] && { echo "ERR 这是当前要用的权重目录（WEIGHTS），不删"; exit 2; }
+busy=""
+for p in /proc/[0-9]*; do
+  ls -l "$p/fd" 2>/dev/null | grep -qF -- "$real/" && busy="$busy ${p#/proc/}"
+done
+[ -n "$busy" ] && { echo "ERR 有进程开着里面的文件（pid$busy）—— 先 bash ./deploy_15.sh stop"; exit 3; }
+info=$(python3 - "$real/config.json" 2>/dev/null <<'PY'
+import json, sys
+c = json.load(open(sys.argv[1]))
+e = c.get("num_experts") or c.get("n_routed_experts") or c.get("num_local_experts")
+print(f"{c.get('model_type', '?')}，{c.get('num_hidden_layers', '?')} 层 × {e} 专家")
+PY
+) || info="没有 config.json"
+size=$(du -sh "$real" 2>/dev/null | cut -f1)
+if [ "$DO" = 1 ]; then
+  rm -rf -- "$real" || { echo "ERR 删除失败"; exit 4; }
+  echo "DEL $size（$info）删后可用 $(df -h --output=avail "$(dirname "$real")" | tail -1 | tr -d ' ')"
+else
+  echo "LIST $size（$info）现可用 $(df -h --output=avail "$real" | tail -1 | tr -d ' ')"
+fi
+EOS
+}
+
+# _purge_weights <目录> <0=只列 | 1=删>：$HOSTS 里各台并行；有一台 ERR 就返回非 0
+_purge_weights() {
+  local dir=$1 do=$2
+  case "$dir" in
+    /*) ;;
+    *) echo "  ✗ 要绝对路径（各节点上的目录），收到 $dir"; return 1 ;;
+  esac
+  dir=${dir%/}
+  [ -n "$dir" ] && [ "$dir" != / ] || { echo "  ✗ 不删 /"; return 1; }
+  case "$(basename "$dir")" in
+    weights*) ;;
+    *) [ "${FORCE:-0}" = 1 ] || { echo "  ✗ 目录名不以 weights 开头（$dir）—— 确定要删就 FORCE=1"; return 1; } ;;
+  esac
+  if [ "$dir" = "${WEIGHTS%/}" ]; then
+    echo "  ✗ $dir 就是当前的 WEIGHTS（正要用的那份）—— 不删"; return 1
+  fi
+  need "$HOSTS"
+  local tmp; tmp=$(mktemp -d)
+  while read -r id ip; do
+    ( "$SSH_BIN" -o BatchMode=yes -o ConnectTimeout=10 ${SSH_OPTS:-} \
+        "${SSH_USER:+$SSH_USER@}$ip" "bash -s -- $(printf %q "$dir") $(printf %q "$WEIGHTS") $do" \
+        < <(_purge_node_script) > "$tmp/$id" 2>&1 || echo "ERR 退出码 $?" >> "$tmp/$id" ) &
+  done < <(awk '{sub(/#.*/,"")} NF>=2 {split($2,a,":"); print $1, a[1]}' "$HOSTS")
+  wait
+  local bad=0 id line
+  for f in "$tmp"/*; do
+    id=$(basename "$f"); line=$(grep -E '^(LIST|DEL|SKIP|ERR)' "$f" | head -1)
+    [ -n "$line" ] || line="ERR $(tail -1 "$f")"
+    case "$line" in
+      LIST*) echo "    $id  有  ${line#LIST }" ;;
+      DEL*)  echo "    $id  ✓ 已删  ${line#DEL }" ;;
+      SKIP*) echo "    $id  —  ${line#SKIP }" ;;
+      *)     echo "    $id  ✗ ${line#ERR }"; bad=1 ;;
+    esac
+  done
+  rm -rf "$tmp"
+  return $bad
+}
+
+cmd_purge_weights() {
+  local dir=${1:-}
+  [ -n "$dir" ] || { echo "用法: $0 purge-weights <各节点上的权重目录，如 $WORKDIR/weights-q3-30b>"; exit 1; }
+  say "P. 删各台的 $dir（$(_n_hosts) 台，HOSTS=$HOSTS）"
+  _purge_weights "$dir" 0 || { echo "  ✗ 没删任何东西（原因见上）"; return 1; }
+  if [ "${CONFIRM:-0}" != 1 ]; then
+    read -rp "  真删？删掉的模型以后要用得重新下 [y/N] " a; [ "$a" = y ] || return 0
+  fi
+  _purge_weights "$dir" 1
 }
 
 cmd_start() {
@@ -1494,6 +1603,7 @@ case "$action" in
   diag)    cmd_diag ;;
   verify)  cmd_verify "${1:-}" ;;
   refetch) cmd_refetch "${1:-}" ;;
+  purge-weights) cmd_purge_weights "${1:-}" ;;
   layerbench) cmd_layerbench ;;
   identity) cmd_identity ;;
   whereis) cmd_whereis "${1:-}" ;;
@@ -1509,6 +1619,6 @@ case "$action" in
   status)  cmd_status ;;
   continuous) cmd_continuous "$@" ;;
   all)     cmd_sync && cmd_check && cmd_fetch && cmd_start && cmd_serve "$@" ;;
-  *) echo "用法: $0 {sync|bootstrap|cmds|check|fetch|meta|diag|serve-weights|verify|refetch|layerbench|identity|whereis|disk|start|status|serve|measure|continuous|report|logs|doctor|stop|all}
+  *) echo "用法: $0 {sync|bootstrap|cmds|check|fetch|meta|diag|serve-weights|verify|refetch|purge-weights|layerbench|identity|whereis|disk|start|status|serve|measure|continuous|report|logs|doctor|stop|all}
        serve/measure 后面的参数原样透传给 control.py"; exit 1 ;;
 esac

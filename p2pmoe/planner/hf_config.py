@@ -54,6 +54,12 @@ class HFModelInfo:
     lin_k_dim: int = 0
     conv_kernel: int = 0
 
+    # ---- MLA 注意力（GLM-4.7-Flash / DeepSeek 系）。非 MLA 模型全是 0，行为不变 ----
+    mla_attn_params: int = 0
+    """一层 MLA 的参数量（q_a/q_b/kv_a/kv_b/o 与两个低秩 norm）。>0 时 attn_gb 用它。"""
+    mla_kv_dim: int = 0
+    """展开后的 KV 维度折成 ModelSpec 的口径（K、V 各算一份）：头数 × (qk_head + v_head) / 2。"""
+
     # -- 逐层拆解（GB） -------------------------------------------------- #
     @property
     def expert_gb(self) -> float:
@@ -79,6 +85,8 @@ class HFModelInfo:
         Qwen3-Next 的 q_proj **同时产出 query 与输出门**，宽度是 2 倍 ——
         这里按 `layer_types` 判断要不要算那一倍。
         """
+        if self.mla_attn_params:
+            return self.mla_attn_params * self.dtype_bytes / 1e9
         gate_mult = 2 if self.hybrid else 1
         qo = self.d_model * (self.n_heads * self.head_dim) * (1 + gate_mult)
         kv = 2 * self.d_model * (self.n_kv_heads * self.head_dim)
@@ -122,6 +130,8 @@ class HFModelInfo:
 
     @property
     def kv_dim(self) -> int:
+        if self.mla_kv_dim:
+            return self.mla_kv_dim
         return self.n_kv_heads * self.head_dim
 
     @property
@@ -197,6 +207,21 @@ def model_spec_from_hf(
     d_model = int(_get(cfg, "hidden_size"))
     n_heads = int(_get(cfg, "num_attention_heads"))
     head_dim = int(_get(cfg, "head_dim", default=d_model // n_heads))
+    mla_params = mla_kv = 0
+    shared = int(_get(cfg, "shared_expert_intermediate_size", default=0))
+    if cfg.get("kv_lora_rank"):
+        # MLA（GLM-4.7-Flash）：q 低秩、kv 压缩后再展开；KV 按展开后的大小记（与运行时一致）
+        qr, kvr = cfg.get("q_lora_rank"), int(cfg["kv_lora_rank"])
+        nope, rope, vh = (int(cfg["qk_nope_head_dim"]), int(cfg["qk_rope_head_dim"]),
+                          int(cfg["v_head_dim"]))
+        q = d_model * n_heads * (nope + rope) if qr is None else (
+            d_model * int(qr) + int(qr) + int(qr) * n_heads * (nope + rope))
+        mla_params = (q + d_model * (kvr + rope) + kvr + kvr * n_heads * (nope + vh)
+                      + n_heads * vh * d_model)
+        mla_kv = n_heads * (nope + rope + vh) // 2
+        head_dim = nope + rope
+        if not shared and cfg.get("n_shared_experts"):
+            shared = int(cfg["n_shared_experts"]) * int(_get(cfg, "moe_intermediate_size"))
     info = HFModelInfo(
         name=name,
         n_layers=int(_get(cfg, "num_hidden_layers")),
@@ -210,12 +235,14 @@ def model_spec_from_hf(
         vocab=int(_get(cfg, "vocab_size")),
         dtype_bytes=dtype_bytes,
         layer_types=tuple(_layer_types(cfg)),
-        shared_intermediate=int(_get(cfg, "shared_expert_intermediate_size", default=0)),
+        shared_intermediate=shared,
         lin_v_heads=int(_get(cfg, "linear_num_value_heads", default=0)),
         lin_k_heads=int(_get(cfg, "linear_num_key_heads", default=0)),
         lin_v_dim=int(_get(cfg, "linear_value_head_dim", default=0)),
         lin_k_dim=int(_get(cfg, "linear_key_head_dim", default=0)),
         conv_kernel=int(_get(cfg, "linear_conv_kernel_dim", default=0)),
+        mla_attn_params=mla_params,
+        mla_kv_dim=mla_kv,
     )
     # 混合模型的 KV 逐层不同，规划器的 ModelSpec 只吃一个标量 ——
     # 取**加权平均**而不是最大值：取最大会把 3/4 的定长状态层也按 full attention
@@ -232,7 +259,7 @@ def model_spec_from_hf(
         # 共享专家每层都有、且**不参与裁剪**，漏了它内存判据会系统性偏乐观
         base_gb_per_layer=(
             sum(info.mixer_gb(l) for l in range(1, info.n_layers + 1)) / info.n_layers
-            + info.shared_gb) if info.hybrid else info.attn_gb,
+            + info.shared_gb) if info.hybrid else info.attn_gb + info.shared_gb,
         expert_gb=info.expert_gb,
         ctx_max=ctx_max,
         kv_bytes_per_elem=dtype_bytes,

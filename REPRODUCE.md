@@ -1266,6 +1266,71 @@ PyTorch 显存下第 7 条 gsm8k 把三台 T4 全占，前段无处可放。此�
 串成一条 gsm8k，实际最慢；PyTorch 实测 RTX 只比 A30 慢约 1.17 倍（2.76 vs 2.36），与理论接近，理论方案反而比 5.15
 更均衡（没让 T4 做后段）。
 
+### 5.18 GLM-4.7-Flash：Petals 的分配 → 清单 → 拉权重 → 逐层计时（`glm47flash/`）
+
+GLM-4.7-Flash（`zai-org/GLM-4.7-Flash`，`glm4_moe_lite`）与 Qwen3-30B-A3B 结构不同，执行层另写了一份
+`p2pmoe/runtime/glm4_moe_lite.py`（节点、fetch、layerbench 按 config 的 `model_type` 自动分派）：
+
+* 47 层：第 1 层（checkpoint 第 0 层）是 dense MLP（10240），第 2–47 层是 MoE；checkpoint 里的
+  `model.layers.47.*` 是 MTP 层，不部署、不下载；
+* 64 个专家选 4 + 1 个共享专家（不参与裁剪）；路由 sigmoid + 偏置选专家，权重归一后 ×1.8，路由器两项 fp32；
+* MLA 注意力（q / kv 低秩，rope 64 维交错），KV 按展开后缓存：每 token 每层 20KiB（与 Petals 方案一致）；
+* 节点只要 torch + safetensors（不要 transformers）。数值与 transformers 5.x 的官方实现逐层对过
+  （`tests/test_glm4_moe_lite.py`，同形状的小模型，prefill + decode 的 logits 差 < 1e-4）。
+
+**清单**（Petals 的 `glm47flash/petals/plan_glm47flash_16k_cap8.json` → 本框架的清单）：
+
+```bash
+python3 examples/petals_to_layout.py glm47flash/petals/plan_glm47flash_16k_cap8.json \
+  --out glm47flash/layout_petals_cap8.json
+python3 examples/manual_plan.py glm47flash/layout_petals_cap8.json --config glm47flash/config.json \
+  --ctx 16384 --out glm47flash/plan_petals_cap8.json
+```
+
+L₀ = 8，2 条链、12 台，专家全装，后段进共享池（`task: any`）；N13–N15 空闲：
+
+| 链 | 前段（第 1–8 层） | 后段 |
+|---|---|---|
+| A | N06 | N05[9–16] → N07[17–24] → N08[25–32] → N09[33–40] → N10[41–47]（RTX） |
+| B | N01 | N02[9–16] → N03[17–24] → N04[25–32] → N11[33–40]（RTX） → N12[41–47]（RTX） |
+
+每台约 9.5–10.2GB（全装一层 1.27GB；前段多一张词嵌入 0.63GB、第 1 层 dense 只有 0.17GB；末台多输出头 0.63GB），
+两条链合计约 120GB。清单里第 1 层也按 64 个专家列着（手写布局默认全装），`weight_gb` 因此对前段偏大约 1.1GB；
+拉权重与装载时 dense 层的专家号一律忽略。
+
+**在 wash1 上**（先把 Mac 上的代码 rsync 过去，同第 1 步）：
+
+```bash
+cd /home/ubuntu/p2p-framework
+HOSTS=task/hosts.txt bash ./deploy_15.sh stop          # 先停掉现在跑着的方案（15 台）
+source glm47flash/use_plan.sh petals_cap8              # env + PLAN + 只含这 12 台的 HOSTS
+bash ./deploy_15.sh sync                               # 代码发到 12 台
+bash ./deploy_15.sh meta                               # 控制机取 config.json / tokenizer 到 $WEIGHTS（约 10MB）
+# 硬盘只装得下一个模型：下载前先删这 12 台上 Qwen3-30B-A3B 的权重目录（源站试通、回 y 之后才删）
+PURGE_OLD=$WORKDIR/weights-q3-30b bash ./deploy_15.sh fetch   # 12 台各拉自己那份到 weights-glm47
+bash ./deploy_15.sh verify                             # 12 台都应 ✓
+# 不在这份清单里的 N13–N15 也清掉（先列出、问一次再删；CONFIRM=1 不问）
+HOSTS=task/hosts.txt bash ./deploy_15.sh purge-weights $WORKDIR/weights-q3-30b
+
+# 逐层计时：15 台都量（N13–N15 不在这份清单里，但以后给 GLM 规划要用）
+HOSTS=task/hosts.txt bash ./deploy_15.sh sync
+HOSTS=task/hosts.txt bash ./deploy_15.sh start
+HOSTS=task/hosts.txt LB_MODE=synthetic bash ./deploy_15.sh layerbench
+cp results/layer_bench.json glm47flash/layer_bench_wash1_glm47.json
+```
+
+`purge-weights` 删的是**整个目录**（权重、config、tokenizer）。护栏：必须是绝对路径、目录名以 `weights`
+开头（`FORCE=1` 才放行别的）、不能是当前的 `$WEIGHTS`；有进程开着里面的文件（agent 还装着 Qwen）就整批不删，
+先 `HOSTS=task/hosts.txt bash ./deploy_15.sh stop`。删之前逐台列出大小与 config（如 `qwen3_moe，48 层 × 128 专家`），
+删之后报剩余空间。以后切回 Qwen 要重新 `fetch`（反过来同理：`PURGE_OLD=$WORKDIR/weights-glm47`）。
+
+layerbench 用随机权重建 4 个 MoE 层（第 2–5 层；第 1 层 dense 不代表其余 46 层，跳过）、64 个专家全装，
+约 5.1GB 显存，T4 也装得下；结果的 `model.arch` 应为 `glm4_moe_lite`。量出来的表与 Qwen 的同格式，
+可直接给 `task_deploy.py --layer-times` / `manual_plan.py --layer-times`。
+
+还没做的：GLM 的 task 选择器（`LR_MODEL` 置空）、规划器对 GLM 的适配（dense 层、层号对齐），以及
+对话模板 / 停止符的端到端核对 —— 拉权重和逐层计时用不到这些。
+
 ## 6. 参考数值（用来判断复现是否正常）
 
 | 实验 | 指标 | 历史值 |

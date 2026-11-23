@@ -120,6 +120,7 @@ def test_test_imports_are_declared() -> None:
 HEAVY_ALLOWED = {
     "p2pmoe/runtime/torch_model.py",       # Qwen3-MoE 执行层
     "p2pmoe/runtime/qwen3_next.py",        # Qwen3-Next 执行层（混合注意力）
+    "p2pmoe/runtime/glm4_moe_lite.py",     # GLM-4.7-Flash 执行层（MLA + dense 第 0 层 + 共享专家）
     "p2pmoe/runtime/weights.py",
     "p2pmoe/runtime/layer_bench.py",       # 逐层计时：在节点 GPU 上跑随机权重的层
     "p2pmoe/sim/fake_checkpoint.py",       # 生成测试用 checkpoint

@@ -590,10 +590,23 @@ _purge_weights() {
   fi
   need "$HOSTS"
   local tmp; tmp=$(mktemp -d)
+  # 远端脚本先落成**普通文件**再当 stdin 喂给 ssh。早先用的是进程替换 `< <(…)`：那个子进程
+  # 写完就退出，SIGCHLD 可能正好打在 ssh 等对方 banner 的那一刻 —— 15 台里随机一台报
+  # `kex_exchange_identification: Interrupted system call`（退出码 255），每次换一台。
+  _purge_node_script > "$tmp/.node.sh"
   while read -r id ip; do
-    ( "$SSH_BIN" -o BatchMode=yes -o ConnectTimeout=10 ${SSH_OPTS:-} \
-        "${SSH_USER:+$SSH_USER@}$ip" "bash -s -- $(printf %q "$dir") $(printf %q "$WEIGHTS") $do" \
-        < <(_purge_node_script) > "$tmp/$id" 2>&1 || echo "ERR 退出码 $?" >> "$tmp/$id" ) &
+    (
+      for try in 1 2 3; do
+        rc=0
+        "$SSH_BIN" -o BatchMode=yes -o ConnectTimeout=10 ${SSH_OPTS:-} \
+          "${SSH_USER:+$SSH_USER@}$ip" "bash -s -- $(printf %q "$dir") $(printf %q "$WEIGHTS") $do" \
+          < "$tmp/.node.sh" > "$tmp/$id" 2>&1 || rc=$?
+        # 只在「ssh 自己没连上、远端脚本一行都没跑」时重试 —— 跑过了（哪怕报错）就不重来
+        [ "$rc" = 255 ] && ! grep -qE '^(LIST|DEL|SKIP|ERR)' "$tmp/$id" || break
+        sleep "$try"
+      done
+      [ "$rc" = 0 ] || echo "ERR 退出码 $rc" >> "$tmp/$id"
+    ) &
   done < <(awk '{sub(/#.*/,"")} NF>=2 {split($2,a,":"); print $1, a[1]}' "$HOSTS")
   wait
   local bad=0 id line

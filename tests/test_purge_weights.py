@@ -83,3 +83,13 @@ def test_unreachable_node_shows_the_ssh_error(pool):
     out = _run(pool, "purge-weights", "/W/weights-q3-30b", CONFIRM="1")
     assert "n2  ✗ ssh 连不上 n2：ssh: connect to host n2 port 22: No route to host" in out
     assert "已删" not in out
+
+
+def test_a_flaky_ssh_is_retried(pool):
+    """kex 阶段被信号打断这种一次性的 255：重试一次就过，不该拦住整批。"""
+    stub = pool / "ssh"
+    stub.write_text(stub.read_text().replace(
+        "exec bash", f'f={pool}/flaky.$host; if [ "$host" = n3 ] && [ ! -e "$f" ]; then touch "$f"; '
+        'echo "kex_exchange_identification: Interrupted system call" >&2; exit 255; fi\nexec bash'))
+    out = _run(pool, "purge-weights", "/W/weights-q3-30b", CONFIRM="1")
+    assert out.count("✓ 已删") == 2 and "✗" not in out

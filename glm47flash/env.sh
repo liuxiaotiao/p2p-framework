@@ -11,6 +11,7 @@ export REPO=zai-org/GLM-4.7-Flash
 export WEIGHTS=$WORKDIR/weights-glm47                     # 与 Qwen 的 weights-q3-30b 分开放，换回 Qwen 不用重下
 export PLAN=glm47flash/plan_petals_cap8.json              # Petals 的分配：2 条链、12 台、专家全装
 export TASKS=gsm8k=1,mbpp=1,no_robots=1
+export PROFILE=task_glm47/profile_prefill.json            # 激活画像（层号 2–47 = MoE 层；动态模式的直方图识别从它来）
 export LR_MODEL=                                          # GLM 的选择器还没训；空 = 动态模式退回直方图识别
 export DUMP_FRONT=results/glm47_front.jsonl
 

@@ -148,8 +148,10 @@ def main(argv=None) -> int:
         mass = np.divide(w, z, out=np.zeros_like(w), where=z > 0)
         prof["tasks"][u] = {
             "n_tokens": n,
-            "layers": {str(l + 1): [round(float(x), 8) for x in mass[l]]
-                       for l in range(c.shape[0])},
+            # 键是规划器层号（1-based）= 模型层号 + 1。只采了 MoE 层的模型（GLM-4.7-Flash：
+            # layer_ids = 1..46，第 0 层 dense）就是 2..47，不是 1..46
+            "layers": {str((layer_ids[l] if layer_ids else l) + 1):
+                       [round(float(x), 8) for x in mass[l]] for l in range(c.shape[0])},
         }
         dec = f"  decode {int(dc.sum()) // int(meta.get('top_k') or 1) // c.shape[0]:>8} 个生成 token" \
             if dc is not None else ""

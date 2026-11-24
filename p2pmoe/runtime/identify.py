@@ -81,12 +81,21 @@ class HistogramClassifier:
         priors: Mapping[str, float],
         **kw,
     ) -> "HistogramClassifier":
-        """参考画像 = 各 task 在前段层（1..L₀）上的激活质量之和。"""
+        """参考画像 = 各 task 在前段层（1..L₀）上的激活质量之和。
+
+        各 task 都是**精确均匀分布**的层跳过：那是画像里没有的层（GLM-4.7-Flash 的 dense
+        第 1 层没有路由，画像按均匀补齐）。节点上这种层不产出直方图，参考里也不能有 ——
+        否则每个 task 的参考都多出同一个常数向量，余弦区分度被白白稀释。"""
         refs = {}
+        some = next(iter(profiles.values()))
+        flat = 1.0 / some.n_experts
+        skip = {l for l in range(1, l0 + 1)
+                if all(np.allclose(p.at(l), flat, rtol=0, atol=1e-12) for p in profiles.values())}
         for u, p in profiles.items():
             acc = np.zeros(p.n_experts)
             for l in range(1, l0 + 1):
-                acc += np.asarray(p.at(l))
+                if l not in skip:
+                    acc += np.asarray(p.at(l))
             refs[u] = acc
         return cls(refs, priors, **kw)
 

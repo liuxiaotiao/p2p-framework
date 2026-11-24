@@ -208,3 +208,23 @@ def test_theory_plan_is_reproducible(tmp_path, monkeypatch):
     plan = json.loads(want.read_text())
     f = plan["segments"]["F0"]
     assert f["splits"] == [[1, 3]] and len(f["nodes"]) == 1
+
+
+def test_front_identification_uses_the_two_moe_layers():
+    """前段 = dense 第 1 层 + MoE 第 2、3 层。画像按规划器层号存（2–47），直方图识别的参考
+    只由第 2、3 层构成 —— dense 层没有路由，节点不产出它的直方图，参考里也不能有。"""
+    prof = ROOT / "task_glm47" / "profile_prefill.json"
+    if not prof.exists():
+        pytest.skip("缺 task_glm47/profile_prefill.json")
+    import numpy as np
+
+    from p2pmoe.runtime.identify import HistogramClassifier
+    from p2pmoe.runtime.profile import load_profile, to_activation_profile
+
+    raw = load_profile(prof)
+    assert min(int(k) for k in raw["tasks"]["gsm8k"]["layers"]) == 2
+    pr = {u: to_activation_profile(raw, u, n_layers=47, n_experts=64)
+          for u in ("gsm8k", "mbpp", "no_robots")}
+    clf = HistogramClassifier.from_profiles(pr, 3, {u: 1 / 3 for u in pr})
+    want = np.asarray(pr["mbpp"].at(2)) + np.asarray(pr["mbpp"].at(3))
+    assert np.allclose(clf.refs["mbpp"], want / np.linalg.norm(want))

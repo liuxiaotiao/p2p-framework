@@ -1,0 +1,520 @@
+{
+ "source": "vllm",
+ "default_key": "req@p512g512",
+ "keys": [
+  "decode@p512g512",
+  "prefill@512",
+  "req@p512g512"
+ ],
+ "setup": {
+  "prompt": 512,
+  "gen": 512,
+  "batch": 1,
+  "experts": 64
+ },
+ "per_node": {
+  "N01": {
+   "gpu": "NVIDIA A30",
+   "source": "vllm",
+   "node_factor": 1.0375,
+   "decode@p512g512": 0.3572,
+   "prefill@512": 1.4615,
+   "req@p512g512": 0.3601,
+   "fixed_ms_per_token": 1.7245,
+   "memory": {
+    "total_gb": 25.3391,
+    "context_gb": 1.5026,
+    "prefill_extra_gb": 0.0,
+    "prefill_extra_at": null,
+    "overhead_ratio": 1.0018,
+    "kv_bytes_per_token_layer": 1152.0,
+    "weights_per_layer_gb": 1.2709,
+    "embed_gb": 0.6344,
+    "lm_head_gb": 0.6344
+   }
+  },
+  "N02": {
+   "gpu": "NVIDIA A30",
+   "source": "vllm",
+   "node_factor": 1.0195,
+   "decode@p512g512": 0.351,
+   "prefill@512": 1.4361,
+   "req@p512g512": 0.3538,
+   "fixed_ms_per_token": 1.7245,
+   "memory": {
+    "total_gb": 25.3391,
+    "context_gb": 1.5026,
+    "prefill_extra_gb": 0.0,
+    "prefill_extra_at": null,
+    "overhead_ratio": 1.0018,
+    "kv_bytes_per_token_layer": 1152.0,
+    "weights_per_layer_gb": 1.2709,
+    "embed_gb": 0.6344,
+    "lm_head_gb": 0.6344
+   }
+  },
+  "N03": {
+   "gpu": "NVIDIA A30",
+   "source": "vllm",
+   "node_factor": 0.954,
+   "decode@p512g512": 0.3284,
+   "prefill@512": 1.3438,
+   "req@p512g512": 0.3311,
+   "fixed_ms_per_token": 1.7245,
+   "memory": {
+    "total_gb": 25.3391,
+    "context_gb": 1.5026,
+    "prefill_extra_gb": 0.0,
+    "prefill_extra_at": null,
+    "overhead_ratio": 1.0018,
+    "kv_bytes_per_token_layer": 1152.0,
+    "weights_per_layer_gb": 1.2709,
+    "embed_gb": 0.6344,
+    "lm_head_gb": 0.6344
+   }
+  },
+  "N04": {
+   "gpu": "NVIDIA A30",
+   "source": "vllm",
+   "node_factor": 0.9782,
+   "decode@p512g512": 0.3368,
+   "prefill@512": 1.3779,
+   "req@p512g512": 0.3395,
+   "fixed_ms_per_token": 1.7245,
+   "memory": {
+    "total_gb": 25.3391,
+    "context_gb": 1.5026,
+    "prefill_extra_gb": 0.0,
+    "prefill_extra_at": null,
+    "overhead_ratio": 1.0018,
+    "kv_bytes_per_token_layer": 1152.0,
+    "weights_per_layer_gb": 1.2709,
+    "embed_gb": 0.6344,
+    "lm_head_gb": 0.6344
+   }
+  },
+  "N05": {
+   "gpu": "NVIDIA A30",
+   "source": "vllm",
+   "node_factor": 0.9779,
+   "decode@p512g512": 0.3367,
+   "prefill@512": 1.3774,
+   "req@p512g512": 0.3394,
+   "fixed_ms_per_token": 1.7245,
+   "memory": {
+    "total_gb": 25.3391,
+    "context_gb": 1.5026,
+    "prefill_extra_gb": 0.0,
+    "prefill_extra_at": null,
+    "overhead_ratio": 1.0018,
+    "kv_bytes_per_token_layer": 1152.0,
+    "weights_per_layer_gb": 1.2709,
+    "embed_gb": 0.6344,
+    "lm_head_gb": 0.6344
+   }
+  },
+  "N06": {
+   "gpu": "NVIDIA A30",
+   "source": "vllm",
+   "node_factor": 0.9811,
+   "decode@p512g512": 0.3378,
+   "prefill@512": 1.382,
+   "req@p512g512": 0.3405,
+   "fixed_ms_per_token": 1.7245,
+   "memory": {
+    "total_gb": 25.3391,
+    "context_gb": 1.5026,
+    "prefill_extra_gb": 0.0,
+    "prefill_extra_at": null,
+    "overhead_ratio": 1.0018,
+    "kv_bytes_per_token_layer": 1152.0,
+    "weights_per_layer_gb": 1.2709,
+    "embed_gb": 0.6344,
+    "lm_head_gb": 0.6344
+   }
+  },
+  "N07": {
+   "gpu": "NVIDIA A30",
+   "source": "vllm",
+   "node_factor": 0.9892,
+   "decode@p512g512": 0.3406,
+   "prefill@512": 1.3934,
+   "req@p512g512": 0.3433,
+   "fixed_ms_per_token": 1.7245,
+   "memory": {
+    "total_gb": 25.3391,
+    "context_gb": 1.5026,
+    "prefill_extra_gb": 0.0,
+    "prefill_extra_at": null,
+    "overhead_ratio": 1.0018,
+    "kv_bytes_per_token_layer": 1152.0,
+    "weights_per_layer_gb": 1.2709,
+    "embed_gb": 0.6344,
+    "lm_head_gb": 0.6344
+   }
+  },
+  "N08": {
+   "gpu": "NVIDIA A30",
+   "source": "vllm",
+   "node_factor": 1.0308,
+   "decode@p512g512": 0.3549,
+   "prefill@512": 1.4521,
+   "req@p512g512": 0.3577,
+   "fixed_ms_per_token": 1.7245,
+   "memory": {
+    "total_gb": 25.3391,
+    "context_gb": 1.5026,
+    "prefill_extra_gb": 0.0,
+    "prefill_extra_at": null,
+    "overhead_ratio": 1.0018,
+    "kv_bytes_per_token_layer": 1152.0,
+    "weights_per_layer_gb": 1.2709,
+    "embed_gb": 0.6344,
+    "lm_head_gb": 0.6344
+   }
+  },
+  "N09": {
+   "gpu": "NVIDIA A30",
+   "source": "vllm",
+   "node_factor": 1.0311,
+   "decode@p512g512": 0.355,
+   "prefill@512": 1.4525,
+   "req@p512g512": 0.3578,
+   "fixed_ms_per_token": 1.7245,
+   "memory": {
+    "total_gb": 25.3391,
+    "context_gb": 1.5026,
+    "prefill_extra_gb": 0.0,
+    "prefill_extra_at": null,
+    "overhead_ratio": 1.0018,
+    "kv_bytes_per_token_layer": 1152.0,
+    "weights_per_layer_gb": 1.2709,
+    "embed_gb": 0.6344,
+    "lm_head_gb": 0.6344
+   }
+  },
+  "N10": {
+   "gpu": "Quadro RTX 6000",
+   "source": "vllm",
+   "node_factor": 1.0061,
+   "decode@p512g512": 1.993,
+   "prefill@512": 29.2605,
+   "req@p512g512": 2.0502,
+   "fixed_ms_per_token": 2.3579,
+   "memory": {
+    "total_gb": 23.5952,
+    "context_gb": 1.4079,
+    "prefill_extra_gb": 0.0,
+    "prefill_extra_at": null,
+    "overhead_ratio": 1.0026,
+    "kv_bytes_per_token_layer": 1152.0,
+    "weights_per_layer_gb": 1.2709,
+    "embed_gb": 0.6344,
+    "lm_head_gb": 0.6344
+   }
+  },
+  "N11": {
+   "gpu": "Quadro RTX 6000",
+   "source": "vllm",
+   "node_factor": 0.9973,
+   "decode@p512g512": 1.9755,
+   "prefill@512": 29.0033,
+   "req@p512g512": 2.0322,
+   "fixed_ms_per_token": 2.3579,
+   "memory": {
+    "total_gb": 23.5952,
+    "context_gb": 1.4079,
+    "prefill_extra_gb": 0.0,
+    "prefill_extra_at": null,
+    "overhead_ratio": 1.0026,
+    "kv_bytes_per_token_layer": 1152.0,
+    "weights_per_layer_gb": 1.2709,
+    "embed_gb": 0.6344,
+    "lm_head_gb": 0.6344
+   }
+  },
+  "N12": {
+   "gpu": "Quadro RTX 6000",
+   "source": "vllm",
+   "node_factor": 0.9966,
+   "decode@p512g512": 1.9742,
+   "prefill@512": 28.9837,
+   "req@p512g512": 2.0308,
+   "fixed_ms_per_token": 2.3579,
+   "memory": {
+    "total_gb": 23.5952,
+    "context_gb": 1.4079,
+    "prefill_extra_gb": 0.0,
+    "prefill_extra_at": null,
+    "overhead_ratio": 1.0026,
+    "kv_bytes_per_token_layer": 1152.0,
+    "weights_per_layer_gb": 1.2709,
+    "embed_gb": 0.6344,
+    "lm_head_gb": 0.6344
+   }
+  },
+  "N13": {
+   "gpu": "Tesla T4",
+   "source": "vllm",
+   "node_factor": 0.9953,
+   "decode@p512g512": 3.3372,
+   "prefill@512": 48.5084,
+   "req@p512g512": 3.432,
+   "fixed_ms_per_token": 3.598,
+   "memory": {
+    "total_gb": 15.6558,
+    "context_gb": 1.3523,
+    "prefill_extra_gb": 0.0,
+    "prefill_extra_at": null,
+    "overhead_ratio": 1.0102,
+    "kv_bytes_per_token_layer": 1152.0,
+    "weights_per_layer_gb": 1.2709,
+    "embed_gb": 0.6344,
+    "lm_head_gb": 0.6344
+   }
+  },
+  "N14": {
+   "gpu": "Tesla T4",
+   "source": "vllm",
+   "node_factor": 1.0022,
+   "decode@p512g512": 3.3605,
+   "prefill@512": 48.8474,
+   "req@p512g512": 3.4559,
+   "fixed_ms_per_token": 3.598,
+   "memory": {
+    "total_gb": 15.6558,
+    "context_gb": 1.3523,
+    "prefill_extra_gb": 0.0,
+    "prefill_extra_at": null,
+    "overhead_ratio": 1.0102,
+    "kv_bytes_per_token_layer": 1152.0,
+    "weights_per_layer_gb": 1.2709,
+    "embed_gb": 0.6344,
+    "lm_head_gb": 0.6344
+   }
+  },
+  "N15": {
+   "gpu": "Tesla T4",
+   "source": "vllm",
+   "node_factor": 1.0024,
+   "decode@p512g512": 3.3612,
+   "prefill@512": 48.8577,
+   "req@p512g512": 3.4567,
+   "fixed_ms_per_token": 3.598,
+   "memory": {
+    "total_gb": 15.6558,
+    "context_gb": 1.3523,
+    "prefill_extra_gb": 0.0,
+    "prefill_extra_at": null,
+    "overhead_ratio": 1.0102,
+    "kv_bytes_per_token_layer": 1152.0,
+    "weights_per_layer_gb": 1.2709,
+    "embed_gb": 0.6344,
+    "lm_head_gb": 0.6344
+   }
+  }
+ },
+ "per_gpu": {
+  "NVIDIA A30": {
+   "nodes": [
+    "N01",
+    "N02",
+    "N03",
+    "N04",
+    "N05",
+    "N06",
+    "N07",
+    "N08",
+    "N09"
+   ],
+   "decode@p512g512": {
+    "mean": 0.3443,
+    "std": 0.0104,
+    "n": 9
+   },
+   "prefill@512": {
+    "mean": 1.4085,
+    "std": 0.0425,
+    "n": 9
+   },
+   "req@p512g512": {
+    "mean": 0.347,
+    "std": 0.0104,
+    "n": 9
+   },
+   "fixed_ms_per_token": 1.7245,
+   "memory": {
+    "total_gb": {
+     "mean": 25.3391,
+     "std": 0.0,
+     "n": 9
+    },
+    "context_gb": {
+     "mean": 1.5026,
+     "std": 0.0,
+     "n": 9
+    },
+    "prefill_extra_gb": {
+     "mean": 0.0,
+     "std": 0.0,
+     "n": 9
+    },
+    "overhead_ratio": {
+     "mean": 1.0018,
+     "std": 0.0,
+     "n": 9
+    },
+    "kv_bytes_per_token_layer": {
+     "mean": 1152.0,
+     "std": 0.0,
+     "n": 9
+    },
+    "weights_per_layer_gb": {
+     "mean": 1.2709,
+     "std": 0.0,
+     "n": 9
+    },
+    "embed_gb": {
+     "mean": 0.6344,
+     "std": 0.0,
+     "n": 9
+    },
+    "lm_head_gb": {
+     "mean": 0.6344,
+     "std": 0.0,
+     "n": 9
+    }
+   }
+  },
+  "Quadro RTX 6000": {
+   "nodes": [
+    "N10",
+    "N11",
+    "N12"
+   ],
+   "decode@p512g512": {
+    "mean": 1.9809,
+    "std": 0.0105,
+    "n": 3
+   },
+   "prefill@512": {
+    "mean": 29.0825,
+    "std": 0.1545,
+    "n": 3
+   },
+   "req@p512g512": {
+    "mean": 2.0377,
+    "std": 0.0108,
+    "n": 3
+   },
+   "fixed_ms_per_token": 2.3579,
+   "memory": {
+    "total_gb": {
+     "mean": 23.5952,
+     "std": 0.0,
+     "n": 3
+    },
+    "context_gb": {
+     "mean": 1.4079,
+     "std": 0.0,
+     "n": 3
+    },
+    "prefill_extra_gb": {
+     "mean": 0.0,
+     "std": 0.0,
+     "n": 3
+    },
+    "overhead_ratio": {
+     "mean": 1.0026,
+     "std": 0.0,
+     "n": 3
+    },
+    "kv_bytes_per_token_layer": {
+     "mean": 1152.0,
+     "std": 0.0,
+     "n": 3
+    },
+    "weights_per_layer_gb": {
+     "mean": 1.2709,
+     "std": 0.0,
+     "n": 3
+    },
+    "embed_gb": {
+     "mean": 0.6344,
+     "std": 0.0,
+     "n": 3
+    },
+    "lm_head_gb": {
+     "mean": 0.6344,
+     "std": 0.0,
+     "n": 3
+    }
+   }
+  },
+  "Tesla T4": {
+   "nodes": [
+    "N13",
+    "N14",
+    "N15"
+   ],
+   "decode@p512g512": {
+    "mean": 3.353,
+    "std": 0.0137,
+    "n": 3
+   },
+   "prefill@512": {
+    "mean": 48.7378,
+    "std": 0.1988,
+    "n": 3
+   },
+   "req@p512g512": {
+    "mean": 3.4482,
+    "std": 0.014,
+    "n": 3
+   },
+   "fixed_ms_per_token": 3.598,
+   "memory": {
+    "total_gb": {
+     "mean": 15.6558,
+     "std": 0.0,
+     "n": 3
+    },
+    "context_gb": {
+     "mean": 1.3523,
+     "std": 0.0,
+     "n": 3
+    },
+    "prefill_extra_gb": {
+     "mean": 0.0,
+     "std": 0.0,
+     "n": 3
+    },
+    "overhead_ratio": {
+     "mean": 1.0102,
+     "std": 0.0,
+     "n": 3
+    },
+    "kv_bytes_per_token_layer": {
+     "mean": 1152.0,
+     "std": 0.0,
+     "n": 3
+    },
+    "weights_per_layer_gb": {
+     "mean": 1.2709,
+     "std": 0.0,
+     "n": 3
+    },
+    "embed_gb": {
+     "mean": 0.6344,
+     "std": 0.0,
+     "n": 3
+    },
+    "lm_head_gb": {
+     "mean": 0.6344,
+     "std": 0.0,
+     "n": 3
+    }
+   }
+  }
+ }
+}

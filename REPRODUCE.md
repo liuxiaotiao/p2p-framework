@@ -1391,6 +1391,25 @@ python3 -m p2pmoe.deploy.layer_bench merge results/layer_bench/*.json --out glm4
 层号 1-based、含两端；含第 1 层会带上词嵌入，含末层会带上输出头。这几台原有的权重会被换掉（同模型的张量复用），
 之后再按清单 fetch 时同样会复用。
 
+### 5.22 GLM-4.7-Flash 按 vLLM profile 规划（前段优先 / 后段优先）
+
+`glm47flash/summary_by_gpu_glm47flash.json` 是各卡 vLLM 实测；先转成 layer_bench 表（GLM 是 64 专家，必须带 `--experts 64`）：
+
+```bash
+python3 -m p2pmoe.deploy.vllm_summary glm47flash/summary_by_gpu_glm47flash.json \
+    --prompt 512 --gen 512 --batch 1 --experts 64 --out glm47flash/layer_bench_vllm_glm47.json
+C="--data task_glm47 --config glm47flash/config.json --phase prefill --tasks gsm8k=1,mbpp=1,no_robots=1 \
+   --expert-sets glm47flash/glm47_expert_sets_90_union.json --l0 3 --front-full \
+   --layer-times glm47flash/layer_bench_vllm_glm47.json --layer-time-key req@p512g512 \
+   --measured-mem --mem-margin-gb 0 --kv-reserve-gb 1.5 --mla-kv latent --endpoint-w 0 --balance-memory"
+python3 examples/task_deploy.py $C --front-first  --save-plan glm47flash/plan_glm47_vllm_ff.json   # 前段优先
+python3 examples/task_deploy.py $C --single-front --save-plan glm47flash/plan_glm47_vllm_1f.json   # 后段优先
+```
+
+vLLM 下 RTX6000 每层 ~2.0ms、T4 ~3.4ms，是 A30（~0.34ms）的 6–10 倍，所以第 2 组通道必然慢一档。
+kv 预留 1.5GB（latent 口径每 token 每层 1152B，一台 ~22 层约 6 万 token）；2GB 起 gsm8k/mbpp 第 2 条建不出、
+或首节点落到 T4。部署：`source glm47flash/use_plan.sh vllm_ff`（或 `vllm_1f`）→ `REPLACE=1 bash ./deploy_15.sh fetch` → `verify`。
+
 ## 6. 参考数值（用来判断复现是否正常）
 
 | 实验 | 指标 | 历史值 |

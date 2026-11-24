@@ -228,3 +228,66 @@ def test_front_identification_uses_the_two_moe_layers():
     clf = HistogramClassifier.from_profiles(pr, 3, {u: 1 / 3 for u in pr})
     want = np.asarray(pr["mbpp"].at(2)) + np.asarray(pr["mbpp"].at(3))
     assert np.allclose(clf.refs["mbpp"], want / np.linalg.norm(want))
+
+
+def _fake_glm_selector(path, *, layer_ids=None):
+    import numpy as np
+
+    rng = np.random.default_rng(0)
+    extra = {} if layer_ids is None else {"layer_ids": np.array(layer_ids)}
+    np.savez(path, mean=np.zeros(256), scale=np.ones(256), coef=rng.normal(size=(3, 256)),
+             intercept=np.zeros(3), classes=np.array(["gsm8k", "mbpp", "no_robots"]),
+             n_layers=2, n_experts=64, feature="prefill_counts_body+meanw", **extra)
+
+
+@pytest.mark.parametrize("ids", [None, [1, 2]])
+def test_glm_selector_reads_the_first_two_moe_layers(tmp_path, ids):
+    """verify/train_selector_L2.py 存的是「前 2 层」—— 对 GLM 的 npz（只有 MoE 层）那是 checkpoint
+    第 1、2 层 = 规划器第 2、3 层。文件没写 layer_ids 时按模型的 dense 层往后挪；写了就照写的用。"""
+    import numpy as np
+
+    from p2pmoe.runtime.lr_classifier import LRClassifier
+    from p2pmoe.runtime.model import LayerStat, MoEStats
+
+    f = tmp_path / "sel.npz"
+    _fake_glm_selector(f, layer_ids=ids)
+    pri = {"gsm8k": 1 / 3, "mbpp": 1 / 3, "no_robots": 1 / 3}
+    clf = LRClassifier.load(f, l0=3, n_experts=64, priors=pri, dense_layers={1})
+    assert clf.layers == [2, 3]
+    st = MoEStats(hist=np.ones(64), layers={
+        l: LayerStat(np.full(64, 4, dtype=np.int64), np.full(64, 1.8), 64, True) for l in (2, 3)})
+    v = clf.predict_stats(st)
+    assert v.error is None and v.task in pri
+    if ids is None:      # 不告诉它 dense 层：还是 Qwen 的口径（前 2 层）
+        assert LRClassifier.load(f, l0=3, n_experts=64, priors=pri).layers == [1, 2]
+    with pytest.raises(ValueError, match="128"):
+        LRClassifier.load(f, l0=3, n_experts=128, priors=pri)
+
+
+def test_task_clf_meanw_selector_is_wired_to_moe_layers(tmp_path):
+    """task_clf_*.npz（W / b / tasks / feature_mode=meanw）：每层只取 wsum/count、整条 prompt、
+    不标准化；GLM 上看 checkpoint 第 1、2 层 = 规划器第 2、3 层。"""
+    import numpy as np
+
+    from p2pmoe.runtime.lr_classifier import LRClassifier
+    from p2pmoe.runtime.model import LayerStat, MoEStats
+
+    f = ROOT / "selector" / "task_clf_glm47flash_L1L2_meanw.npz"
+    if not f.exists():
+        f = tmp_path / "task_clf.npz"
+        np.savez(f, W=np.random.default_rng(0).normal(size=(4, 128)).astype(np.float32),
+                 b=np.zeros(4, np.float32), tasks=np.array(["gsm8k", "mbpp", "humaneval", "no_robots"]),
+                 n_layers=2, n_experts=64, feature_mode="meanw", feature_order=np.array(["mean_weight"]))
+    pri = {"gsm8k": 1 / 3, "mbpp": 1 / 3, "no_robots": 1 / 3}
+    clf = LRClassifier.load(f, l0=3, n_experts=64, priors=pri, dense_layers={1})
+    assert clf.layers == [2, 3] and clf.spec.stats == ["mean_weight"]
+    assert not clf.needs_body and clf.shift is None and clf.scale is None
+    # 特征就是 wsum / count（没进 top-k 的记 0），按层拼
+    c = np.zeros(64, dtype=np.int64)
+    c[:4] = [2, 1, 0, 3]
+    w = np.zeros(64)
+    w[:4] = [0.9, 0.45, 0.0, 1.2]
+    st = MoEStats(hist=np.zeros(64), layers={l: LayerStat(c, w, 2) for l in (2, 3)})
+    x = clf.features(st.layers)
+    assert x.shape == (128,) and np.allclose(x[:4], [0.45, 0.45, 0.0, 0.4])
+    assert clf.predict_stats(st).task in pri

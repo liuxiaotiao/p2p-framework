@@ -1417,7 +1417,8 @@ def main(argv: list[str] | None = None) -> int:
                 args.lr_model, l0=l0, n_experts=setup.n_experts,
                 priors=dict(tasks_lam), class_map=args.lr_classes,
                 features=args.lr_features, feature_fn=args.lr_feature_fn,
-                tau_hi=args.tau_hi, tau_lo=args.tau_lo)
+                tau_hi=args.tau_hi, tau_lo=args.tau_lo,
+                dense_layers=setup.spec.dense_layers)
         except (ValueError, KeyError, OSError) as e:
             log.error("LR 模型装不上：%s", e)
             log.error("  先离线核对：python3 -m p2pmoe.deploy.lr_tool inspect "
@@ -1425,6 +1426,10 @@ def main(argv: list[str] | None = None) -> int:
                       setup.n_experts)
             return 2
         log.info("      识别器：%s", clf.describe())
+        if clf.meta.get("shifted_to_moe"):
+            log.info("      选择器看的层 → checkpoint 第 %s 层（前 %d 个 MoE 层；dense 层 %s 没有路由）",
+                     clf.meta["shifted_to_moe"], len(clf.meta["shifted_to_moe"]),
+                     sorted(setup.spec.dense_layers))
         # 选择器按**完整模型**的路由训练：它看的那几层，前段每台都得装全部专家。
         # 缺专家时第 l 层的输出被 drop-expert 近似改写，第 l+1 层起的路由（= 特征）
         # 就整体偏了 —— 不报错，只是准确率悄悄掉。

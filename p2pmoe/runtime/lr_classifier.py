@@ -260,7 +260,17 @@ _SELECTOR_FEATURES = {
     # 与节点捎带的 LayerStat.mass（只数 body token 时是 lmass）同一口径。
     "prefill_counts_body+meanw": dict(stats=["count", "mean_weight"], normalize="per_layer",
                                       tokens="body", layout="layer_major"),
+    # GLM-4.7-Flash 的 task_clf_glm47flash_L1L2_meanw.npz：每层只取平均门控权重 wsum/count
+    # （没进过 top-k 的记 0；权重是含 routed_scaling_factor=1.8 的原值），**整条 prompt**
+    # 的 token（不是只数 body），不做标准化。口径是拿 verify 的 GLM 统计反推核实的：
+    # 整条 prompt 样本外平衡准确率 99.5%，只数 body 77.6%，权重 ÷1.8 85.8%。
+    "prefill_meanw_full": dict(stats=["mean_weight"], normalize="none", tokens="all",
+                               layout="layer_major"),
 }
+
+_CLF_FEATURE_MODES = {"meanw": "prefill_meanw_full"}
+"""另一种选择器文件（task_clf_*.npz：W, b, tasks, n_layers, n_experts, feature_mode）的
+feature_mode → 上面的口径名。"""
 
 
 def _selector_meta(d: Mapping, out: dict) -> dict:
@@ -285,8 +295,14 @@ def _selector_meta(d: Mapping, out: dict) -> dict:
             raise ValueError(f"选择器的特征口径 {feat!r} 不认识；"
                              f"认识的是 {sorted(_SELECTOR_FEATURES)}")
         if "features" not in out:
-            out["features"] = {"layers": list(range(n)), "layer_base": 0,
-                               **_SELECTOR_FEATURES[feat]}
+            # layer_ids（checkpoint 的 0-based 层号）：选择器看的是哪几层。没写就是「前 n 层」
+            # —— Qwen 的选择器都是这样。GLM-4.7-Flash 第 0 层是 dense，前 2 个 MoE 层是 1、2：
+            # 文件里没写 layer_ids 时由 LRClassifier.load(dense_layers=…) 往后挪
+            ids = d.get("layer_ids")
+            layers = ([int(x) for x in np.asarray(ids).reshape(-1)] if ids is not None
+                      else list(range(n)))
+            out["features"] = {"layers": layers, "layer_base": 0, **_SELECTOR_FEATURES[feat]}
+            out["layers_explicit"] = ids is not None
         out["meta"] = {"feature": feat, "n_layers": n,
                        "n_experts": int(np.asarray(d["n_experts"]))
                        if "n_experts" in d else None,
@@ -295,6 +311,20 @@ def _selector_meta(d: Mapping, out: dict) -> dict:
 
 
 def _from_mapping(d: Mapping) -> dict:
+    # task_clf_*.npz（GLM-4.7-Flash 的选择器）：W[C,D] / b[C] / tasks / feature_mode，没有标准化
+    if all(k in d for k in ("W", "b", "tasks")) and "coef" not in d:
+        mode = str(np.asarray(d.get("feature_mode", "")))
+        if mode not in _CLF_FEATURE_MODES:
+            raise ValueError(f"task_clf 选择器的 feature_mode={mode!r} 不认识；"
+                             f"认识的是 {sorted(_CLF_FEATURE_MODES)}")
+        conv = {"coef": np.asarray(d["W"], dtype=np.float64),
+                "intercept": np.asarray(d["b"], dtype=np.float64),
+                "classes": [str(x) for x in np.asarray(d["tasks"]).reshape(-1)],
+                "n_layers": d["n_layers"], "n_experts": d["n_experts"],
+                "feature": _CLF_FEATURE_MODES[mode]}
+        if "layer_ids" in d:
+            conv["layer_ids"] = d["layer_ids"]
+        return _from_mapping(conv)
     # 常见的「自己打包」形式：{"model": clf, "scaler": sc, "features": {...}}
     for k in ("model", "clf", "lr", "classifier", "estimator", "pipeline"):
         if k in d and (hasattr(d[k], "coef_") or hasattr(d[k], "steps")):
@@ -519,11 +549,23 @@ class LRClassifier:
         feature_fn: str | None = None,
         tau_hi: float | None = None,
         tau_lo: float = 0.40,
+        dense_layers=(),
     ) -> "LRClassifier":
         """`tau_hi=None`：选择器文件用 0.9（SELECTOR_USAGE.md 推荐的 --min-prob），
-        其它 LR 用 0.55（与直方图识别器相同）。"""
+        其它 LR 用 0.55（与直方图识别器相同）。
+
+        `dense_layers`：模型里没有路由的层（规划器口径，GLM-4.7-Flash 是 {1}）。选择器文件只写了
+        「前 n 层」（`verify/train_selector_L2.py` 按 npz 的前 n 个切片训练，而 GLM 的 npz 只有 MoE 层）
+        时，把这 n 层挪到**前 n 个 MoE 层**上。文件里写了 layer_ids、或显式给了 features 时不动。"""
         raw = load_lr_params(path)
         meta = raw.get("meta") or {}
+        dense = sorted(int(l) for l in dense_layers)
+        if (dense and features is None and meta and not raw.get("layers_explicit")
+                and isinstance(raw.get("features"), Mapping)):
+            n = len(raw["features"]["layers"])
+            moe = [l - 1 for l in range(1, n + len(dense) + 1) if l not in dense][:n]
+            raw["features"] = {**raw["features"], "layers": moe}
+            meta = {**meta, "shifted_to_moe": moe}
         if meta.get("n_experts") and int(meta["n_experts"]) != int(n_experts):
             raise ValueError(
                 f"选择器是按 {meta['n_experts']} 个专家/层训练的，部署的模型是 "

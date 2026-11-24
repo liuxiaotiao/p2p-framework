@@ -55,7 +55,8 @@ from ..runtime.weights import KeyPlan, qwen_moe_keys
 log = logging.getLogger("p2pmoe.fetch")
 
 __all__ = ["Source", "TensorSpec", "FetchPlan", "plan_fetch", "fetch",
-           "RangeNotSupported", "local_checkpoint_keys", "clear_checkpoint"]
+           "RangeNotSupported", "local_checkpoint_keys", "clear_checkpoint",
+           "same_model", "probe_peers", "plan_sources", "fetch_reusing", "commit_staged"]
 
 
 class RangeNotSupported(RuntimeError):
@@ -759,6 +760,225 @@ def fetch(src: Source, keys: Iterable[str], out_dir: str | Path, *,
 
 
 # --------------------------------------------------------------------------- #
+# 集群内复用：先从本机旧权重、别的节点上已有的张量里拿，缺的才去上游
+# --------------------------------------------------------------------------- #
+STAGED = "model.safetensors.next"
+STAGED_INDEX = "model.safetensors.index.json.next"
+"""分阶段换权重时的新文件名。别的节点可能正在从本机的旧文件里读张量 —— 写完不能马上
+盖掉旧文件，要等**所有节点都拉完**再一起改名（`--commit-staged`）。"""
+
+_CFG_IGNORE = ("_name_or_path", "transformers_version")
+
+
+def same_model(a: Mapping, b: Mapping) -> bool:
+    """两份 config.json 是不是同一个模型（同一个仓库拉的，张量逐字节相同）。"""
+    def norm(c: Mapping) -> dict:
+        return {k: v for k, v in c.items() if k not in _CFG_IGNORE}
+    return norm(a) == norm(b)
+
+
+@dataclass
+class Donor:
+    """一个可以拿张量的地方：本机的旧权重，或者别的节点（经它的 serve_weights）。"""
+
+    label: str
+    src: Source
+    rtt_ms: float = 0.0
+
+
+def parse_peers(s: str | None, *, exclude: str | None = None) -> dict[str, str]:
+    """`N01=http://10.0.0.1:9400,N02=…` → {节点: URL}，去掉自己。"""
+    out: dict[str, str] = {}
+    for part in (s or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        name, _, url = part.partition("=")
+        if not url:
+            raise ValueError(f"--peers 的写法是 节点=URL，收到 {part!r}")
+        if name != exclude:
+            out[name.strip()] = url.strip().rstrip("/")
+    return out
+
+
+def probe_peers(peers: Mapping[str, str], cfg: Mapping, *,
+                timeout: float = 10.0) -> list[Donor]:
+    """读每个对等节点的 config.json（顺便量往返）：同一个模型、有权重的，按往返由近到远排。
+
+    并行问 —— 一台连不上要等到超时，串行的话 14 台就是几分钟。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(item):
+        name, url = item
+        src = Source(base_url=url, timeout=timeout, retries=2, transport="urllib")
+        try:
+            t0 = time.perf_counter()
+            c = src.read_json("config.json")
+            rtt = (time.perf_counter() - t0) * 1e3
+            if not same_model(c, cfg):
+                return name, None, "模型不同（config.json 对不上）"
+            if not src.exists("model.safetensors.index.json"):
+                return name, None, "没有权重"
+            return name, Donor(name, src, rtt), None
+        except Exception as e:                    # 连不上、没开服务 —— 不用它就是了
+            return name, None, f"{type(e).__name__}: {str(e)[:80]}"
+
+    got: list[Donor] = []
+    with ThreadPoolExecutor(max_workers=max(1, min(16, len(peers)))) as ex:
+        for name, d, why in ex.map(one, sorted(peers.items())):
+            if d is None:
+                log.info("  对等节点 %-5s 不用：%s", name, why)
+            else:
+                got.append(d)
+    got.sort(key=lambda d: (d.rtt_ms, d.label))
+    return got
+
+
+def plan_sources(donors: Sequence[Donor], upstream: Source,
+                 keys: Iterable[str]) -> list[tuple[Donor | None, TensorSpec]]:
+    """每个张量从哪拿：按 donors 的顺序（本机旧权重 → 近的节点 → 远的节点），都没有才找上游。
+    返回 [(来源，None = 上游), TensorSpec（偏移是相对那个来源的文件）]。只读文件头。"""
+    remaining = set(keys)
+    out: list[tuple[Donor | None, TensorSpec]] = []
+    for d in donors:
+        if not remaining:
+            break
+        try:
+            p = plan_fetch(d.src, remaining)
+        except Exception as e:
+            log.warning("  %s 的文件头读不通（%s）—— 不用它", d.label, e)
+            continue
+        for t in p.tensors:
+            out.append((d, t))
+            remaining.discard(t.name)
+    if remaining:
+        p = plan_fetch(upstream, remaining)
+        if p.missing:
+            raise KeyError(f"上游缺 {len(p.missing)} 个 key，首个是 {p.missing[0]}")
+        out += [(None, t) for t in p.tensors]
+    return out
+
+
+def source_bytes(assigned: Sequence[tuple[Donor | None, TensorSpec]]) -> dict[str, int]:
+    by: dict[str, int] = {}
+    for d, t in assigned:
+        k = d.label if d else "上游"
+        by[k] = by.get(k, 0) + t.nbytes
+    return by
+
+
+def fetch_reusing(assigned: Sequence[tuple[Donor | None, TensorSpec]], upstream: Source,
+                  out_dir: str | Path, *, stage: bool = False,
+                  gap: int = 1 << 20) -> dict[str, int]:
+    """按 plan_sources 的分配拼出新的单文件 checkpoint。
+
+    文件头先按全部张量写好，每段字节按**名字**落到它在新文件里的位置 —— 所以哪个来源
+    中途掉线都不要紧：它没给完的张量最后统一改从上游拿，写进同一个位置。
+    stage=True 时写成 model.safetensors.next（等 --commit-staged 再改名），否则直接替换。
+    返回实际从各来源取的字节数。"""
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    specs = [t for _, t in assigned]
+    header = _st_header(specs)
+    base = 8 + len(header)
+    at: dict[str, int] = {}
+    off = 0
+    for t in specs:
+        at[t.name] = base + off
+        off += t.nbytes
+    total = base + off
+    part = out / "model.safetensors.partial"
+    with open(part, "wb") as fh:
+        fh.write(len(header).to_bytes(8, "little"))
+        fh.write(header)
+
+    got: dict[str, int] = {}
+    failed: list[str] = []
+
+    def pull(src: Source, label: str, group: list[TensorSpec], fh, *, tolerant: bool) -> bool:
+        group = sorted(group, key=lambda t: t.start)
+        ranges = _coalesce(group, gap)
+        i = 0
+        for k, (lo, hi) in enumerate(ranges):
+            try:
+                buf = memoryview(src.read(group[0].shard, lo, hi))
+                if len(buf) != hi - lo:
+                    raise RuntimeError(f"拿到 {len(buf)} 字节，应该是 {hi - lo}")
+            except Exception as e:
+                if not tolerant:
+                    raise
+                log.warning("  %s 中途读不到了（%s）—— 它剩下的 %d 个张量改从上游拿",
+                            label, str(e)[:120], len(group) - i)
+                failed.extend(t.name for t in group[i:])
+                return False
+            while i < len(group) and group[i].end <= hi:
+                t = group[i]
+                fh.seek(at[t.name])
+                fh.write(buf[t.start - lo: t.end - lo])
+                i += 1
+            got[label] = got.get(label, 0) + (hi - lo)
+            del buf
+        return True
+
+    with open(part, "r+b") as fh:
+        groups: dict[tuple[str, str], tuple[Donor | None, list[TensorSpec]]] = {}
+        order: list[tuple[str, str]] = []
+        for d, t in assigned:
+            key = (d.label if d else "", t.shard)
+            if key not in groups:
+                groups[key] = (d, [])
+                order.append(key)
+            groups[key][1].append(t)
+        dead: set[str] = set()
+        for key in order:
+            d, grp = groups[key]
+            if d is None:
+                continue                      # 上游放到最后，和掉线补拉的一起
+            if d.label in dead:
+                failed.extend(t.name for t in grp)
+                continue
+            log.info("  ← %s：%s，%d 个张量 / %.1fMB", d.label, key[1], len(grp),
+                     sum(t.nbytes for t in grp) / 1e6)
+            if not pull(d.src, d.label, grp, fh, tolerant=True):
+                dead.add(d.label)
+        up = [t.name for k in order if groups[k][0] is None for t in groups[k][1]]
+        if failed:
+            up += failed
+        if up:
+            p = plan_fetch(upstream, up)
+            if p.missing:
+                raise KeyError(f"上游缺 {len(p.missing)} 个 key，首个是 {p.missing[0]}")
+            for shard in p.shards_needed:
+                grp = [t for t in p.tensors if t.shard == shard]
+                log.info("  ← 上游：%s，%d 个张量 / %.1fMB", shard, len(grp),
+                         sum(t.nbytes for t in grp) / 1e6)
+                pull(upstream, "上游", grp, fh, tolerant=False)
+        fh.truncate(total)
+    if part.stat().st_size != total:
+        raise RuntimeError(f"{part} 是 {part.stat().st_size} 字节，应该是 {total}")
+    index = json.dumps({"metadata": {"total_size": total},
+                        "weight_map": {t.name: "model.safetensors" for t in specs}}, indent=2)
+    if stage:
+        os.replace(part, out / STAGED)
+        (out / STAGED_INDEX).write_text(index, encoding="utf-8")
+    else:
+        os.replace(part, out / "model.safetensors")
+        (out / "model.safetensors.index.json").write_text(index, encoding="utf-8")
+    return got
+
+
+def commit_staged(out_dir: str | Path) -> bool:
+    """把 --stage 写好的新权重换上（所有节点都拉完之后才调）。没有待换的就什么都不做。"""
+    out = Path(out_dir)
+    if not (out / STAGED).is_file():
+        return False
+    os.replace(out / STAGED, out / "model.safetensors")
+    if (out / STAGED_INDEX).is_file():
+        os.replace(out / STAGED_INDEX, out / "model.safetensors.index.json")
+    return True
+
+
+# --------------------------------------------------------------------------- #
 def local_checkpoint_keys(out: str | Path) -> set[str] | None:
     """out 里已有的单文件 checkpoint（fetch 的产物）装了哪些张量。
 
@@ -908,9 +1128,27 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--replace", action="store_true",
                     help="就地换方案：--out 里已经是这份清单要的张量就跳过；不是就**先删掉"
                          "旧权重**再下新的（磁盘放不下新旧两份时用）。config/tokenizer 保留")
+    ap.add_argument("--peers", default=None,
+                    help="别的节点的权重服务（serve_weights），如 N01=http://10.0.0.1:9400,…：同一个模型、"
+                         "已经有的张量从它们那里拿（局域网），缺的才去上游。隐含 --reuse")
+    ap.add_argument("--reuse", action="store_true",
+                    help="本机 --out 里已有的同模型张量直接复用（换方案时大半层没变），不再从上游重下；"
+                         "要新旧两份同时放得下，放不下且给了 --replace 就退回「先删后下」")
+    ap.add_argument("--stage", action="store_true",
+                    help="本机原来有同模型权重时，新文件写成 model.safetensors.next、不盖旧的 —— "
+                         "别的节点可能还在从本机的旧文件拿张量。全部拉完后 --commit-staged 再换上")
+    ap.add_argument("--commit-staged", action="store_true",
+                    help="把 --stage 写好的 model.safetensors.next 换成正式文件（只需要 --out）")
     ap.add_argument("--dry-run", action="store_true", help="只算要下多少，不下")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
+    if args.commit_staged:
+        logging.basicConfig(level=logging.INFO, format="%(message)s")
+        if args.out is None:
+            ap.error("--commit-staged 要给 --out")
+        done = commit_staged(args.out)
+        log.info("%s", f"{args.out}：新权重已换上" if done else f"{args.out}：没有待换的新权重")
+        return 0
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(message)s")
@@ -934,7 +1172,20 @@ def main(argv: list[str] | None = None) -> int:
     try:
         cfg = src.read_json("config.json")
     except (urllib.error.URLError, OSError, ValueError) as e:
-        log.error("读不到 %s 的 config.json：%s", src, e)
+        cfg_err = e
+        # 上游不通但有对等节点：config 从它们那里拿（同一个模型的 config 一字不差）
+        for name, url in parse_peers(args.peers, exclude=args.node).items():
+            try:
+                cfg = Source(base_url=url, timeout=10, retries=2,
+                             transport="urllib").read_json("config.json")
+                log.warning("上游读不到 config.json（%s）—— 用 %s 的", e, name)
+                break
+            except Exception:
+                continue
+        else:
+            cfg = None
+    if cfg is None:
+        log.error("读不到 %s 的 config.json：%s", src, cfg_err)
         log.error("  · 私有/受限仓库要 HF_TOKEN（`hf auth login` 之后在 "
                   "~/.cache/huggingface/token）")
         log.error("  · 连接被中途掐断：查代理（$https_proxy）、MTU、"
@@ -1075,6 +1326,9 @@ def main(argv: list[str] | None = None) -> int:
              sum(len(l.experts) for l in p.layers), arch, len(keys))
     log.info("来源 %s", src)
 
+    if args.reuse or args.peers:
+        return _main_reusing(args, src, cfg, keys)
+
     if args.replace and not args.dry_run:
         # 先删后下：slice 模式边下边写 .partial、写完才替换，不删的话新旧两份要同时
         # 落在盘上。代价是下载失败时这台暂时没有可用权重 —— 重跑同一条命令即可。
@@ -1109,6 +1363,93 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     log.info("完成，用时 %.1fs → %s", time.perf_counter() - t0, args.out)
     log.info("节点上把 --model-dir 指到 %s 即可", args.out)
+    return 0
+
+
+def _main_reusing(args, src: Source, cfg: dict, keys: set[str]) -> int:
+    """--reuse / --peers：本机旧权重 → 别的节点 → 上游，按这个顺序取张量。"""
+    out: Path = args.out
+    have = local_checkpoint_keys(out)
+    try:
+        local_cfg = json.loads((out / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        local_cfg = None
+    local_ok = have is not None and local_cfg is not None and same_model(local_cfg, cfg)
+    if local_ok and have == set(keys):
+        log.info("%s 已经是这份清单要的 %d 个张量，跳过", out, len(keys))
+        for f in (STAGED, STAGED_INDEX):          # 上一轮没换上的残留
+            if (out / f).is_file() and not args.dry_run:
+                (out / f).unlink()
+        return 0
+    if have is not None and not local_ok:
+        log.info("%s 里的旧权重不是这个模型（或没有 config.json）—— 不复用", out)
+        if args.replace and not args.dry_run:
+            freed = clear_checkpoint(out)
+            log.info("--replace：先删旧权重（释放 %.1fGB）", freed / 1e9)
+
+    donors: list[Donor] = []
+    if local_ok:
+        donors.append(Donor("本机旧权重", Source(local=out)))
+    peers = parse_peers(args.peers, exclude=args.node)
+    if peers:
+        found = probe_peers(peers, cfg)
+        log.info("对等节点：%d/%d 台可用（同一个模型、有权重），按往返由近到远：%s",
+                 len(found), len(peers),
+                 "、".join(f"{d.label}({d.rtt_ms:.0f}ms)" for d in found) or "无")
+        donors += found
+    try:
+        assigned = plan_sources(donors, src, keys)
+    except (KeyError, urllib.error.URLError, OSError) as e:
+        log.error("%s", e)
+        return 2
+    by = source_bytes(assigned)
+    need = sum(by.values())
+    stage = bool(args.stage and local_ok)
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+        free = shutil.disk_usage(out).free
+    except OSError:
+        free = None
+    if local_ok and free is not None and free < need * 1.02 + (64 << 20):
+        # 新旧两份放不下：旧的只能先删 —— 本机这份不再复用，也不再给别的节点用
+        if not args.replace:
+            log.error("盘上剩 %.1fGB，新权重要 %.1fGB，旧的还占着 —— 放不下两份。"
+                      "加 --replace 先删旧的", free / 1e9, need / 1e9)
+            return 2
+        log.warning("盘上剩 %.1fGB，放不下新旧两份（新的 %.1fGB）—— 先删本机旧权重，"
+                    "它的张量改从别的节点 / 上游拿", free / 1e9, need / 1e9)
+        if not args.dry_run:
+            clear_checkpoint(out)
+        donors = [d for d in donors if d.label != "本机旧权重"]
+        local_ok, stage = False, False
+        assigned = plan_sources(donors, src, keys)
+        by = source_bytes(assigned)
+    log.info("%d 个张量 / %.2fGB，来源：%s", len(assigned), need / 1e9,
+             "，".join(f"{k} {v / 1e9:.2f}GB" for k, v in by.items()))
+    if args.dry_run:
+        log.info("（--dry-run，没有真下）")
+        return 0
+
+    if not args.no_tokenizer:
+        for name in TOKENIZER_FILES:
+            if local_ok and (out / name).is_file():
+                continue
+            for s in [src] + [d.src for d in donors if d.label != "本机旧权重"]:
+                try:
+                    if s.exists(name):
+                        (out / name).write_bytes(s.read(name))
+                        break
+                except Exception:
+                    continue
+    t0 = time.perf_counter()
+    try:
+        got = fetch_reusing(assigned, src, out, stage=stage, gap=int(args.gap_mb * 1e6))
+    except (KeyError, RuntimeError, urllib.error.URLError, OSError) as e:
+        log.error("%s", e)
+        return 2
+    log.info("完成，用时 %.1fs → %s%s；实际取：%s", time.perf_counter() - t0, out,
+             f"/{STAGED}（等 --commit-staged 换上）" if stage else "",
+             "，".join(f"{k} {v / 1e9:.2f}GB" for k, v in got.items()))
     return 0
 
 

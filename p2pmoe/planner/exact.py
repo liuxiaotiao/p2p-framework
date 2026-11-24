@@ -26,7 +26,7 @@ from typing import Mapping, Sequence
 from .network import MeasurementCache
 from .types import Node, Objective, Segment, SegmentSpec
 
-__all__ = ["exact_path"]
+__all__ = ["exact_path", "rebalance_splits", "min_free_gb"]
 
 
 def exact_path(
@@ -117,3 +117,65 @@ def exact_path(
     _, seq, splits, comp, hop, jit = best_seg
     return Segment(kind=spec.kind, task=spec.task, nodes=tuple(seq),
                    splits=tuple(splits), compute_ms=comp, hop_ms=hop, jitter_ms=jit)
+
+
+def rebalance_splits(seg: Segment, spec: SegmentSpec, nodes: Mapping[str, Node],
+                     net: MeasurementCache) -> Segment:
+    """节点链不动、计算时延不变，重新切层，让链上**剩得最少的那台剩得尽量多**。
+
+    DP 切层只看计算时延：同型号的几台每层一样快，怎么切时延都一样，DP 取到的是第一个
+    最优解 —— 往往前面那台只放一两层、后面几台装到满（vLLM 的 KV cache 就没地方放了）。
+    这里在同一组节点上按（计算时延, −最小剩余显存）字典序重做 DP：时延不会变差，
+    剩余显存最紧的那台尽量宽松。时延相同的切法里取最均衡的那个。
+    """
+    seq = tuple(seg.nodes)
+    k, lo0, n = len(seq), spec.layer_lo, spec.n_layers
+    if k < 2:
+        return seg
+    cum = [0.0]
+    for l in range(lo0, spec.layer_hi + 1):
+        cum.append(cum[-1] + spec.gb_per_layer(l) + spec.kv_gb_per_layer)
+
+    def gb(a: int, b: int) -> float:
+        return (cum[b] - cum[a - 1] + (spec.head_extra_gb if a == 1 else 0.0)
+                + (spec.tail_extra_gb if b == n else 0.0))
+
+    scale = spec.ms_per_layer_scale
+    # best[i][j] = (计算时延, −最小剩余, 前一台的 s)
+    best: list[list[tuple[float, float, int] | None]] = [[None] * (n + 1) for _ in range(k + 1)]
+    best[0][0] = (0.0, -float("inf"), -1)
+    for i, v in enumerate(seq, start=1):
+        cap, ms = nodes[v].usable_gb, nodes[v].ms_per_layer * scale
+        for j in range(i, n - (k - i) + 1):
+            for s in range(i - 1, j):
+                p = best[i - 1][s]
+                g = gb(s + 1, j)
+                if p is None or g > cap + 1e-9:
+                    continue
+                c = p[0] + (j - s) * ms
+                f = max(p[1], -(cap - g))
+                cur = best[i][j]
+                if cur is None or (round(c, 9), f) < (round(cur[0], 9), cur[1]):
+                    best[i][j] = (c, f, s)
+    if best[k][n] is None or best[k][n][0] > seg.compute_ms + 1e-9:
+        return seg
+    splits: list[tuple[int, int]] = []
+    j = n
+    for i in range(k, 0, -1):
+        s = best[i][j][2]
+        splits.append((lo0 + s, lo0 + j - 1))
+        j = s
+    from .solver import segment_from_nodes
+
+    return segment_from_nodes(spec, seq, splits[::-1], nodes, net)
+
+
+def min_free_gb(seg: Segment, spec: SegmentSpec, nodes: Mapping[str, Node]) -> float:
+    """链上剩余显存最少的那台还剩多少（GB）。"""
+    lo0, n = spec.layer_lo, spec.n_layers
+    out = float("inf")
+    for v, (a, b) in zip(seg.nodes, seg.splits):
+        g = sum(spec.gb_per_layer(l) + spec.kv_gb_per_layer for l in range(a, b + 1))
+        g += (spec.head_extra_gb if a == lo0 else 0.0) + (spec.tail_extra_gb if b == lo0 + n - 1 else 0.0)
+        out = min(out, nodes[v].usable_gb - g)
+    return out

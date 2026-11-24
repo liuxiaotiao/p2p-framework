@@ -32,6 +32,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Mapping
 
 from ..runtime.wire import rpc
 
@@ -383,6 +384,89 @@ WantedBy=multi-user.target
 
 
 # --------------------------------------------------------------------------- #
+# 节点互传：拉新权重前在各节点上把**现有**权重目录用 serve_weights 发出来
+# --------------------------------------------------------------------------- #
+def _peer_alive(url: str, timeout: float = 5.0) -> bool:
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f"{url}/config.json", timeout=timeout) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def _serve_cmd(args, out: str, port: int) -> str:
+    q = shlex.quote
+    return (f"mkdir -p {q(args.logdir)} && if [ -f {q(out)}/model.safetensors ]; then "
+            f"nohup {q(args.python)} -m p2pmoe.deploy.serve_weights --dir {q(out)} "
+            f"--bind 0.0.0.0:{port} > {q(args.logdir)}/serve-weights.log 2>&1 < /dev/null & "
+            f"sleep 1; echo serving; else echo none; fi")
+
+
+def _stop_cmd(out: str, port: int) -> str:
+    return (f"pkill -f {shlex.quote(f'p2pmoe.deploy.serve_weights --dir {out} --bind 0.0.0.0:{port}')}"
+            f" || true")
+
+
+def _start_peers(peer_hosts, out, args) -> tuple[dict[str, str], list]:
+    """各节点把自己现有的权重目录发出来 → ({节点: URL}, 本机模式下的进程)。
+
+    没有权重的节点不起；起了但控制机连不上的（防火墙、端口被占）不算 —— 那几台的张量
+    各节点会改从上游拿，不影响结果，只是慢一点。"""
+    procs: list = []
+
+    def start(i_h):
+        i, h = i_h
+        port = args.peer_port + (i if args.local else 0)
+        d = f"{out}/{h.node_id}" if args.per_node_dir else out
+        if args.local:
+            if not (Path(args.workdir) / d / "model.safetensors").is_file() and \
+                    not Path(d, "model.safetensors").is_file():
+                return h, None
+            p = subprocess.Popen([args.python, "-m", "p2pmoe.deploy.serve_weights",
+                                  "--dir", d, "--bind", f"127.0.0.1:{port}"],
+                                 cwd=args.workdir, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True)
+            procs.append(p)
+            url = f"http://127.0.0.1:{port}"
+        else:
+            ok, msg = _ssh(h, f"cd {shlex.quote(args.workdir)} && {_serve_cmd(args, d, port)}",
+                           ssh=args.ssh, user=args.user, timeout=30)
+            if not ok or "serving" not in msg:
+                return h, None
+            url = f"http://{h.host}:{port}"
+        for _ in range(20):
+            if _peer_alive(url):
+                return h, url
+            time.sleep(0.5)
+        return h, None
+
+    with ThreadPoolExecutor(max_workers=args.parallel) as ex:
+        rows = list(ex.map(start, enumerate(peer_hosts)))
+    urls = {h.node_id: u for h, u in rows if u}
+    print(f"  节点互传：{len(urls)}/{len(peer_hosts)} 台在发自己现有的权重"
+          + (f"（{', '.join(sorted(urls))}）" if urls else "")
+          + ("；没发的：" + ", ".join(sorted(h.node_id for h, u in rows if not u))
+             if len(urls) < len(peer_hosts) else ""))
+    return urls, procs
+
+
+def _stop_peers(peer_hosts, out, args, procs) -> None:
+    for p in procs:
+        p.terminate()
+    if args.local:
+        return
+
+    def stop(i_h):
+        i, h = i_h
+        d = f"{out}/{h.node_id}" if args.per_node_dir else out
+        _ssh(h, _stop_cmd(d, args.peer_port), ssh=args.ssh, user=args.user, timeout=30)
+
+    with ThreadPoolExecutor(max_workers=args.parallel) as ex:
+        list(ex.map(stop, enumerate(peer_hosts)))
+
+
 def _fetch_all(hosts, args) -> int:
     """让每台节点**自己**去拉它那一份权重。
 
@@ -400,7 +484,20 @@ def _fetch_all(hosts, args) -> int:
         return 2
     out = args.out or "/data/p2pmoe-weights"
     _warn_default_workdir(args)
+    peers: dict[str, str] = {}
+    procs: list = []
+    peer_hosts = []
+    if getattr(args, "peers", False) and not args.dry_run:
+        peer_hosts = read_hosts(args.peer_hosts) if args.peer_hosts else list(hosts)
+        peers, procs = _start_peers(peer_hosts, out, args)
+    try:
+        return _fetch_all_inner(hosts, args, out, peers)
+    finally:
+        if peer_hosts:
+            _stop_peers(peer_hosts, out, args, procs)
 
+
+def _fetch_all_inner(hosts, args, out: str, peers: Mapping[str, str]) -> int:
     def cmd_for(h) -> str:
         parts = [args.python, "-m", "p2pmoe.deploy.fetch",
                  "--plan", str(args.plan), "--node", h.node_id,
@@ -408,6 +505,12 @@ def _fetch_all(hosts, args) -> int:
                  "--mode", args.mode]
         if getattr(args, "replace", False):
             parts.append("--replace")
+        mine = {n: u for n, u in peers.items() if n != h.node_id}
+        if getattr(args, "peers", False):
+            # 本机旧权重也复用；本机原来有同模型权重的写成 .next，等全部拉完再统一换上
+            parts += ["--reuse", "--stage"]
+            if mine:
+                parts += ["--peers", ",".join(f"{n}={u}" for n, u in sorted(mine.items()))]
         # 权重源三选一，与 fetch 的口径一致
         if args.src:
             parts += ["--src", args.src]
@@ -471,6 +574,25 @@ def _fetch_all(hosts, args) -> int:
     for h, ok, msg in rows:
         print(f"  {h.node_id:<8} {'✓' if ok else '✗'} {_brief(msg)}")
         n_ok += ok
+    if getattr(args, "peers", False):
+        # 全部拉完（别的节点不会再来读旧文件了）才把 .next 换上。失败的那几台不换 —— 旧权重还在，重跑即可
+        def commit(h):
+            d = f"{out}/{h.node_id}" if args.per_node_dir else out
+            c = " ".join(shlex.quote(x) for x in
+                         [args.python, "-m", "p2pmoe.deploy.fetch", "--commit-staged", "--out", d])
+            if args.local:
+                r = subprocess.run(c, shell=True, cwd=args.workdir, capture_output=True, text=True)
+                return h, r.returncode == 0, (r.stdout or r.stderr).strip()
+            return (h, *_ssh(h, f"cd {shlex.quote(args.workdir)} && {c}", ssh=args.ssh,
+                             user=args.user, timeout=120))
+
+        good = [h for h, ok, _ in rows if ok]
+        with ThreadPoolExecutor(max_workers=args.parallel) as ex:
+            crow = list(ex.map(commit, good))
+        bad_c = [h.node_id for h, ok, _ in crow if not ok]
+        print(f"  换上新权重：{len(crow) - len(bad_c)}/{len(good)} 台"
+              + (f"；没换成：{bad_c}" if bad_c else ""))
+        n_ok -= len(bad_c)
     print(f"\nfetch: {n_ok}/{len(hosts)} 成功")
     if n_ok == len(hosts):
         where = f"{out}/<节点id>" if args.per_node_dir else out
@@ -530,6 +652,12 @@ def main(argv: list[str] | None = None) -> int:
                     help="改成 <out>/<节点id>。只在同机演练（多个 agent 在一台机器上）"
                          "时需要，真机上别开")
     ap.add_argument("--mode", choices=("slice", "shard"), default="slice")
+    ap.add_argument("--peers", action="store_true",
+                    help="fetch：节点互传 —— 先在 --peer-hosts 的各台上把现有权重目录用 serve_weights 发出来，"
+                         "各节点先复用本机旧权重、再从别的节点拿，缺的才去上游；全部拉完后统一换上")
+    ap.add_argument("--peer-hosts", type=Path, default=None,
+                    help="哪些节点当源（默认同 --hosts）。给全部 15 台：不在新清单里的节点上的权重也能用")
+    ap.add_argument("--peer-port", type=int, default=9400)
     ap.add_argument("--replace", action="store_true",
                     help="fetch：各节点就地换方案 —— 已是本清单的权重就跳过，否则先删旧的再下")
     ap.add_argument("--dry-run", action="store_true",

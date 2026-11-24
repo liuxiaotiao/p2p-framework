@@ -177,6 +177,12 @@ def main() -> int:
                          "代替拓扑 compute_capacity 推出来的相对值")
     ap.add_argument("--layer-time-key", default="decode@1024",
                     help="取实测表里哪一列：decode@<上下文长度> 或 prefill@<token 数>")
+    ap.add_argument("--balance-memory", action="store_true",
+                    help="出清单前在原来那几台上重新切层：计算时延不变，让每条段上剩余显存最少的那台尽量宽松"
+                         "（给 vLLM 留 KV cache；PlannerConfig.balance_memory）")
+    ap.add_argument("--mla-kv", choices=("expanded", "latent"), default="expanded",
+                    help="MLA 模型（GLM-4.7-Flash）的 KV 口径：expanded = 本框架的执行层（按头展开后的 K/V，"
+                         "每 token 每层 20KiB）；latent = vLLM（只存压缩向量 kv_lora_rank + qk_rope，1152B）")
     ap.add_argument("--theory-times", action="store_true",
                     help="计算项用理论值（拓扑 compute_capacity 反比，A30 = 0.35ms/层）而不用 --layer-times 的实测；"
                          "--layer-times 此时只用来取 --measured-mem 的显存实测")
@@ -229,8 +235,6 @@ def main() -> int:
     ap.add_argument("--save-spec", type=Path, default=None,
                     help="导出 deploy/run.py 能吃的布局文件")
     args = ap.parse_args()
-    if args.kv_reserve_gb is not None and not args.measured_mem:
-        raise SystemExit("--kv-reserve-gb 要配 --measured-mem")
     if args.fill_idle and args.raw_fill:
         raise SystemExit("--fill-idle 与 --raw-fill 二选一（都是给剩下的节点派活）")
     if args.kv_reserve_gb is not None and args.kv_reserve_gb < 0:
@@ -271,7 +275,10 @@ def main() -> int:
     if not 0 < args.avail <= 1:
         raise SystemExit(f"--avail 要在 (0, 1] 里，收到 {args.avail}")
     topo = load_topology(D / "topo_fabric_mbps.json", d_model=int(hf_cfg["hidden_size"]),
-                         dtype_bytes=args.dtype_bytes, reserve_gb=args.reserve_gb,
+                         dtype_bytes=args.dtype_bytes,
+                         # 标称显存 + --kv-reserve-gb：KV 预留直接从每台的标称可用量里扣
+                         reserve_gb=args.reserve_gb + ((args.kv_reserve_gb or 0.0)
+                                                       if not args.measured_mem else 0.0),
                          avail=args.avail)
     if args.layer_times:
         from p2pmoe.deploy.layer_bench import per_node_ms
@@ -329,7 +336,20 @@ def main() -> int:
     rule("2. 模型")
     spec, info = model_spec_from_hf(hf_cfg, name=model_name,
                                     ctx_max=args.ctx, dtype_bytes=args.dtype_bytes)
-    if args.measured_mem:
+    if args.mla_kv == "latent":
+        if not hf_cfg.get("kv_lora_rank"):
+            raise SystemExit("--mla-kv latent 只对 MLA 模型有意义（config 里要有 kv_lora_rank）")
+        import dataclasses
+
+        # vLLM 的 MLA 缓存：每 token 每层存 kv_lora_rank + qk_rope_head_dim 个元素（ModelSpec 的
+        # KV 公式是 ctx × 2 × kv_dim × bytes，所以 kv_dim 取一半）
+        lat = int(hf_cfg["kv_lora_rank"]) + int(hf_cfg["qk_rope_head_dim"])
+        spec = dataclasses.replace(spec, kv_dim=lat / 2)
+        print(f"  KV 口径  MLA 压缩向量（vLLM）：每 token 每层 {lat * args.dtype_bytes}B")
+    if args.kv_reserve_gb is not None and not args.measured_mem:
+        print(f"  显存     标称（topo 的 memory_capacity）− 预留 {args.reserve_gb:g}GB − KV 预留 "
+              f"{args.kv_reserve_gb:g}GB；词嵌入 / 输出头计入首尾两台（没有 layerbench 时的保守口径）")
+    if args.measured_mem or args.kv_reserve_gb is not None:
         # 首尾两台各多装一张 vocab × d_model 的表：前段 head 的词嵌入、后段 tail 的输出头（+ norm）
         import dataclasses
 
@@ -424,6 +444,7 @@ def main() -> int:
                         quota_equal=args.quota_equal,
                         front_max_nodes=args.front_max_nodes,
                         single_front=args.single_front,
+                        balance_memory=args.balance_memory,
                         tighten_exact=args.tighten_exact,
                         balance_by_round=args.balance_by_round,
                         front_first=args.front_first,

@@ -291,3 +291,44 @@ def test_task_clf_meanw_selector_is_wired_to_moe_layers(tmp_path):
     x = clf.features(st.layers)
     assert x.shape == (128,) and np.allclose(x[:4], [0.45, 0.45, 0.0, 0.4])
     assert clf.predict_stats(st).task in pri
+
+
+def test_balance_memory_keeps_delay_and_frees_the_tightest_node():
+    """--balance-memory：同一组节点、计算时延不变，重切层让最紧的那台尽量宽松。"""
+    from p2pmoe.planner.exact import min_free_gb, rebalance_splits
+    from p2pmoe.planner.network import MeasurementCache
+    from p2pmoe.planner.solver import segment_from_nodes
+    from p2pmoe.planner.types import Node, SegmentSpec
+
+    nodes = {v: Node(id=v, tier="A30", mem_gb=24.0, ms_per_layer=0.35, reserve_gb=0.0)
+             for v in ("a", "b", "c")}
+    from p2pmoe.sim.network import SimNetwork
+
+    net = MeasurementCache(SimNetwork(list(nodes), seed=0), k=8, j_cap_ms=40.0)
+    spec = SegmentSpec(kind="back", task="t", layer_lo=4, layer_hi=47,
+                       gb_per_layer=lambda l: 1.0, kv_gb_per_layer=0.0)
+    seg = segment_from_nodes(spec, ["a", "b", "c"], [(4, 5), (6, 26), (27, 47)], nodes, net)
+    r = rebalance_splits(seg, spec, nodes, net)
+    assert r.compute_ms == pytest.approx(seg.compute_ms)
+    assert min_free_gb(seg, spec, nodes) == pytest.approx(3.0)
+    assert min_free_gb(r, spec, nodes) == pytest.approx(9.0)          # 44 层 → 15/15/14
+
+
+def test_vllm_theory_plan_is_reproducible(tmp_path, monkeypatch):
+    want = ROOT / "glm47flash" / "plan_glm47_vllm_1f_theory.json"
+    es = ROOT / "glm47flash" / "glm47_expert_sets_90_union.json"
+    lb = ROOT / "qwen3-30b" / "layer_bench_vllm_1105.json"
+    if not (want.exists() and es.exists() and lb.exists() and (ROOT / "task_glm47").exists()):
+        pytest.skip("缺数据")
+    import examples.task_deploy as td
+
+    out = tmp_path / "p.json"
+    monkeypatch.setattr(sys, "argv", [
+        "task_deploy", "--data", str(ROOT / "task_glm47"), "--config", str(CFG),
+        "--phase", "prefill", "--tasks", "gsm8k=1,mbpp=1,no_robots=1", "--expert-sets", str(es),
+        "--l0", "3", "--front-full", "--layer-times", str(lb), "--layer-time-key", "req@p512g512",
+        "--theory-times", "--measured-mem", "--mem-margin-gb", "0", "--kv-reserve-gb", "3",
+        "--mla-kv", "latent", "--endpoint-w", "0", "--single-front", "--balance-memory",
+        "--save-plan", str(out)])
+    assert td.main() == 0
+    assert out.read_bytes() == want.read_bytes()

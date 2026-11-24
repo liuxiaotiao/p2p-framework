@@ -1352,6 +1352,28 @@ python3 examples/task_deploy.py --data task_glm47 --config glm47flash/config.jso
 * 结果：前段 N13（T4，第 1–3 层，2.7GB），6 条后段每条 2 台、全在 A30 + RTX 上（第 4–23/24–47 层上下），
   13 台，N14 / N15 空闲；组合时延（理论）第 1 组 24.3–24.6ms、第 2 组 22.3–26.3ms，终审通过。
 
+### 5.20 换方案时节点互传（`deploy_15.sh fetch` 默认开，`PEERS=0` 关）
+
+同一个模型换方案（如 GLM 的 Petals → `plan_glm47_vllm_1f_theory`），新方案要的张量大多已经在集群里：
+`fetch` 先在 `$HOSTS_ALL`（默认 `task/hosts.txt`，15 台）的各台上用 `serve_weights` 把**现有**权重目录发出来
+（端口 `PEER_PORT`，默认 9400），每台按「本机旧权重 → 别的节点（按往返由近到远）→ 上游」取张量：
+
+* 对等节点只认**同一个模型**（`config.json` 一致）—— Qwen 的权重不会被当成 GLM 的；
+* 新文件先写成 `model.safetensors.next`，旧文件不动（别的节点可能还在读它）；**全部节点拉完**后控制机统一
+  `fetch --commit-staged` 换上。某台失败就不换，旧权重还在，重跑即可；
+* 某个对等节点中途掉线，它没给完的张量自动改从上游拿，结果不变（`tests/test_fetch_peers.py` 逐位核对）；
+* 要能同时放下新旧两份；放不下且 `REPLACE=1` 时那台先删旧的（它的张量不再复用、也不再给别人）。
+
+Petals → `plan_glm47_vllm_1f_theory`：13 台要的张量**全部**在 Petals 那 12 台上，上游只取 config / tokenizer。
+
+```bash
+source glm47flash/use_plan.sh glm47flash/plan_glm47_vllm_1f_theory.json
+HOSTS=task/hosts.txt bash ./deploy_15.sh stop
+bash ./deploy_15.sh sync && HOSTS=task/hosts.txt bash ./deploy_15.sh sync
+REPLACE=1 bash ./deploy_15.sh fetch
+bash ./deploy_15.sh verify
+```
+
 ## 6. 参考数值（用来判断复现是否正常）
 
 | 实验 | 指标 | 历史值 |

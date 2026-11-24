@@ -1067,6 +1067,25 @@ def _plan_once(
             + ("" if audit.passed else " —— 补位段不在公共带内，这是开 --fill-idle 的已知代价")
         )
 
+    if cfg.balance_memory:
+        # 同型号几台每层一样快，DP 切层在并列最优里取到的往往是「前面那台只放一两层、后面装满」。
+        # 时延不变的前提下重切，让每条链上剩得最少的那台尽量宽松（vLLM 的 KV cache 用的就是这部分）
+        from .exact import min_free_gb, rebalance_splits
+
+        moved = []
+        for u, segs in backs.items():
+            sp = back_specs.get(u)
+            if sp is None:
+                continue
+            for i, s in enumerate(segs):
+                r = rebalance_splits(s, sp, node_map, net)
+                if r.splits != s.splits:
+                    moved.append(f"{u}[{'+'.join(s.nodes)}] 最紧一台剩 "
+                                 f"{min_free_gb(s, sp, node_map):.1f}→{min_free_gb(r, sp, node_map):.1f}GB")
+                    segs[i] = r
+        log.append("[显存均衡] " + ("；".join(moved) if moved else "切层已经均衡，没动")
+                   + "（计算时延不变）")
+
     # ---------------- 部署清单 + 组合矩阵 ----------------------------------
     manifest: DeploymentManifest | None = None
     back_plc = {t.name: t.placement for t in tasks if t.placement is not None}

@@ -13,6 +13,7 @@
 #   ./deploy_15.sh verify     # 逐台核对权重齐不齐（只读文件头，几秒）
 #   ./deploy_15.sh refetch <节点>  # 清掉旧产物再单独重拉一台
 #   REPLACE=1 ./deploy_15.sh fetch   # 换方案：与新清单一致的节点跳过，其余先删旧权重再下
+#   PEERS=0 ./deploy_15.sh fetch     # 关掉节点互传（默认开：集群里已有的同模型张量从别的节点拿，缺的才去上游）
 #   PURGE_OLD=<旧权重目录> ./deploy_15.sh fetch   # 换模型：源站试通后，先删各台另一个模型的权重目录再下
 #   ./deploy_15.sh purge-weights <目录>  # 只删各台的某个权重目录（先列出、确认后才删；CONFIRM=1 不问）
 #   ./deploy_15.sh layerbench # 经 agent 逐台量每层耗时（不用 ssh/不停 agent）→ results/layer_bench.json
@@ -513,6 +514,15 @@ PYEOF
     echo "    给新模型腾地方。删掉的模型以后要用得重新下。各台情况先列出来："
     _purge_weights "$PURGE_OLD" 0 || return 1
   fi
+  local PEERARG=()
+  if [ "${PEERS:-1}" = 1 ]; then
+    PEERARG=(--peers --peer-hosts "${HOSTS_ALL:-task/hosts.txt}" --peer-port "${PEER_PORT:-9400}")
+    echo
+    echo "  节点互传（PEERS=1，默认）：先在 ${HOSTS_ALL:-task/hosts.txt} 的各台上把现有权重目录发出来"
+    echo "    （端口 ${PEER_PORT:-9400}），每台按「本机旧权重 → 别的节点（近的先）→ 上游」取张量 ——"
+    echo "    同一个模型换方案时，集群里已有的张量不再从 HF 下。新文件先写成 .next，全部拉完再统一换上，"
+    echo "    拉的过程中旧权重还在、还能给别的节点用。PEERS=0 关掉，退回各台直连上游。"
+  fi
   read -rp "  继续？[y/N] " a; [ "$a" = y ] || return 0
   if [ -n "${PURGE_OLD:-}" ]; then
     say "3b-0. 先删各台的 $PURGE_OLD"
@@ -521,7 +531,7 @@ PYEOF
   $PY -m p2pmoe.deploy.launch fetch --hosts "$HOSTS" --plan "$PLAN" \
       --out "$WEIGHTS" --python "$NODE_PY" --workdir "$WORKDIR" \
       --mode "$MODE" --timeout "$FETCH_TIMEOUT" --transport "$TRANSPORT" \
-      --progress-every "$PROGRESS_EVERY" "${REPARG[@]}" \
+      --progress-every "$PROGRESS_EVERY" "${REPARG[@]}" "${PEERARG[@]}" \
       "${SSHARG[@]}" "${SRCARG[@]}"
 }
 

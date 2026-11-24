@@ -449,6 +449,10 @@ class PlannerConfig:
     精确解几秒内；beam 在这种池子上会交出「一台 RTX 只放 1 层却占着」的链，害得下一条段
     无处可放、整轮回退（vLLM 单前段方案里 gsm8k 两条 9.8 / 83.5ms 因此没拉平）。
     single_front 时自动打开；默认关 —— 打开会改变已有方案（task_deploy --tighten-exact）。"""
+    balance_memory: bool = False
+    """建完、出清单之前，每条段在**原来那几台**上重新切层：计算时延不变（同型号每层一样快，
+    切法本来就有很多个并列最优），让链上剩余显存最少的那台尽量宽松（task_deploy --balance-memory）。
+    默认关 = 已有方案原样复现。给 vLLM 部署时打开：它的 KV cache 用的是权重之外剩下的显存。"""
     single_front: bool = False
     """只建**一条**前段、放在**一台**节点上，所有请求共用（task_deploy --single-front）。
 

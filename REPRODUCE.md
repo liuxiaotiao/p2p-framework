@@ -1374,6 +1374,23 @@ REPLACE=1 bash ./deploy_15.sh fetch
 bash ./deploy_15.sh verify
 ```
 
+### 5.21 给没有权重的节点拉几层、量真权重（`benchfetch` + `LB_MODE=disk`）
+
+不在清单里的节点（如空着的 T4）没有权重，layerbench 只能用随机权重。`benchfetch` 不看清单、直接给 `$HOSTS`
+各台拉指定几层的**全部专家**（同样走节点互传），`LB_MODE=disk` 让 agent 把盘上那几层临时装上量、量完释放：
+
+```bash
+grep -E '^N1[3-5][[:space:]]' task/hosts.txt > task/hosts_t4.txt
+HOSTS=task/hosts.txt bash ./deploy_15.sh sync
+HOSTS=task/hosts_t4.txt bash ./deploy_15.sh benchfetch 2-9      # GLM 第 2–9 层（8 个 MoE 层，约 10.2GB）
+HOSTS=task/hosts_t4.txt bash ./deploy_15.sh start
+HOSTS=task/hosts_t4.txt LB_MODE=disk bash ./deploy_15.sh layerbench
+python3 -m p2pmoe.deploy.layer_bench merge results/layer_bench/*.json --out glm47flash/layer_bench_wash1_glm47.json
+```
+
+层号 1-based、含两端；含第 1 层会带上词嵌入，含末层会带上输出头。这几台原有的权重会被换掉（同模型的张量复用），
+之后再按清单 fetch 时同样会复用。
+
 ## 6. 参考数值（用来判断复现是否正常）
 
 | 实验 | 指标 | 历史值 |

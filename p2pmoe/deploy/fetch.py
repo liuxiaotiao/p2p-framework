@@ -1062,6 +1062,29 @@ def keys_for_node(manifest: DeploymentManifest, node: str, *,
         with_embed=(role == "front" and p.is_head),
         with_lm_head=(role.startswith("back:") and p.is_tail),
     )
+    return keys_for_plan(plan, config=config, tie_word_embeddings=tie_word_embeddings)
+
+
+def layer_keyplan(spec: str, config: Mapping) -> KeyPlan:
+    """`--layers 2-9`：不看清单，直接要第 2–9 层（规划器口径，1-based）的**全部专家**。
+    含第 1 层就带上词嵌入，含末层就带上输出头。给不在清单里的节点拉几层来做逐层计时用。"""
+    lo_s, sep, hi_s = spec.replace(":", "-").partition("-")
+    try:
+        lo, hi = int(lo_s), int(hi_s if sep else lo_s)
+    except ValueError:
+        raise ValueError(f"--layers 的写法是 起-止（1-based，含两端），如 2-9；收到 {spec!r}") from None
+    n = int(config.get("num_hidden_layers", 0))
+    e = int(config.get("n_routed_experts") or config.get("num_experts")
+            or config.get("num_local_experts") or 0)
+    if not (1 <= lo <= hi <= n):
+        raise ValueError(f"--layers {spec}：要在 1..{n} 之内")
+    return KeyPlan(layer_experts={l: list(range(e)) for l in range(lo, hi + 1)},
+                   with_embed=(lo == 1), with_lm_head=(hi == n))
+
+
+def keys_for_plan(plan: KeyPlan, *, config: dict | None = None,
+                  tie_word_embeddings: bool | None = None) -> set[str]:
+    """KeyPlan → checkpoint 的 key 集合，按 config 的架构分派（与节点加载同一套规则）。"""
     cfg = config or {}
     if tie_word_embeddings is None:
         tie_word_embeddings = bool(cfg.get("tie_word_embeddings"))
@@ -1128,6 +1151,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--replace", action="store_true",
                     help="就地换方案：--out 里已经是这份清单要的张量就跳过；不是就**先删掉"
                          "旧权重**再下新的（磁盘放不下新旧两份时用）。config/tokenizer 保留")
+    ap.add_argument("--layers", default=None,
+                    help="不看清单，直接拉这几层（如 2-9，1-based 含两端）的全部专家 —— 给不在清单里的"
+                         "节点拉几层做逐层计时（deploy_15.sh benchfetch）。与 --plan 二选一")
     ap.add_argument("--peers", default=None,
                     help="别的节点的权重服务（serve_weights），如 N01=http://10.0.0.1:9400,…：同一个模型、"
                          "已经有的张量从它们那里拿（局域网），缺的才去上游。隐含 --reuse")
@@ -1157,7 +1183,7 @@ def main(argv: list[str] | None = None) -> int:
                  transport=args.transport)
     if not args.diagnose and args.out is None:
         ap.error("要给 --out")
-    if not (args.meta_only or args.diagnose) and not (args.plan and args.node):
+    if not (args.meta_only or args.diagnose or args.layers) and not (args.plan and args.node):
         ap.error("要么给 --plan 与 --node（拉本机那份权重），"
                  "要么给 --meta-only（只拉 config 与 tokenizer）"
                  "或 --diagnose（只诊断源站）")
@@ -1318,12 +1344,22 @@ def main(argv: list[str] | None = None) -> int:
                  "节点上的同名目录才有。")
         return 0
 
-    keys = keys_for_node(man, args.node, config=cfg)
-    p = man.plan_for(args.node)
     arch = str(cfg.get("model_type", "?"))
-    log.info("节点 %s：%s，层 %d–%d，%d 个专家（架构 %s，%d 个张量）",
-             args.node, p.role, p.layer_range[0], p.layer_range[1],
-             sum(len(l.experts) for l in p.layers), arch, len(keys))
+    if args.layers:
+        try:
+            kp = layer_keyplan(args.layers, cfg)
+        except ValueError as e:
+            log.error("%s", e)
+            return 2
+        keys = keys_for_plan(kp, config=cfg)
+        log.info("节点 %s：不按清单，拉第 %s 层的全部专家（架构 %s，%d 个张量）",
+                 args.node or "本机", args.layers, arch, len(keys))
+    else:
+        keys = keys_for_node(man, args.node, config=cfg)
+        p = man.plan_for(args.node)
+        log.info("节点 %s：%s，层 %d–%d，%d 个专家（架构 %s，%d 个张量）",
+                 args.node, p.role, p.layer_range[0], p.layer_range[1],
+                 sum(len(l.experts) for l in p.layers), arch, len(keys))
     log.info("来源 %s", src)
 
     if args.reuse or args.peers:

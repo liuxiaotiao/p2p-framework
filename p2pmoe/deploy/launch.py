@@ -482,8 +482,8 @@ def _fetch_all(hosts, args) -> int:
     清单**不**推过去 —— 各节点只需要知道自己那一份，而 `--node` 加上清单里的
     条目就够了。所以清单文件得在各节点上能读到（跟代码一起 rsync 过去即可）。
     """
-    if not args.plan:
-        print("fetch 需要 --plan（部署清单）")
+    if not (args.plan or getattr(args, "layers", None)):
+        print("fetch 需要 --plan（部署清单），或 --layers 2-9（不看清单、直接拉这几层）")
         return 2
     if not (args.repo or args.endpoint or args.base_url or args.src):
         print("fetch 需要一个权重源：--repo / --endpoint / --base-url / --src")
@@ -505,8 +505,10 @@ def _fetch_all(hosts, args) -> int:
 
 def _fetch_all_inner(hosts, args, out: str, peers: Mapping[str, str]) -> int:
     def cmd_for(h) -> str:
+        what = (["--layers", args.layers] if getattr(args, "layers", None)
+                else ["--plan", str(args.plan)])
         parts = [args.python, "-m", "p2pmoe.deploy.fetch",
-                 "--plan", str(args.plan), "--node", h.node_id,
+                 *what, "--node", h.node_id,
                  "--out", f"{out}/{h.node_id}" if args.per_node_dir else out,
                  "--mode", args.mode]
         if getattr(args, "replace", False):
@@ -556,7 +558,7 @@ def _fetch_all_inner(hosts, args, out: str, peers: Mapping[str, str]) -> int:
     # 各节点并行拉 —— 这正是不经控制机中转的意义
     stop = threading.Event()
     mon: threading.Thread | None = None
-    if args.progress_every > 0 and not args.local:
+    if args.progress_every > 0 and not args.local and args.plan:
         exp = _expected_bytes(args.plan, args.per_node_dir)
         if exp:
             print(f"  每 {args.progress_every:.0f}s 报一次进度"
@@ -658,6 +660,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="改成 <out>/<节点id>。只在同机演练（多个 agent 在一台机器上）"
                          "时需要，真机上别开")
     ap.add_argument("--mode", choices=("slice", "shard"), default="slice")
+    ap.add_argument("--layers", default=None,
+                    help="fetch：不看清单，各台都拉这几层（如 2-9）的全部专家 —— 给逐层计时用")
     ap.add_argument("--peers", action="store_true",
                     help="fetch：节点互传 —— 先在 --peer-hosts 的各台上把现有权重目录用 serve_weights 发出来，"
                          "各节点先复用本机旧权重、再从别的节点拿，缺的才去上游；全部拉完后统一换上")

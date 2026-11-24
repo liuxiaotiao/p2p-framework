@@ -17,6 +17,7 @@
 #   PURGE_OLD=<旧权重目录> ./deploy_15.sh fetch   # 换模型：源站试通后，先删各台另一个模型的权重目录再下
 #   ./deploy_15.sh purge-weights <目录>  # 只删各台的某个权重目录（先列出、确认后才删；CONFIRM=1 不问）
 #   ./deploy_15.sh layerbench # 经 agent 逐台量每层耗时（不用 ssh/不停 agent）→ results/layer_bench.json
+#   ./deploy_15.sh benchfetch 2-9  # 给 $HOSTS 各台拉这几层的全部专家，再 LB_MODE=disk layerbench 量真权重
 #   ./deploy_15.sh identity   # 15 个 id 是不是落在 15 台不同机器/目录上
 #   ./deploy_15.sh whereis    # 权重在哪、内存被谁占着（目录空了但内存满时用）
 #   ./deploy_15.sh disk       # 逐台磁盘：份额 vs 实占 vs 幽灵，一张表
@@ -647,6 +648,30 @@ cmd_purge_weights() {
     read -rp "  真删？删掉的模型以后要用得重新下 [y/N] " a; [ "$a" = y ] || return 0
   fi
   _purge_weights "$dir" 1
+}
+
+# 给不在清单里的节点（如空着的 T4）拉几层的全部专家，供逐层计时量真权重（LB_MODE=disk）：
+#   HOSTS=task/hosts_t4.txt bash ./deploy_15.sh benchfetch 2-9
+# 同样走节点互传（PEERS=1 默认）：集群里已有的同模型张量从别的节点拿，缺的才去上游。
+cmd_benchfetch() {
+  local rng=${1:-}
+  [ -n "$rng" ] || { echo "用法: HOSTS=<这几台的 hosts> $0 benchfetch <起-止层，1-based，如 2-9>"; exit 1; }
+  need "$HOSTS"
+  say "B. 给 $(_n_hosts) 台拉第 $rng 层（全部专家），供 LB_MODE=disk 逐层计时"
+  _require_node_py || return 1
+  SRCARG=()
+  if [ -n "$SRC_DIR" ]; then SRCARG=(--src "$SRC_DIR")
+  elif [ -n "$SRC_URL" ]; then SRCARG=(--base-url "$SRC_URL")
+  else SRCARG=(--repo "$REPO" ${HF_ENDPOINT:+--endpoint "$HF_ENDPOINT"}); fi
+  local PEERARG=()
+  [ "${PEERS:-1}" = 1 ] && PEERARG=(--peers --peer-hosts "${HOSTS_ALL:-task/hosts.txt}" --peer-port "${PEER_PORT:-9400}")
+  awk '{sub(/#.*/,"")} NF>=2 {printf "    %s", $1} END {print ""}' "$HOSTS"
+  echo "  ⚠ 这几台 $WEIGHTS 里原有的权重会被换成第 $rng 层（同模型的张量会复用，不重下）"
+  read -rp "  继续？[y/N] " a; [ "$a" = y ] || return 0
+  $PY -m p2pmoe.deploy.launch fetch --hosts "$HOSTS" --layers "$rng" \
+      --out "$WEIGHTS" --python "$NODE_PY" --workdir "$WORKDIR" \
+      --mode "$MODE" --timeout "$FETCH_TIMEOUT" --transport "$TRANSPORT" \
+      --progress-every 0 "${PEERARG[@]}" "${SSHARG[@]}" "${SRCARG[@]}"
 }
 
 cmd_start() {
@@ -1631,6 +1656,7 @@ case "$action" in
   verify)  cmd_verify "${1:-}" ;;
   refetch) cmd_refetch "${1:-}" ;;
   purge-weights) cmd_purge_weights "${1:-}" ;;
+  benchfetch) cmd_benchfetch "${1:-}" ;;
   layerbench) cmd_layerbench ;;
   identity) cmd_identity ;;
   whereis) cmd_whereis "${1:-}" ;;
@@ -1646,6 +1672,6 @@ case "$action" in
   status)  cmd_status ;;
   continuous) cmd_continuous "$@" ;;
   all)     cmd_sync && cmd_check && cmd_fetch && cmd_start && cmd_serve "$@" ;;
-  *) echo "用法: $0 {sync|bootstrap|cmds|check|fetch|meta|diag|serve-weights|verify|refetch|purge-weights|layerbench|identity|whereis|disk|start|status|serve|measure|continuous|report|logs|doctor|stop|all}
+  *) echo "用法: $0 {sync|bootstrap|cmds|check|fetch|meta|diag|serve-weights|verify|refetch|purge-weights|benchfetch|layerbench|identity|whereis|disk|start|status|serve|measure|continuous|report|logs|doctor|stop|all}
        serve/measure 后面的参数原样透传给 control.py"; exit 1 ;;
 esac

@@ -166,7 +166,7 @@ def _print_table(m: dict) -> None:
         print(f"\n{title}")
         print(f"  {'节点':<6}{'GPU':<22}{'权重':<7}" + "".join(f"{k.split('@')[1]:>8}" for k in ks))
         for n, v in m["per_node"].items():
-            src = {"loaded": "已加载", "synthetic": "随机"}.get(v.get("source"), "?")
+            src = {"loaded": "已加载", "synthetic": "随机", "disk": "盘上"}.get(v.get("source"), "?")
             print(f"  {n:<6}{str(v['gpu'])[:21]:<22}{src:<7}" + "".join(f3(v.get(k)) for k in ks))
         for g, gv in m["per_gpu"].items():
             print(f"  {'均值':<6}{g[:21]:<22}{'':<7}"
@@ -191,7 +191,8 @@ def _print_table(m: dict) -> None:
 # --------------------------------------------------------------------------- #
 def run_remote(addrs: Mapping[str, tuple[str, int]], *, hf_config: Mapping | None,
                mode: str = "auto", opts: Mapping | None = None, timeout: float = 900.0,
-               relay=None, parallel: int = 16, on_done=None) -> tuple[dict, dict]:
+               relay=None, parallel: int = 16, on_done=None,
+               model_dir: str | None = None) -> tuple[dict, dict]:
     """从控制机让每个 agent 在**自己的 GPU**上计时，收回结果。
 
     不经 ssh、不停 agent：走控制面的 TCP（与 capabilities / configure 同一条路）。
@@ -204,6 +205,8 @@ def run_remote(addrs: Mapping[str, tuple[str, int]], *, hf_config: Mapping | Non
     from ..runtime.wire import rpc
 
     msg = {"type": "layer_bench", "mode": mode, **(opts or {})}
+    if model_dir:
+        msg["model_dir"] = model_dir           # disk 模式：节点上的权重目录（各机同一个路径）
     if hf_config is not None:
         msg["hf_config"] = dict(hf_config)
 
@@ -300,8 +303,9 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--out", type=Path, default=None)
     rm = sub.add_parser("remote", help="在控制机上一条命令量完所有 agent（不用 ssh、不用停 agent）")
     rm.add_argument("--agents", required=True, help="N01=ip:port,N02=ip:port,…（deploy_15.sh 的 AGENTS）")
-    rm.add_argument("--mode", choices=("auto", "loaded", "synthetic"), default="auto",
-                    help="auto：装着权重就量已加载的层，没装就用随机权重；loaded / synthetic 强制其一")
+    rm.add_argument("--mode", choices=("auto", "loaded", "synthetic", "disk"), default="auto",
+                    help="auto：装着权重就量已加载的层，没装就用随机权重；loaded / synthetic 强制其一；"
+                         "disk：把节点权重目录里现有的那几层临时装上量（deploy_15.sh benchfetch 拉的）")
     rm.add_argument("--model-dir", default=None, help="控制机上读 config.json（给随机权重模式定形状）")
     rm.add_argument("--config", default=None, help="没有 config.json 时用预置名，如 qwen3-30b-a3b")
     rm.add_argument("--layers", type=int, default=4, help="随机权重模式一次建几层")
@@ -381,14 +385,15 @@ def main(argv: list[str] | None = None) -> int:
             (a.out_dir / f"{node}.json").write_text(
                 json.dumps(res, ensure_ascii=False, indent=1), encoding="utf-8")
             v = next(iter(res["variants"].values()))
-            src = {"loaded": "已加载权重", "synthetic": "随机权重"}[res["setup"]["source"]]
+            src = {"loaded": "已加载权重", "synthetic": "随机权重",
+                   "disk": "盘上的权重"}.get(res["setup"]["source"], res["setup"]["source"])
             lay = f"层 {v['layers'][0]}–{v['layers'][1]}" if "layers" in v else f"{res['setup']['n_layers']} 层"
             d = v["decode"].get(a.key.partition("@")[2]) if a.key.startswith("decode") else None
             print(f"  ✓ {node}  {res['gpu'].get('name')}  {src}（{lay}）"
                   + (f"  {a.key} = {d['median']:.3f} ms/层" if d and "median" in d else ""))
 
         got, bad = run_remote(addrs, hf_config=hf, mode=a.mode, opts=opts, timeout=a.timeout,
-                              relay=relay, on_done=done)
+                              relay=relay, on_done=done, model_dir=a.model_dir)
         if not got:
             print("一台都没量成")
             return 1

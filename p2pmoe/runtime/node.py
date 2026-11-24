@@ -368,75 +368,23 @@ class NodeServer:
 
         torch / safetensors 是**可选依赖**（requirements-node.txt）——
         只有配成 backend="torch" 的节点才会走到这里，控制机永远不会。
+        分派与加载在 `loader.load_segment_model`（逐层计时的 disk 模式也用它）。
         """
-        from .weights import (
-            KeyPlan, SelectiveLoader, WeightIndex, qwen3_next_keys, qwen_moe_keys,
-        )
+        from .loader import load_segment_model
 
         if not cfg.model_dir:
             raise ValueError("backend='torch' 需要 model_dir")
-
-        # 按 checkpoint 自报的架构分派。**不要按「有没有某个字段」去猜** ——
-        # 猜错的代价是加载一个结构不对的模型，而它不会报错，只会算出垃圾。
-        arch = str(cfg.model.get("model_type", "")).lower()
-        archs = [str(a).lower() for a in cfg.model.get("architectures", [])]
-        is_next = arch == "qwen3_next" or any("qwen3next" in a for a in archs)
-        from .glm4_moe_lite import is_glm4_moe_lite
-
-        is_glm = is_glm4_moe_lite(cfg.model)
-
-        idx = WeightIndex(self.resolve_dir(cfg.model_dir))
-        plan = KeyPlan(layer_experts=cfg.layer_experts,
-                       with_embed=cfg.with_embed, with_lm_head=cfg.with_lm_head)
-        if is_glm:
-            # GLM-4.7-Flash：MLA + dense 第 0 层 + 共享专家 + sigmoid 路由（glm4_moe_lite.py）。
-            # 路由器两项要 fp32 —— 先按 checkpoint 原样读，再逐项转
-            from .glm4_moe_lite import GlmModelConfig, GlmSegmentModel, glm_keys
-
-            mcfg = GlmModelConfig.from_hf(cfg.model)
-            keys = glm_keys(plan, mcfg)
-            tensors, rep = SelectiveLoader(idx).load(keys, device=cfg.device, dtype=None)
-            if rep.missing:
-                raise KeyError(f"checkpoint 缺 {len(rep.missing)} 个 key，首个: {rep.missing[0]}")
-            self.model = GlmSegmentModel(mcfg, cfg.layer_experts, mcfg.cast(tensors),
-                                         device=cfg.device, miss_policy=cfg.miss_policy)
-            return mcfg, {
-                "loaded_gb": round(rep.bytes_loaded / 1e9, 3),
-                "ckpt_gb": round(rep.bytes_total / 1e9, 3),
-                "load_fraction": round(rep.fraction, 4),
-                "shards": f"{rep.shards_opened}/{rep.shards_total}",
-                "model_dir": self.resolve_dir(cfg.model_dir),
-                "arch": "glm4_moe_lite",
-            }
-        if is_next:
-            from .qwen3_next import NextModelConfig, TorchNextSegmentModel
-
-            mcfg = NextModelConfig.from_hf(cfg.model)
-            keys = qwen3_next_keys(
-                plan, layer_types=list(mcfg.layer_types),
-                shared_expert=mcfg.shared_intermediate > 0,
-                tie_word_embeddings=mcfg.tie_word_embeddings)
-            SegModel = TorchNextSegmentModel
-        else:
-            from .torch_model import TorchModelConfig, TorchSegmentModel
-
-            mcfg = TorchModelConfig.from_hf(cfg.model)
-            keys = qwen_moe_keys(plan, tie_word_embeddings=mcfg.tie_word_embeddings)
-            SegModel = TorchSegmentModel
-        tensors, rep = SelectiveLoader(idx).load(
-            keys, device=cfg.device, dtype=mcfg.torch_dtype
-        )
-        if rep.missing:
-            raise KeyError(f"checkpoint 缺 {len(rep.missing)} 个 key，首个: {rep.missing[0]}")
-        self.model = SegModel(mcfg, cfg.layer_experts, tensors, device=cfg.device,
-                              miss_policy=cfg.miss_policy)
+        d = self.resolve_dir(cfg.model_dir)
+        self.model, mcfg, rep, arch = load_segment_model(
+            cfg.model, d, cfg.layer_experts, with_embed=cfg.with_embed,
+            with_lm_head=cfg.with_lm_head, device=cfg.device, miss_policy=cfg.miss_policy)
         return mcfg, {
             "loaded_gb": round(rep.bytes_loaded / 1e9, 3),
             "ckpt_gb": round(rep.bytes_total / 1e9, 3),
             "load_fraction": round(rep.fraction, 4),
             "shards": f"{rep.shards_opened}/{rep.shards_total}",
-            "model_dir": self.resolve_dir(cfg.model_dir),
-            "arch": "qwen3_next" if is_next else "qwen3_moe",
+            "model_dir": d,
+            "arch": arch,
         }
 
     # -- 服务循环 ---------------------------------------------------------- #
@@ -892,6 +840,9 @@ class NodeServer:
                 if k in h}
         loaded = self.model is not None and hasattr(self.model, "blocks")
         try:
+            if mode == "disk":
+                return {"ok": True, "node": self.me,
+                        "result": self._bench_disk(h, opts, loaded)}
             if mode == "loaded" or (mode == "auto" and loaded):
                 if not loaded:
                     raise BenchError("还没装权重（没收过 configure）—— 用 --mode synthetic，"
@@ -909,6 +860,42 @@ class NodeServer:
             return {"ok": True, "node": self.me, "result": res}
         except BenchError as e:
             return {"ok": False, "node": self.me, "why": str(e)}
+
+    def _bench_disk(self, h: dict, opts: dict, loaded: bool) -> dict:
+        """disk 模式：把本机权重目录里**现有的那几层**（deploy_15.sh benchfetch 拉的）临时装上量，
+        量完就释放。用于不在清单里、没收过 configure 的节点（如空着的 T4）。"""
+        import json as _json
+        from pathlib import Path as _Path
+
+        from .layer_bench import BenchError, bench_loaded
+        from .loader import disk_layout, load_segment_model
+        from .weights import WeightIndex, release_cuda_cache
+
+        if loaded:
+            raise BenchError("本节点已经装着清单里的权重 —— 用 --mode loaded 量它，"
+                             "或者先 stop 再起 agent")
+        d = self.resolve_dir(h.get("model_dir"))
+        if not d or not (_Path(d) / "config.json").is_file():
+            raise BenchError(f"disk 模式要 model_dir（节点上的权重目录，里面有 config.json），收到 {d!r}")
+        try:
+            idx = WeightIndex(d)
+        except FileNotFoundError as e:
+            raise BenchError(f"{d} 里没有权重 —— 先 deploy_15.sh benchfetch：{e}") from None
+        hf = _json.loads((_Path(d) / "config.json").read_text(encoding="utf-8"))
+        le, emb, head = disk_layout(idx.weight_map, hf)
+        if not le:
+            raise BenchError(f"{d} 里一层都没有")
+        dev = str(h.get("device") or "cuda")
+        model, _, rep, arch = load_segment_model(hf, d, le, with_embed=emb, with_lm_head=head,
+                                                 device=dev, miss_policy="local_topk")
+        try:
+            res = bench_loaded(model, node=self.me, **opts)
+            res["setup"]["source"] = "disk"
+            res["model"]["arch"] = arch
+            return res
+        finally:
+            del model
+            release_cuda_cache()
 
     def capabilities(self) -> dict:
         """上报本机能力。规划器的 Node 表就是由这些回包拼出来的。"""

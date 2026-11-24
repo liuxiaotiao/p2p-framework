@@ -343,6 +343,16 @@ def main() -> int:
             print(f"  KV       每台固定留 {args.kv_reserve_gb:g}GB（每 token 每层 {kv_tok:.0f}B；"
                   f"放 30 层的节点约可容 {args.kv_reserve_gb * 1e9 / (kv_tok * 30):,.0f} token）")
         print(f"  首尾额外 前段 head 词嵌入 {spec.embed_gb:.3f}GB，后段 tail 输出头 {spec.lm_head_gb:.3f}GB（已计入）")
+    if spec.dense_layers and all(p.n_layers + len(spec.dense_layers) == info.n_layers
+                                 for p in profiles.values()):
+        from p2pmoe.planner.from_data import pad_dense_layers
+
+        profiles = {u: pad_dense_layers(p, spec.dense_layers, info.n_layers)
+                    for u, p in profiles.items()}
+        dl = sorted(spec.dense_layers)
+        print(f"  dense 层 {dl}（没有路由专家，每层 {dict(spec.dense_layer_gb)[dl[0]]:.3f}GB）："
+              f"激活统计只有 {info.n_layers - len(dl)} 个 MoE 层 → 对齐到模型的第 "
+              f"{len(dl) + 1}–{info.n_layers} 层，dense 层按均匀分布补（不参与识别）")
     bad = [u for u, p in profiles.items()
            if (p.n_layers, p.n_experts) != (info.n_layers, info.n_experts)]
     if bad:
@@ -367,7 +377,7 @@ def main() -> int:
         plc, es_info = load_expert_sets(
             args.expert_sets, key=args.expert_set_key, tasks=sorted(lam),
             n_layers=info.n_layers, n_experts=info.n_experts, min_experts=info.top_k,
-            profiles=profiles)
+            profiles=profiles, dense_layers=spec.dense_layers)
         print(f"  驻留集来自 {args.expert_sets}（{args.expert_set_key}；"
               f"{es_info.get('rule') or ''}）")
         for u, p in sorted(plc.items()):

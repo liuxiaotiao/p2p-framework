@@ -1331,6 +1331,27 @@ layerbench 用随机权重建 4 个 MoE 层（第 2–5 层；第 1 层 dense �
 还没做的：GLM 的 task 选择器（`LR_MODEL` 置空）、规划器对 GLM 的适配（dense 层、层号对齐），以及
 对话模板 / 停止符的端到端核对 —— 拉权重和逐层计时用不到这些。
 
+### 5.19 GLM-4.7-Flash：按理论算力规划（单前段，`glm47flash/plan_glm47_1f_theory.json`）
+
+GLM 第 1 层是 dense，激活统计（`task_glm47/*.csv`）与驻留集（`glm47flash/glm47_expert_sets_90_union.json`）都只有
+46 个 MoE 层。规划器按 config 的 `first_k_dense_replace` 认出 dense 层：画像在第 1 层补均匀分布（各 task 一样，
+不参与识别），驻留集补全集；第 1 层的权重按 dense 记（注意力 + SwiGLU 0.169GB，`ModelSpec.layer_gb`），
+与专家数无关。Qwen 的方案不受影响（没有 dense 层，`tests/test_single_front.py` 原样复现）。
+
+```bash
+python3 examples/task_deploy.py --data task_glm47 --config glm47flash/config.json --phase prefill \
+  --tasks gsm8k=1,mbpp=1,no_robots=1 --expert-sets glm47flash/glm47_expert_sets_90_union.json \
+  --l0 3 --front-full --single-front --endpoint-w 0 --save-plan glm47flash/plan_glm47_1f_theory.json
+```
+
+* 计算按拓扑 `compute_capacity` 的反比（A30 0.35、RTX6000 0.443、T4 0.889 ms/层），显存按标称（`memory_capacity`
+  − `--reserve-gb 1`，KV 按 `--ctx 2048`）—— GLM 的 layerbench 还没有，不加 `--layer-times` / `--measured-mem`；
+  标称口径下前段的词嵌入、后段末台的输出头（各约 0.63GB）不计，量完 layerbench 换 `--measured-mem` 重出；
+* L₀ = 3：dense 第 1 层 + 2 个 MoE 层，与 Qwen 的 L₀ = 2（2 个 MoE 层，L2 选择器）同口径。直方图的识别率下界
+  只有 52%（Chernoff 界偏保守，Qwen 在 L₀ = 2 时也只有 53.5%，实际选择器 98%），GLM 的选择器还没训；
+* 结果：前段 N13（T4，第 1–3 层，2.7GB），6 条后段每条 2 台、全在 A30 + RTX 上（第 4–23/24–47 层上下），
+  13 台，N14 / N15 空闲；组合时延（理论）第 1 组 24.3–24.6ms、第 2 组 22.3–26.3ms，终审通过。
+
 ## 6. 参考数值（用来判断复现是否正常）
 
 | 实验 | 指标 | 历史值 |

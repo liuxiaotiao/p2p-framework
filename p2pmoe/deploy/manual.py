@@ -287,7 +287,7 @@ def _load(spec: ManualSpec, model: ModelSpec, layer: int,
           chan: "ChannelLayout | None") -> LayerLoad:
     es = spec.experts_at(layer, model.n_experts, chan)
     return LayerLoad(layer=layer, experts=es,
-                     weight_gb=model.weight_gb_per_layer(len(es)),
+                     weight_gb=model.layer_gb(layer, len(es)),
                      kv_gb=model.kv_gb_per_layer)
 
 
@@ -360,8 +360,8 @@ def memory_report(
             for i, v in enumerate(seg.nodes):
                 lo, hi = seg.splits[i]
                 need[v] = sum(
-                    model.weight_gb_per_layer(
-                        len(spec.experts_at(l, model.n_experts, chan)))
+                    model.layer_gb(
+                        l, len(spec.experts_at(l, model.n_experts, chan)))
                     + model.kv_gb_per_layer
                     for l in range(lo, hi + 1)
                 )

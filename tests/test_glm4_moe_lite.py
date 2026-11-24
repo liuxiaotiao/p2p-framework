@@ -173,3 +173,38 @@ def test_resident_subset_and_miss_policies():
         assert st.miss_token_layer > 0 and 0 < st.miss_mass <= 6
         assert bool(torch.isfinite(y).all())
         assert st.layers[2].count.sum() == 6 * 4       # 统计永远按全量路由
+
+
+def test_dense_layer_is_aligned_and_sized():
+    """激活统计 / 驻留集只有 46 个 MoE 层：补上 dense 第 1 层（均匀分布、不进识别），
+    第 1 层权重按 dense 记（注意力 + SwiGLU 0.169GB），与驻留专家数无关。"""
+    from p2pmoe.planner.experts import ActivationProfile
+    from p2pmoe.planner.from_data import pad_dense_layers
+    from p2pmoe.planner.hf_config import model_spec_from_hf
+
+    spec, _ = model_spec_from_hf(_cfg())
+    assert spec.dense_layers == {1}
+    assert spec.layer_gb(1, 64) == pytest.approx(0.169, abs=0.001)
+    assert spec.layer_gb(2, 64) == pytest.approx(1.271, abs=0.002)
+    p = ActivationProfile("t", 46, 64, tuple(tuple([0.0] * 63 + [1.0]) for _ in range(46)))
+    q = pad_dense_layers(p, spec.dense_layers, 47)
+    assert q.n_layers == 47 and q.at(1) == tuple([1 / 64] * 64) and q.at(2)[63] == 1.0
+
+
+def test_theory_plan_is_reproducible(tmp_path, monkeypatch):
+    want = ROOT / "glm47flash" / "plan_glm47_1f_theory.json"
+    es = ROOT / "glm47flash" / "glm47_expert_sets_90_union.json"
+    if not (want.exists() and es.exists() and (ROOT / "task_glm47").exists()):
+        pytest.skip("缺 glm47flash/ 或 task_glm47/")
+    import examples.task_deploy as td
+
+    out = tmp_path / "p.json"
+    monkeypatch.setattr(sys, "argv", [
+        "task_deploy", "--data", str(ROOT / "task_glm47"), "--config", str(CFG),
+        "--phase", "prefill", "--tasks", "gsm8k=1,mbpp=1,no_robots=1", "--expert-sets", str(es),
+        "--l0", "3", "--front-full", "--single-front", "--endpoint-w", "0", "--save-plan", str(out)])
+    assert td.main() == 0
+    assert out.read_bytes() == want.read_bytes()
+    plan = json.loads(want.read_text())
+    f = plan["segments"]["F0"]
+    assert f["splits"] == [[1, 3]] and len(f["nodes"]) == 1

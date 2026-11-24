@@ -270,7 +270,7 @@ def _layer_loads(
             LayerLoad(
                 layer=l,
                 experts=experts,
-                weight_gb=model.weight_gb_per_layer(len(experts)),
+                weight_gb=model.layer_gb(l, len(experts)),
                 kv_gb=model.kv_gb_per_layer,
             )
         )

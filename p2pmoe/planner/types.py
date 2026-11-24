@@ -87,6 +87,21 @@ class ModelSpec:
     `task_deploy --measured-mem` 时按 vocab × d_model × dtype 填上。"""
     lm_head_gb: float = 0.0
     """输出头 + 最终 norm，后段 tail 那台要多装它。默认 0 = 旧口径（不计）。"""
+    dense_layer_gb: tuple[tuple[int, float], ...] = ()
+    """没有路由专家的层：((层号 1-based, 这一层的权重 GB), …)。GLM-4.7-Flash 的第 1 层是普通
+    SwiGLU（checkpoint 第 0 层，`first_k_dense_replace=1`）。这些层的权重与驻留专家数无关，
+    `layer_gb` 直接返回这里的值。默认空 = 每层都是 MoE（Qwen 系），行为不变。"""
+
+    @property
+    def dense_layers(self) -> frozenset[int]:
+        return frozenset(l for l, _ in self.dense_layer_gb)
+
+    def layer_gb(self, layer: int, n_resident_experts: int) -> float:
+        """第 layer 层（1-based）驻留 n 个专家时的权重量；dense 层与 n 无关。"""
+        for l, gb in self.dense_layer_gb:
+            if l == layer:
+                return gb
+        return self.weight_gb_per_layer(n_resident_experts)
 
     @property
     def kv_gb_per_layer(self) -> float:

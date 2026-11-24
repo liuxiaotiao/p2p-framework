@@ -41,10 +41,28 @@ __all__ = ["load_activation_csv", "load_topology", "FabricOracle", "TopoInfo",
 
 
 # --------------------------------------------------------------------------- #
+def pad_dense_layers(prof: ActivationProfile, dense_layers, n_layers: int) -> ActivationProfile:
+    """只统计了 MoE 层的画像 → 补上 dense 层，对齐到模型的层号。
+
+    GLM-4.7-Flash 第 1 层（checkpoint 第 0 层）是 dense：采集脚本只记 46 个 MoE 层，CSV 第 k 行
+    = 规划器第 k+2 层。dense 层没有路由，这里填**均匀分布**：各 task 完全一样，识别率
+    （Bhattacharyya 距离）上贡献为 0，也不会让哪个专家显得「热」。"""
+    dense = sorted(int(l) for l in dense_layers)
+    if prof.n_layers + len(dense) != n_layers:
+        raise ValueError(f"{prof.task}：画像 {prof.n_layers} 层 + dense {len(dense)} 层 ≠ 模型 {n_layers} 层")
+    flat = tuple([1.0 / prof.n_experts] * prof.n_experts)
+    rows, it = [], iter(prof.mass)
+    for l in range(1, n_layers + 1):
+        rows.append(flat if l in dense else next(it))
+    return ActivationProfile(task=prof.task, n_layers=n_layers, n_experts=prof.n_experts,
+                             mass=tuple(rows))
+
+
 def load_expert_sets(
     path: str | Path, *, key: str = "union", tasks: Sequence[str] | None = None,
     n_layers: int | None = None, n_experts: int | None = None, min_experts: int = 1,
     profiles: Mapping[str, ActivationProfile] | None = None,
+    dense_layers=(),
 ) -> tuple[dict, dict]:
     """外部给定的逐层驻留集 → `{task: ExpertPlacement}`，外加一份说明。
 
@@ -75,6 +93,12 @@ def load_expert_sets(
         rows = e[key] if isinstance(e, Mapping) else e
         if isinstance(e, Mapping) and key not in e:
             raise ValueError(f"{u} 没有 {key!r}；有的是 {[k for k in e if isinstance(e[k], list)]}")
+        dense = sorted(int(l) for l in dense_layers)
+        if dense and n_layers is not None and len(rows) + len(dense) == n_layers:
+            # 只列了 MoE 层（GLM-4.7-Flash 的 46 层）：dense 层补上全集（反正不加载专家）
+            full = list(range(n_experts or 0))
+            it = iter(rows)
+            rows = [full if l in dense else next(it) for l in range(1, n_layers + 1)]
         L = len(rows)
         if n_layers is not None and L != n_layers:
             raise ValueError(f"{u} 的驻留集有 {L} 层，模型是 {n_layers} 层 —— 不是同一个模型")

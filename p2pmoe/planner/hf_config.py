@@ -58,6 +58,15 @@ class HFModelInfo:
     mla_attn_params: int = 0
     """一层 MLA 的参数量（q_a/q_b/kv_a/kv_b/o 与两个低秩 norm）。>0 时 attn_gb 用它。"""
     mla_kv_dim: int = 0
+    dense_layers: tuple[int, ...] = ()
+    """没有路由专家的层（1-based）。GLM-4.7-Flash：(1,)。"""
+    dense_intermediate: int = 0
+    """dense 层 SwiGLU 的中间维（GLM-4.7-Flash：10240）。"""
+
+    @property
+    def dense_gb(self) -> float:
+        """一个 dense 层的权重量：注意力 + SwiGLU。"""
+        return self.attn_gb + 3 * self.d_model * self.dense_intermediate * self.dtype_bytes / 1e9
     """展开后的 KV 维度折成 ModelSpec 的口径（K、V 各算一份）：头数 × (qk_head + v_head) / 2。"""
 
     # -- 逐层拆解（GB） -------------------------------------------------- #
@@ -208,6 +217,13 @@ def model_spec_from_hf(
     n_heads = int(_get(cfg, "num_attention_heads"))
     head_dim = int(_get(cfg, "head_dim", default=d_model // n_heads))
     mla_params = mla_kv = 0
+    # 前几层是 dense（没有路由专家）：GLM-4.7-Flash 的 first_k_dense_replace / mlp_layer_types
+    n_all = int(_get(cfg, "num_hidden_layers"))
+    if cfg.get("mlp_layer_types"):
+        dense = tuple(i + 1 for i, t in enumerate(cfg["mlp_layer_types"]) if t == "dense")
+    else:
+        dense = tuple(range(1, int(cfg.get("first_k_dense_replace") or 0) + 1))
+    dense = tuple(l for l in dense if l <= n_all)
     shared = int(_get(cfg, "shared_expert_intermediate_size", default=0))
     if cfg.get("kv_lora_rank"):
         # MLA（GLM-4.7-Flash）：q 低秩、kv 压缩后再展开；KV 按展开后的大小记（与运行时一致）
@@ -243,6 +259,8 @@ def model_spec_from_hf(
         conv_kernel=int(_get(cfg, "linear_conv_kernel_dim", default=0)),
         mla_attn_params=mla_params,
         mla_kv_dim=mla_kv,
+        dense_layers=dense,
+        dense_intermediate=int(cfg.get("intermediate_size") or 0) if dense else 0,
     )
     # 混合模型的 KV 逐层不同，规划器的 ModelSpec 只吃一个标量 ——
     # 取**加权平均**而不是最大值：取最大会把 3/4 的定长状态层也按 full attention
@@ -264,6 +282,7 @@ def model_spec_from_hf(
         ctx_max=ctx_max,
         kv_bytes_per_elem=dtype_bytes,
         kv_dim=info.kv_dim,
+        dense_layer_gb=tuple((l, info.dense_gb) for l in info.dense_layers),
     )
     if kv_per_layer is not None:
         # ModelSpec 的 KV 是按 (ctx × kv_dim × bytes) 算的；混合模型的定长状态层

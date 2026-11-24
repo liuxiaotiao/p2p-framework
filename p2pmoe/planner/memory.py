@@ -58,14 +58,13 @@ def front_gb_per_layer(model: ModelSpec, union_experts) -> Callable[[int], float
                             用一个常数会同时产生高估与低估。
     """
     if isinstance(union_experts, int):
-        gb = model.weight_gb_per_layer(union_experts)
-        return lambda _l: gb
-    return lambda l: model.weight_gb_per_layer(union_experts.size_at(l))
+        return lambda l: model.layer_gb(l, union_experts)
+    return lambda l: model.layer_gb(l, union_experts.size_at(l))
 
 
 def back_gb_per_layer(model: ModelSpec, task: TaskProfile) -> Callable[[int], float]:
     """mem_u(l)：后段驻留 task 专用集，规模 n_{u,l} 异构。"""
-    return lambda l: model.weight_gb_per_layer(task.n_experts_at(l))
+    return lambda l: model.layer_gb(l, task.n_experts_at(l))
 
 
 def make_front_spec(

@@ -770,6 +770,39 @@ STAGED_INDEX = "model.safetensors.index.json.next"
 _CFG_IGNORE = ("_name_or_path", "transformers_version")
 
 
+def _shape(cfg: Mapping) -> tuple[int, int, int]:
+    e = cfg.get("n_routed_experts") or cfg.get("num_experts") or cfg.get("num_local_experts") or 0
+    return int(cfg.get("num_hidden_layers", 0)), int(cfg.get("hidden_size", 0)), int(e)
+
+
+def plan_model_mismatch(plan_model: str, cfg: Mapping) -> str | None:
+    """清单写的模型与上游 config 对不上就说出来。
+
+    清单的 model 字段：规划器写 `47L-d2048-E64`，手写布局写 config 路径（如 glm47flash/config.json）。
+    GLM 的清单配上 Qwen 的 REPO 时，按 key 名大半都「找得到」（层号、专家号都在 Qwen 的范围里），
+    不拦的话会把 Qwen 的张量当 GLM 的下下来（2026-11-24 踩过）。认不出的写法不拦。"""
+    import re
+
+    want = _shape(cfg)
+    m = re.fullmatch(r"(\d+)L-d(\d+)-E(\d+)", str(plan_model or "").strip())
+    if m:
+        got = tuple(int(x) for x in m.groups())
+        src = plan_model
+    else:
+        f = Path(str(plan_model or ""))
+        if not (f.name == "config.json" or f.suffix == ".json") or not f.is_file():
+            return None
+        try:
+            got = _shape(json.loads(f.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            return None
+        src = str(f)
+    if got == want:
+        return None
+    return (f"清单是 {got[0]} 层 × d{got[1]} × {got[2]} 专家（{src}），"
+            f"上游 config 是 {want[0]} 层 × d{want[1]} × {want[2]} 专家")
+
+
 def same_model(a: Mapping, b: Mapping) -> bool:
     """两份 config.json 是不是同一个模型（同一个仓库拉的，张量逐字节相同）。"""
     def norm(c: Mapping) -> dict:
@@ -1358,6 +1391,11 @@ def main(argv: list[str] | None = None) -> int:
         log.info("节点 %s：不按清单，拉第 %s 层的全部专家（架构 %s，%d 个张量）",
                  args.node or "本机", args.layers, arch, len(keys))
     else:
+        why = plan_model_mismatch(man.model, cfg)
+        if why:
+            log.error("清单与上游不是同一个模型：%s", why)
+            log.error("  多半是环境变量串了（REPO 还是上一个模型的）—— 先 source 对应的 use_plan.sh")
+            return 2
         keys = keys_for_node(man, args.node, config=cfg)
         p = man.plan_for(args.node)
         log.info("节点 %s：%s，层 %d–%d，%d 个专家（架构 %s，%d 个张量）",

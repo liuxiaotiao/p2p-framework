@@ -49,16 +49,27 @@ cd "$(dirname "$0")"
 # 系统 python3 3.8、Qwen3-Next）—— fetch 预检会报 `Addr = tuple[str, int]` / `'type' object is
 # not subscriptable`，sync 会把代码推进旧目录。没设 WORKDIR 且本目录有 qwen3-30b/env.sh 时自动
 # source 它；已经 export 的 PLAN / HOSTS / PROFILE / WEIGHTS 保持不变（env.sh 会重置 PLAN）。
-if [ -z "${WORKDIR:-}" ] && [ -f qwen3-30b/env.sh ]; then
-  _keep_plan=${PLAN:-}; _keep_hosts=${HOSTS:-}; _keep_profile=${PROFILE:-}; _keep_weights=${WEIGHTS:-}
-  # shellcheck disable=SC1091
-  source qwen3-30b/env.sh >/dev/null 2>&1 || true
-  [ -n "$_keep_plan" ] && PLAN=$_keep_plan
-  [ -n "$_keep_hosts" ] && HOSTS=$_keep_hosts
-  [ -n "$_keep_profile" ] && PROFILE=$_keep_profile
-  [ -n "$_keep_weights" ] && WEIGHTS=$_keep_weights
-  echo "（没设 WORKDIR —— 已自动 source qwen3-30b/env.sh：WORKDIR=$WORKDIR  NODE_PY=$NODE_PY  PLAN=$PLAN  HOSTS=${HOSTS:-task/hosts.txt}）" >&2
-  unset _keep_plan _keep_hosts _keep_profile _keep_weights
+# 用哪份 env：看 PLAN 在哪个目录（glm47flash/plan_*.json → glm47flash/env.sh），没给 PLAN 才退回
+# qwen3-30b/env.sh。**以前一律 source Qwen 的**：新终端里只 export 了 GLM 的 PLAN / WEIGHTS 就跑，
+# REPO 被换成 Qwen/Qwen3-30B-A3B，fetch 开始下 Qwen（2026-11-24 踩过）。已经 export 的 REPO 也保留。
+if [ -z "${WORKDIR:-}" ]; then
+  _envf=qwen3-30b/env.sh
+  if [ -n "${PLAN:-}" ] && [ -f "$(dirname "$PLAN")/env.sh" ]; then _envf=$(dirname "$PLAN")/env.sh; fi
+  if [ -f "$_envf" ]; then
+    _keep_plan=${PLAN:-}; _keep_hosts=${HOSTS:-}; _keep_profile=${PROFILE:-}
+    _keep_weights=${WEIGHTS:-}; _keep_repo=${REPO:-}
+    # shellcheck disable=SC1090
+    source "$_envf" >/dev/null 2>&1 || true
+    [ -n "$_keep_plan" ] && PLAN=$_keep_plan
+    [ -n "$_keep_hosts" ] && HOSTS=$_keep_hosts
+    [ -n "$_keep_profile" ] && PROFILE=$_keep_profile
+    [ -n "$_keep_weights" ] && WEIGHTS=$_keep_weights
+    [ -n "$_keep_repo" ] && REPO=$_keep_repo
+    echo "（没设 WORKDIR —— 已自动 source $_envf：REPO=$REPO  WEIGHTS=$WEIGHTS  PLAN=$PLAN  HOSTS=${HOSTS:-task/hosts.txt}）" >&2
+    echo "  ⚠ 换着用 Qwen / GLM 时先 source 对应的 use_plan.sh，别靠这里猜" >&2
+    unset _keep_plan _keep_hosts _keep_profile _keep_weights _keep_repo
+  fi
+  unset _envf
 fi
 
 # ---- 改这里 ----------------------------------------------------------------
@@ -419,6 +430,7 @@ print(\"ok\", numpy.__version__, torch.__version__)'" \
 
 cmd_fetch() {
   say "3. 各节点只拉自己那份权重"
+  echo "  模型 $REPO → 各节点 $WEIGHTS（清单 $PLAN）"
   _require_node_py || return 1
   # 来源三选一
   SRCARG=()
@@ -660,6 +672,7 @@ cmd_benchfetch() {
   [ -n "$rng" ] || { echo "用法: HOSTS=<这几台的 hosts> $0 benchfetch <起-止层，1-based，如 2-9>"; exit 1; }
   need "$HOSTS"
   say "B. 给 $(_n_hosts) 台拉第 $rng 层（全部专家），供 LB_MODE=disk 逐层计时"
+  echo "  模型 $REPO → 各节点 $WEIGHTS"
   _require_node_py || return 1
   SRCARG=()
   if [ -n "$SRC_DIR" ]; then SRCARG=(--src "$SRC_DIR")
@@ -1121,6 +1134,7 @@ cmd_logs() {
 # 不经过控制机。所以这里只要约 10MB，不是 141GB。
 cmd_meta() {
   say "M. 控制机取模型元数据（约 10MB，不含权重）"
+  echo "  模型 $REPO"
   if ! mkdir -p "$WEIGHTS" 2>/dev/null; then
     echo "  ✗ 建不了 $WEIGHTS —— 没权限。"
     echo "    把 WEIGHTS 设到你写得进去的地方，比如项目目录下："

@@ -51,3 +51,18 @@ def test_exported_plan_and_hosts_survive():
 def test_explicit_workdir_is_respected():
     v = _prefix_vars({"WORKDIR": "/somewhere", "NODE_PY": "py"})
     assert v["WORKDIR"] == "/somewhere" and v["NODE_PY"] == "py"
+
+
+def test_glm_plan_picks_glm_env_not_qwen():
+    """只 export 了 GLM 的 PLAN 就跑：要 source glm47flash/env.sh，REPO 不能变成 Qwen（2026-11-24 踩过）。"""
+    if not (ROOT / "glm47flash" / "env.sh").exists():
+        pytest.skip("没有 glm47flash/env.sh")
+    v = _prefix_vars({"PLAN": "glm47flash/plan_glm47_vllm_1f_theory.json",
+                      "WEIGHTS": "/home/ubuntu/p2p-framework/weights-glm47-1f"})
+    assert v["REPO"] == "zai-org/GLM-4.7-Flash"
+    assert v["PLAN"] == "glm47flash/plan_glm47_vllm_1f_theory.json"
+
+
+def test_exported_repo_survives():
+    v = _prefix_vars({"REPO": "zai-org/GLM-4.7-Flash"})
+    assert v["REPO"] == "zai-org/GLM-4.7-Flash"

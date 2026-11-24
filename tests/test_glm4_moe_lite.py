@@ -332,3 +332,16 @@ def test_vllm_theory_plan_is_reproducible(tmp_path, monkeypatch):
         "--save-plan", str(out)])
     assert td.main() == 0
     assert out.read_bytes() == want.read_bytes()
+
+
+def test_fetch_refuses_glm_plan_with_qwen_repo():
+    """GLM 的清单配上 Qwen 的 REPO：按 key 名大半都找得到，不拦就会把 Qwen 的张量当 GLM 的下下来。"""
+    from p2pmoe.deploy.fetch import plan_model_mismatch
+    from p2pmoe.planner.hf_config import PRESETS
+
+    glm, qwen = _cfg(), PRESETS["qwen3-30b-a3b"]
+    assert plan_model_mismatch("47L-d2048-E64", glm) is None
+    assert "48 层" in plan_model_mismatch("47L-d2048-E64", qwen)
+    assert plan_model_mismatch(str(CFG), qwen) is not None
+    assert plan_model_mismatch(str(CFG), glm) is None
+    assert plan_model_mismatch("toy", qwen) is None              # 认不出的写法不拦

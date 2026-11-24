@@ -1160,6 +1160,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--reuse", action="store_true",
                     help="本机 --out 里已有的同模型张量直接复用（换方案时大半层没变），不再从上游重下；"
                          "要新旧两份同时放得下，放不下且给了 --replace 就退回「先删后下」")
+    ap.add_argument("--reuse-from", action="append", default=[], type=Path,
+                    help="本机别的目录里的同模型权重也拿来用（如换方案时新清单放在新目录 weights-glm47-1f，"
+                         "旧的在 weights-glm47）。可给多次。那些目录只读、不改")
     ap.add_argument("--stage", action="store_true",
                     help="本机原来有同模型权重时，新文件写成 model.safetensors.next、不盖旧的 —— "
                          "别的节点可能还在从本机的旧文件拿张量。全部拉完后 --commit-staged 再换上")
@@ -1362,7 +1365,7 @@ def main(argv: list[str] | None = None) -> int:
                  sum(len(l.experts) for l in p.layers), arch, len(keys))
     log.info("来源 %s", src)
 
-    if args.reuse or args.peers:
+    if args.reuse or args.peers or args.reuse_from:
         return _main_reusing(args, src, cfg, keys)
 
     if args.replace and not args.dry_run:
@@ -1402,6 +1405,35 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def _copy_meta(out: Path, cfg: Mapping, upstream: Source, peers: Sequence[Donor], *,
+               names: Sequence[str], keep_local: bool) -> dict[str, str]:
+    """config.json / tokenizer / 对话模板：**先从对等节点拿**（局域网、而且已经核对过是同一个模型），
+    没有的再找上游。config.json 一定要有 —— 哪儿都没拿到就把已经核对过的那份 config 写下去；
+    否则旧模型的 config 留在目录里，节点会按错的架构加载。返回 {文件: 来源}。"""
+    got: dict[str, str] = {}
+    for name in names:
+        if keep_local and (out / name).is_file():
+            got[name] = "本机"
+            continue
+        for label, s in [(d.label, d.src) for d in peers] + [("上游", upstream)]:
+            try:
+                if s.exists(name):
+                    data = s.read(name)
+                    if name == "config.json" and not same_model(json.loads(data), cfg):
+                        continue
+                    (out / name).write_bytes(data)
+                    got[name] = label
+                    break
+            except Exception:
+                continue
+    if "config.json" not in got:
+        (out / "config.json").write_text(json.dumps(cfg, indent=2, ensure_ascii=False),
+                                         encoding="utf-8")
+        got["config.json"] = "已核对的 config"
+    log.info("元数据：%s", "，".join(f"{k} ← {v}" for k, v in got.items()))
+    return got
+
+
 def _main_reusing(args, src: Source, cfg: dict, keys: set[str]) -> int:
     """--reuse / --peers：本机旧权重 → 别的节点 → 上游，按这个顺序取张量。"""
     out: Path = args.out
@@ -1426,6 +1458,18 @@ def _main_reusing(args, src: Source, cfg: dict, keys: set[str]) -> int:
     donors: list[Donor] = []
     if local_ok:
         donors.append(Donor("本机旧权重", Source(local=out)))
+    for extra in args.reuse_from or ():
+        extra = Path(extra)
+        if extra.resolve() == out.resolve() or local_checkpoint_keys(extra) is None:
+            continue
+        try:
+            ok = same_model(json.loads((extra / "config.json").read_text(encoding="utf-8")), cfg)
+        except (OSError, ValueError):
+            ok = False
+        if ok:
+            donors.append(Donor(f"本机 {extra.name}", Source(local=extra)))
+        else:
+            log.info("%s 不是这个模型（或没有 config.json）—— 不复用", extra)
     peers = parse_peers(args.peers, exclude=args.node)
     if peers:
         found = probe_peers(peers, cfg)
@@ -1466,17 +1510,9 @@ def _main_reusing(args, src: Source, cfg: dict, keys: set[str]) -> int:
         log.info("（--dry-run，没有真下）")
         return 0
 
-    if not args.no_tokenizer:
-        for name in TOKENIZER_FILES:
-            if local_ok and (out / name).is_file():
-                continue
-            for s in [src] + [d.src for d in donors if d.label != "本机旧权重"]:
-                try:
-                    if s.exists(name):
-                        (out / name).write_bytes(s.read(name))
-                        break
-                except Exception:
-                    continue
+    _copy_meta(out, cfg, src, [d for d in donors if d.label != "本机旧权重"],
+               names=("config.json",) if args.no_tokenizer else TOKENIZER_FILES,
+               keep_local=local_ok)
     t0 = time.perf_counter()
     try:
         got = fetch_reusing(assigned, src, out, stage=stage, gap=int(args.gap_mb * 1e6))

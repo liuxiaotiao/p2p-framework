@@ -13,6 +13,7 @@
 #   ./deploy_15.sh verify     # 逐台核对权重齐不齐（只读文件头，几秒）
 #   ./deploy_15.sh refetch <节点>  # 清掉旧产物再单独重拉一台
 #   REPLACE=1 ./deploy_15.sh fetch   # 换方案：与新清单一致的节点跳过，其余先删旧权重再下
+#   PEER_DIR=<旧权重目录> ./deploy_15.sh fetch   # 新清单拉到新的 WEIGHTS 目录时，各台从旧目录发 / 复用
 #   PEERS=0 ./deploy_15.sh fetch     # 关掉节点互传（默认开：集群里已有的同模型张量从别的节点拿，缺的才去上游）
 #   PURGE_OLD=<旧权重目录> ./deploy_15.sh fetch   # 换模型：源站试通后，先删各台另一个模型的权重目录再下
 #   ./deploy_15.sh purge-weights <目录>  # 只删各台的某个权重目录（先列出、确认后才删；CONFIRM=1 不问）
@@ -517,7 +518,8 @@ PYEOF
   fi
   local PEERARG=()
   if [ "${PEERS:-1}" = 1 ]; then
-    PEERARG=(--peers --peer-hosts "${HOSTS_ALL:-task/hosts.txt}" --peer-port "${PEER_PORT:-9400}")
+    PEERARG=(--peers --peer-hosts "${HOSTS_ALL:-task/hosts.txt}" --peer-port "${PEER_PORT:-9400}"
+             ${PEER_DIR:+--peer-dir "$PEER_DIR"})
     echo
     echo "  节点互传（PEERS=1，默认）：先在 ${HOSTS_ALL:-task/hosts.txt} 的各台上把现有权重目录发出来"
     echo "    （端口 ${PEER_PORT:-9400}），每台按「本机旧权重 → 别的节点（近的先）→ 上游」取张量 ——"
@@ -664,7 +666,8 @@ cmd_benchfetch() {
   elif [ -n "$SRC_URL" ]; then SRCARG=(--base-url "$SRC_URL")
   else SRCARG=(--repo "$REPO" ${HF_ENDPOINT:+--endpoint "$HF_ENDPOINT"}); fi
   local PEERARG=()
-  [ "${PEERS:-1}" = 1 ] && PEERARG=(--peers --peer-hosts "${HOSTS_ALL:-task/hosts.txt}" --peer-port "${PEER_PORT:-9400}")
+  [ "${PEERS:-1}" = 1 ] && PEERARG=(--peers --peer-hosts "${HOSTS_ALL:-task/hosts.txt}" --peer-port "${PEER_PORT:-9400}"
+                                    ${PEER_DIR:+--peer-dir "$PEER_DIR"})
   awk '{sub(/#.*/,"")} NF>=2 {printf "    %s", $1} END {print ""}' "$HOSTS"
   echo "  ⚠ 这几台 $WEIGHTS 里原有的权重会被换成第 $rng 层（同模型的张量会复用，不重下）"
   read -rp "  继续？[y/N] " a; [ "$a" = y ] || return 0

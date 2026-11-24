@@ -415,6 +415,12 @@ def _serve_stop_cmd(out: str, port: int) -> str:
             f"python*|Python*) kill $p 2>/dev/null;; esac; done; true")
 
 
+def _peer_dir(h, out: str, args) -> str:
+    """各节点发哪个目录：默认就是 --out；--peer-dir 给了就发它（新清单放新目录、旧权重在别的目录时）。"""
+    base = getattr(args, "peer_dir", None) or out
+    return f"{base}/{h.node_id}" if args.per_node_dir else base
+
+
 def _start_peers(peer_hosts, out, args) -> tuple[dict[str, str], list]:
     """各节点把自己现有的权重目录发出来 → ({节点: URL}, 本机模式下的进程)。
 
@@ -425,7 +431,7 @@ def _start_peers(peer_hosts, out, args) -> tuple[dict[str, str], list]:
     def start(i_h):
         i, h = i_h
         port = args.peer_port + (i if args.local else 0)
-        d = f"{out}/{h.node_id}" if args.per_node_dir else out
+        d = _peer_dir(h, out, args)
         if args.local:
             if not (Path(args.workdir) / d / "model.safetensors").is_file() and \
                     not Path(d, "model.safetensors").is_file():
@@ -466,7 +472,7 @@ def _stop_peers(peer_hosts, out, args, procs) -> None:
 
     def stop(i_h):
         i, h = i_h
-        d = f"{out}/{h.node_id}" if args.per_node_dir else out
+        d = _peer_dir(h, out, args)
         _ssh(h, _serve_stop_cmd(d, args.peer_port), ssh=args.ssh, user=args.user, timeout=30)
 
     with ThreadPoolExecutor(max_workers=args.parallel) as ex:
@@ -517,6 +523,10 @@ def _fetch_all_inner(hosts, args, out: str, peers: Mapping[str, str]) -> int:
         if getattr(args, "peers", False):
             # 本机旧权重也复用；本机原来有同模型权重的写成 .next，等全部拉完再统一换上
             parts += ["--reuse", "--stage"]
+            pd = getattr(args, "peer_dir", None)
+            if pd and pd != out:
+                # 旧权重在别的目录：本机那份也拿来用（只读）
+                parts += ["--reuse-from", _peer_dir(h, out, args)]
             if mine:
                 parts += ["--peers", ",".join(f"{n}={u}" for n, u in sorted(mine.items()))]
         # 权重源三选一，与 fetch 的口径一致
@@ -668,6 +678,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--peer-hosts", type=Path, default=None,
                     help="哪些节点当源（默认同 --hosts）。给全部 15 台：不在新清单里的节点上的权重也能用")
     ap.add_argument("--peer-port", type=int, default=9400)
+    ap.add_argument("--peer-dir", default=None,
+                    help="各节点发哪个目录里的现有权重（默认 = --out）。新清单拉到新目录、旧权重在"
+                         "别的目录时给旧目录：别的节点从它拿，本机也从它拿（只读）")
     ap.add_argument("--replace", action="store_true",
                     help="fetch：各节点就地换方案 —— 已是本清单的权重就跳过，否则先删旧的再下")
     ap.add_argument("--dry-run", action="store_true",

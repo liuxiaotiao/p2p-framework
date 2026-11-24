@@ -188,3 +188,71 @@ def test_launch_starts_peers_stages_then_commits(monkeypatch, tmp_path):
              if "--commit-staged" in c or ("p2pmoe.deploy.fetch" in c and "--plan" in c)]
     kinds = ["commit" if "--commit-staged" in cmds[i][1] else "fetch" for i in order]
     assert kinds == ["fetch", "fetch", "commit", "commit"], "全部拉完才换"
+
+
+def test_metadata_comes_from_peers_even_when_upstream_is_down(up, tmp_path):
+    """上游（HF）不通：张量与 config / tokenizer 都从对等节点拿，config.json 一定写下去。"""
+    url, stats, cfg, d = up
+    _, new = _plans(tmp_path, cfg)
+    peer_dir = tmp_path / "peer"
+    assert _run("--src", d, "--plan", new, "--node", "n2", "--out", peer_dir) == 0
+    with WeightServer(peer_dir, host="127.0.0.1", port=0) as peer:
+        out = tmp_path / "me"
+        assert _run("--base-url", "http://127.0.0.1:9", "--plan", new, "--node", "n2",
+                    "--out", out, "--peers", f"N99=http://127.0.0.1:{peer.port}") == 0
+    assert json.loads((out / "config.json").read_text()) == json.loads(
+        (peer_dir / "config.json").read_text())
+    _same(out, _direct(d, new, "n2", tmp_path / "ref"))
+
+
+def test_stale_config_of_another_model_is_overwritten(up, tmp_path):
+    """目录里原来是别的模型：旧 config.json 不能留着（节点会按错的架构加载）。"""
+    url, stats, cfg, d = up
+    _, new = _plans(tmp_path, cfg)
+    out = tmp_path / "me"
+    out.mkdir()
+    (out / "config.json").write_text(json.dumps({"model_type": "something_else"}))
+    assert _run("--base-url", url, "--plan", new, "--node", "n2", "--out", out, "--reuse",
+                "--replace") == 0
+    assert F.same_model(json.loads((out / "config.json").read_text()), cfg)
+
+
+def test_reuse_from_another_local_dir(up, tmp_path):
+    """新清单拉到新目录（weights-glm47-1f），旧权重在 weights-glm47：本机旧目录照样复用，旧目录不改。"""
+    url, stats, cfg, d = up
+    old, new = _plans(tmp_path, cfg)
+    olddir = tmp_path / "weights-old"
+    assert _run("--base-url", url, "--plan", new, "--node", "n2", "--out", olddir) == 0
+    before_bytes = (olddir / "model.safetensors").read_bytes()
+    before = stats["bytes"]
+    out = tmp_path / "weights-new"
+    assert _run("--base-url", url, "--plan", new, "--node", "n2", "--out", out,
+                "--reuse-from", olddir) == 0
+    assert stats["bytes"] - before < 64 << 10, "旧目录里都有，不该再从上游拿张量"
+    assert (olddir / "model.safetensors").read_bytes() == before_bytes
+    assert (out / "config.json").is_file()
+    _same(out, _direct(d, new, "n2", tmp_path / "ref"))
+
+
+def test_launch_peer_dir_serves_old_dir_and_reuses_it(monkeypatch, tmp_path):
+    from p2pmoe.deploy import launch as L
+
+    hosts = tmp_path / "h.txt"
+    hosts.write_text("N01  10.0.0.1:9101\nN02  10.0.0.2:9101\n", encoding="utf-8")
+    plan = tmp_path / "plan.json"
+    plan.write_text('{"l0": 1, "model": {}, "segments": {}, "nodes": []}', encoding="utf-8")
+    cmds: list[tuple[str, str]] = []
+
+    def fake_ssh(h, cmd, **kw):
+        cmds.append((h.node_id, cmd))
+        return True, "serving" if "nohup" in cmd else "ok"
+
+    monkeypatch.setattr(L, "_ssh", fake_ssh)
+    monkeypatch.setattr(L, "_peer_alive", lambda url, timeout=5.0: True)
+    assert L.main(["fetch", "--hosts", str(hosts), "--plan", str(plan), "--repo", "R",
+                   "--out", "/w/new", "--workdir", "/c", "--peers", "--peer-dir", "/w/old",
+                   "--progress-every", "0"]) == 0
+    served = [c for _, c in cmds if "nohup" in c]
+    assert served and all("--dir /w/old" in c for c in served)
+    fetched = [c for _, c in cmds if "p2pmoe.deploy.fetch" in c and "--plan" in c]
+    assert all("--out /w/new" in c and "--reuse-from /w/old" in c for c in fetched)

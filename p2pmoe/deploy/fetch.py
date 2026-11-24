@@ -465,7 +465,8 @@ def _meta_file_ok(path: "Path") -> bool:
     """
     try:
         if not path.name.endswith(".json"):
-            return path.stat().st_size > 0
+            head = path.read_bytes()[:64].lstrip().lower()
+            return path.stat().st_size > 0 and not head.startswith((b"<!doctype", b"<html"))
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             return False
@@ -863,7 +864,10 @@ def keys_for_node(manifest: DeploymentManifest, node: str, *,
 
 
 TOKENIZER_FILES = ("config.json", "generation_config.json", "tokenizer.json",
-                   "tokenizer_config.json", "special_tokens_map.json")
+                   "tokenizer_config.json", "special_tokens_map.json",
+                   # 新版 transformers 把对话模板单独存成这个文件（GLM-4.7-Flash），
+                   # tokenizer_config.json 里就没有 chat_template 了；没有的仓库按 404 跳过
+                   "chat_template.jinja")
 
 
 def main(argv: list[str] | None = None) -> int:

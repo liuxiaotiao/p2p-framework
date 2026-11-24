@@ -146,6 +146,18 @@ class Detokenizer:
 
 
 # --------------------------------------------------------------------------- #
+def _read_chat_template_file(d: Path) -> str | None:
+    """模型目录里单独存的对话模板：chat_template.jinja，或 chat_template.json 的 "chat_template"。"""
+    j = d / "chat_template.jinja"
+    if j.exists():
+        return j.read_text(encoding="utf-8")
+    js = d / "chat_template.json"
+    if js.exists():
+        t = json.loads(js.read_text(encoding="utf-8")).get("chat_template")
+        return t if isinstance(t, (str, list)) else None
+    return None
+
+
 class Tokenizer:
     """HF `tokenizer.json` 的薄封装 + chat template 渲染。"""
 
@@ -174,6 +186,12 @@ class Tokenizer:
             ) from e
         cfg_f = d / "tokenizer_config.json"
         cfg = json.loads(cfg_f.read_text(encoding="utf-8")) if cfg_f.exists() else {}
+        if not cfg.get("chat_template"):
+            # transformers ≥ 4.43 存盘时把模板单独写成 chat_template.jinja（或 chat_template.json），
+            # tokenizer_config.json 里不再有这个键 —— GLM-4.7-Flash 就是这样
+            tpl = _read_chat_template_file(d)
+            if tpl is not None:
+                cfg["chat_template"] = tpl
         return cls(_HFTok.from_file(str(f)), config=cfg, model_dir=d)
 
     # -- 编解码 ------------------------------------------------------------ #
@@ -233,8 +251,10 @@ class Tokenizer:
         tpl = self.chat_template
         if tpl is None:
             raise ValueError(
-                "这个 checkpoint 的 tokenizer_config.json 里没有 chat_template"
-                "（基座模型通常就没有）—— 用 completion 模式，别套对话格式"
+                "这个 checkpoint 的 tokenizer_config.json 里没有 chat_template，"
+                "目录里也没有 chat_template.jinja / chat_template.json"
+                "（基座模型通常就没有）—— 用 completion 模式，别套对话格式。"
+                "指令模型的话多半是模板文件没拉下来：bash ./deploy_15.sh meta"
             )
         try:
             from jinja2.exceptions import TemplateError
@@ -249,7 +269,8 @@ class Tokenizer:
             raise TemplateError(msg)
 
         env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
-        env.filters["tojson"] = lambda o, **kw: json.dumps(o, ensure_ascii=False, **kw)
+        # 模板里会写 tojson(ensure_ascii=False)（GLM-4.7-Flash）—— 默认值不能和显式参数撞车
+        env.filters["tojson"] = lambda o, **kw: json.dumps(o, **{"ensure_ascii": False, **kw})
         env.globals["raise_exception"] = raise_exception
         ctx: dict[str, Any] = {
             k: v for k, v in self.config.items()

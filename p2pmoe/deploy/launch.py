@@ -404,9 +404,15 @@ def _serve_cmd(args, out: str, port: int) -> str:
             f"sleep 1; echo serving; else echo none; fi")
 
 
-def _stop_cmd(out: str, port: int) -> str:
-    return (f"pkill -f {shlex.quote(f'p2pmoe.deploy.serve_weights --dir {out} --bind 0.0.0.0:{port}')}"
-            f" || true")
+def _serve_stop_cmd(out: str, port: int) -> str:
+    """停掉 _start_peers 起的权重服务。**名字不能叫 _stop_cmd** —— 那是停 agent 的，重名会把它盖掉，
+    `deploy_15.sh stop / start` 全部报 TypeError（2026-11-24 踩过）。
+
+    与停 agent 同一个写法：不直接 `pkill -f`（会先杀掉执行它的远端 shell），pgrep 后只杀 python 进程。"""
+    pat = shlex.quote(f"p2pmoe.deploy.serve_weights --dir {out} --bind 0.0.0.0:{port}")
+    return (f"for p in $(pgrep -f {pat} 2>/dev/null); do "
+            f'case "$(ps -o comm= -p $p 2>/dev/null)" in '
+            f"python*|Python*) kill $p 2>/dev/null;; esac; done; true")
 
 
 def _start_peers(peer_hosts, out, args) -> tuple[dict[str, str], list]:
@@ -461,7 +467,7 @@ def _stop_peers(peer_hosts, out, args, procs) -> None:
     def stop(i_h):
         i, h = i_h
         d = f"{out}/{h.node_id}" if args.per_node_dir else out
-        _ssh(h, _stop_cmd(d, args.peer_port), ssh=args.ssh, user=args.user, timeout=30)
+        _ssh(h, _serve_stop_cmd(d, args.peer_port), ssh=args.ssh, user=args.user, timeout=30)
 
     with ThreadPoolExecutor(max_workers=args.parallel) as ex:
         list(ex.map(stop, enumerate(peer_hosts)))

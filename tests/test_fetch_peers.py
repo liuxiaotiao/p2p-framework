@@ -178,7 +178,7 @@ def test_launch_starts_peers_stages_then_commits(monkeypatch, tmp_path):
     started = [n for n, c in cmds if "nohup" in c]
     fetched = [(n, c) for n, c in cmds if "p2pmoe.deploy.fetch" in c and "--plan" in c]
     committed = [n for n, c in cmds if "--commit-staged" in c]
-    stopped = [n for n, c in cmds if "pkill" in c]
+    stopped = [n for n, c in cmds if "pgrep" in c and "serve_weights" in c]
     assert sorted(started) == ["N01", "N02", "N03"]             # 不在清单里的 N03 也当源
     assert len(fetched) == 2 and all("--stage" in c and "--peers" in c for _, c in fetched)
     assert all("N01=" not in c for n, c in fetched if n == "N01")  # 不把自己当对等节点

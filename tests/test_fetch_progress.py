@@ -48,7 +48,7 @@ def _run(monkeypatch, hosts, plan, sizes, stuck=(), every="0.4"):
     monkeypatch.setattr("builtins.print", lambda *a, **k: out.append(" ".join(map(str, a))))
 
     def fake_ssh(h, cmd, *, ssh, user, timeout=60.0):
-        if "du -sb" in cmd:
+        if "du -sB1" in cmd:           # 进度探针（见 launch._du_cmd）
             return True, str(int(sizes.get(h.node_id, 0)))
         for _ in range(4):
             time.sleep(0.25)
@@ -130,3 +130,25 @@ def test_expected_sizes_come_from_the_plan(plan) -> None:
 def test_a_missing_plan_degrades_quietly(tmp_path) -> None:
     """读不到清单就不报进度，而不是崩掉整轮下载。"""
     assert L._expected_bytes(tmp_path / "nope.json", per_node_dir=False) == {}
+
+
+def test_progress_measures_the_file_being_written_not_the_whole_dir(tmp_path) -> None:
+    """换方案时目录里还留着旧的 model.safetensors（等全部拉完才被 .next 换掉）。
+    以前量整个目录，进度成了「旧 + 新」：38/19GB、152%、「12/12 台完成」但其实还在拉。"""
+    import subprocess
+    d = tmp_path / "w"
+    d.mkdir()
+    run = lambda: int(subprocess.run(["bash", "-c", L._du_cmd(str(d))],
+                                     capture_output=True, text=True).stdout.strip())
+    assert run() == 0
+    (d / "model.safetensors").write_bytes(b"o" * 3_000_000)          # 旧方案
+    (d / "config.json").write_text("{}")
+    assert 2_900_000 <= run() <= 3_200_000
+    with open(d / "model.safetensors.partial", "wb") as f:           # 按偏移写：稀疏
+        f.seek(40_000_000)
+        f.write(b"n" * 1_000_000)
+    assert run() <= 1_200_000, "量成了旧的，或用了稀疏文件的表观大小"
+    (d / "model.safetensors.partial").rename(d / "model.safetensors.next")
+    assert run() <= 1_200_000
+    assert int(subprocess.run(["bash", "-c", L._du_cmd(str(tmp_path / "nope"))],
+                              capture_output=True, text=True).stdout.strip()) == 0

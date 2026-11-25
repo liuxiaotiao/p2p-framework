@@ -159,10 +159,24 @@ def _expected_bytes(plan_path, per_node_dir: bool) -> dict[str, int]:
     return {n["node"]: int(float(n.get("weight_gb", 0)) * 1e9) for n in m.get("nodes", [])}
 
 
+def _du_cmd(path: str) -> str:
+    """量「这一轮正在写的那份权重」，不量整个目录。
+
+    以前是 `du -sb 目录`：换方案时目录里还躺着旧的 model.safetensors（等全部拉完才被
+    .next 换掉），进度就成了「旧 + 新」—— 出现 38/19GB、152%、「12/12 台完成」但其实还在拉。
+    现在按 .partial（正在写）→ .next（写完、等换上）→ model.safetensors（没换方案 / 跳过）
+    的顺序取第一个存在的。互传是按偏移写的，不能用表观大小（-b）——
+    末尾的张量先到时表观大小一下就满了；用实际占用块（-B1）。
+    """
+    q = shlex.quote(path)
+    return (f"cd {q} 2>/dev/null || {{ echo 0; exit 0; }}; "
+            "for f in model.safetensors.partial model.safetensors.next model.safetensors; do "
+            '[ -f "$f" ] && { du -sB1 "$f" | cut -f1; exit 0; }; done; echo 0')
+
+
 def _du(h: Host, path: str, *, ssh: str, user: str | None) -> int:
-    """远端目录当前多大。`du -sb` 很便宜，30 秒问一次不心疼。"""
-    ok, out = _ssh(h, f"du -sb {shlex.quote(path)} 2>/dev/null | cut -f1",
-                   ssh=ssh, user=user, timeout=20)
+    """远端这一轮的权重文件当前多大（见 `_du_cmd`）。30 秒问一次不心疼。"""
+    ok, out = _ssh(h, _du_cmd(path), ssh=ssh, user=user, timeout=20)
     if not ok:
         return -1
     tok = out.strip().split()

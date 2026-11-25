@@ -19,6 +19,10 @@ case "$_up_name" in
   *.json) _up_plan=$_up_name; _up_tag=$(basename "$_up_name" .json); _up_tag=${_up_tag#plan_} ;;
   *)      _up_plan=glm47flash/plan_${_up_name}.json; _up_tag=$_up_name ;;
 esac
+# 文件名本身带 glm47_ 前缀（plan_glm47_vllm_ff.json）时，也认短名 vllm_ff
+if [ ! -f "$_up_plan" ] && [ -f "glm47flash/plan_glm47_${_up_name}.json" ]; then
+  _up_plan=glm47flash/plan_glm47_${_up_name}.json
+fi
 if [ ! -f "$_up_plan" ]; then
   echo "✗ 没有 $_up_plan（当前目录 $(pwd)；要在 p2p-framework 目录下 source）"
   return 1 2>/dev/null || exit 1
